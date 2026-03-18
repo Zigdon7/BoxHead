@@ -5,11 +5,13 @@ export class Game {
     players: {},
     zombies: [],
     bullets: [],
-    wave: 1
+    wave: 1,
+    barricades: []
   };
   private inputs: Record<string, ClientInput> = {};
   private lastTick = Date.now();
   private zombieSpawnTimer = 0;
+  private waveKills = 0;
 
   addPlayer(id: string) {
     this.state.players[id] = {
@@ -20,7 +22,7 @@ export class Game {
       health: 100,
       weapon: 'pistol'
     };
-    this.inputs[id] = { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, shooting: false };
+    this.inputs[id] = { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, shooting: false, switchWeapon: false };
   }
 
   removePlayer(id: string) {
@@ -39,7 +41,6 @@ export class Game {
 
     const speed = 200;
 
-    // Process players
     for (const id in this.state.players) {
       const p = this.state.players[id];
       const i = this.inputs[id];
@@ -50,44 +51,50 @@ export class Game {
       if (i.down) p.pos.y += speed * dt;
       if (i.left) p.pos.x -= speed * dt;
       if (i.right) p.pos.x += speed * dt;
-
-      // Calculate angle
+      
       p.angle = Math.atan2(i.mouseY - p.pos.y, i.mouseX - p.pos.x);
+      
+      if (i.switchWeapon) {
+          const w = ['pistol', 'uzi', 'shotgun', 'barrel', 'barricade'] as const;
+          const idx = w.indexOf(p.weapon);
+          p.weapon = w[(idx + 1) % w.length];
+      }
 
-      // Shooting (simple pistol logic)
-      if (i.shooting && Math.random() < 0.1) { // Throttle
-        this.state.bullets.push({
-          id: Math.random().toString(),
-          pos: { x: p.pos.x, y: p.pos.y },
-          vel: { x: Math.cos(p.angle) * 800, y: Math.sin(p.angle) * 800 },
-          ownerId: id
-        });
+      if (i.shooting && Math.random() < 0.1) {
+        if (p.weapon === 'barricade' || p.weapon === 'barrel') {
+           this.state.barricades.push({ x: p.pos.x, y: p.pos.y, type: p.weapon });
+        } else {
+           this.state.bullets.push({
+             id: Math.random().toString(),
+             pos: { x: p.pos.x, y: p.pos.y },
+             vel: { x: Math.cos(p.angle) * 800, y: Math.sin(p.angle) * 800 },
+             ownerId: id
+           });
+        }
       }
     }
 
-    // Process bullets
     for (const b of this.state.bullets) {
       b.pos.x += b.vel.x * dt;
       b.pos.y += b.vel.y * dt;
     }
-    // Remove out of bounds bullets
     this.state.bullets = this.state.bullets.filter(b => b.pos.x > 0 && b.pos.x < 1000 && b.pos.y > 0 && b.pos.y < 800);
 
-    // Process zombies
     this.zombieSpawnTimer += dt;
     if (this.zombieSpawnTimer > Math.max(0.5, 3 - this.state.wave * 0.2)) {
       this.zombieSpawnTimer = 0;
+      const isDevil = Math.random() < 0.1 * this.state.wave;
       this.state.zombies.push({
         id: Math.random().toString(),
+        type: isDevil ? 'devil' : 'zombie',
         pos: { x: Math.random() < 0.5 ? 0 : 800, y: Math.random() * 600 },
-        health: 20 + this.state.wave * 10,
-        speed: 50 + this.state.wave * 5
+        health: isDevil ? (50 + this.state.wave * 20) : (20 + this.state.wave * 10),
+        speed: isDevil ? (80 + this.state.wave * 5) : (50 + this.state.wave * 5)
       });
     }
 
     for (let i = this.state.zombies.length - 1; i >= 0; i--) {
       const z = this.state.zombies[i];
-      // Find nearest player
       let target: Player | null = null;
       let minDist = Infinity;
       for (const pid in this.state.players) {
@@ -102,7 +109,6 @@ export class Game {
         z.pos.y += Math.sin(angle) * z.speed * dt;
       }
 
-      // Check collision with bullets
       for (let j = this.state.bullets.length - 1; j >= 0; j--) {
         const b = this.state.bullets[j];
         if (Math.hypot(b.pos.x - z.pos.x, b.pos.y - z.pos.y) < 20) {
@@ -111,7 +117,12 @@ export class Game {
           if (z.health <= 0) {
             this.state.zombies.splice(i, 1);
             if (this.state.players[b.ownerId]) {
-               this.state.players[b.ownerId].score += 10;
+               this.state.players[b.ownerId].score += z.type === 'devil' ? 50 : 10;
+            }
+            this.waveKills++;
+            if (this.waveKills > this.state.wave * 10) {
+               this.state.wave++;
+               this.waveKills = 0;
             }
             break;
           }

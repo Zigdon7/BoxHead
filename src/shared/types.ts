@@ -9,11 +9,12 @@ export interface Player {
   angle: number;
   score: number;
   health: number;
-  weapon: string;
+  weapon: 'pistol' | 'uzi' | 'shotgun' | 'barrel' | 'barricade';
 }
 
 export interface Zombie {
   id: string;
+  type: 'zombie' | 'devil';
   pos: Vector2;
   health: number;
   speed: number;
@@ -31,6 +32,7 @@ export interface GameState {
   zombies: Zombie[];
   bullets: Bullet[];
   wave: number;
+  barricades: any[];
 }
 
 export type ClientInput = {
@@ -41,4 +43,5 @@ export type ClientInput = {
   mouseX: number;
   mouseY: number;
   shooting: boolean;
+  switchWeapon: boolean;
 };
