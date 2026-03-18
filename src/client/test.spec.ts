@@ -10,6 +10,6 @@ test('Game has required features', () => {
     
     // Simulate game loop and weapon switch
     game.handleInput('1', { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, shooting: false, switchWeapon: true });
-    game.update();
+    game.update(1/60);
     expect(state.players['1'].weapon).toBe('uzi');
 });

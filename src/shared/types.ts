@@ -9,6 +9,8 @@ export interface Player {
   angle: number;
   score: number;
   health: number;
+  ammo: number;
+  maxAmmo: number;
   weapon: 'pistol' | 'uzi' | 'shotgun' | 'barrel' | 'barricade';
 }
 
@@ -33,6 +35,7 @@ export interface GameState {
   bullets: Bullet[];
   wave: number;
   barricades: any[];
+  gameOver: boolean;
 }
 
 export type ClientInput = {

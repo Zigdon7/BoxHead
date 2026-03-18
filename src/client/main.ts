@@ -98,7 +98,21 @@ function draw() {
     }
 
     if (state.players[myId]) {
-      scoreDisplay.innerText = `Score: ${state.players[myId].score} | Wave: ${state.wave}`;
+      const p = state.players[myId];
+      scoreDisplay.innerText = `Score: ${p.score} | Wave: ${state.wave} | Ammo: ${p.ammo}/${p.maxAmmo} | HP: ${p.health}`;
+    }
+
+    if (state.gameOver) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = 'red';
+      ctx.font = '48px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 30);
+      ctx.fillStyle = 'white';
+      ctx.font = '24px Arial';
+      ctx.fillText(`Wave: ${state.wave}`, canvas.width / 2, canvas.height / 2 + 10);
+      ctx.fillText('Refresh to play again', canvas.width / 2, canvas.height / 2 + 50);
     }
   }
 
