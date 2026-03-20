@@ -10,6 +10,25 @@ use crate::types::*;
 
 // ---------- Spatial-grid helper structs ----------
 
+/// Wall entry inserted into multiple grid cells. Carries its insertion
+/// position (`cell_x`, `cell_y`) separately from its actual rect so that
+/// `SpatialGrid::insert` places it in the correct cell.
+#[derive(Clone, Debug)]
+struct WallEntry {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    cell_x: f64,
+    cell_y: f64,
+}
+
+impl crate::spatial_grid::Positioned for WallEntry {
+    fn pos(&self) -> (f64, f64) {
+        (self.cell_x, self.cell_y)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ZombieRef {
     index: usize,
@@ -80,7 +99,7 @@ fn resolve_circle_rect(
         let ny = dy / dist;
         (px + nx * overlap, py + ny * overlap)
     } else if dist == 0.0 {
-        // Center is inside the rect – push out along minimum overlap axis
+        // Center is inside the rect - push out along minimum overlap axis
         let left = px - rx;
         let right = (rx + rw) - px;
         let top = py - ry;
@@ -100,216 +119,18 @@ fn resolve_circle_rect(
     }
 }
 
-fn point_in_rect(px: f64, py: f64, rx: f64, ry: f64, rw: f64, rh: f64) -> bool {
-    px >= rx && px <= rx + rw && py >= ry && py <= ry + rh
-}
-
-// Dead code removed — see build_wall_grid_impl and bullet_hits_wall_at below
-#[cfg(any())]
-fn _dead(_walls: &[Wall]) {
-    for _wall in _walls {
-        // Insert the wall into every cell it overlaps
-        let min_col = (wall.x / WALL_GRID_CELL_SIZE).floor() as i32;
-        let max_col = ((wall.x + wall.w) / WALL_GRID_CELL_SIZE).floor() as i32;
-        let min_row = (wall.y / WALL_GRID_CELL_SIZE).floor() as i32;
-        let max_row = ((wall.y + wall.h) / WALL_GRID_CELL_SIZE).floor() as i32;
-
-        let cols = (MAP_WIDTH / WALL_GRID_CELL_SIZE).ceil() as i32;
-        let rows = (MAP_HEIGHT / WALL_GRID_CELL_SIZE).ceil() as i32;
-
-        for row in min_row.max(0)..=max_row.min(rows - 1) {
-            for col in min_col.max(0)..=max_col.min(cols - 1) {
-                let cx = (col as f64 + 0.5) * WALL_GRID_CELL_SIZE;
-                let cy = (row as f64 + 0.5) * WALL_GRID_CELL_SIZE;
-                // We insert a WallEntry positioned at the cell center so it lands in the right cell
-                // But we need its actual rect for collision. Trick: position at cell center.
-                // Actually, we need to insert directly into the cell. Since SpatialGrid::insert
-                // uses pos() to determine the cell, we position each copy at that cell's center.
-                let entry = WallEntry {
-                    x: wall.x,
-                    y: wall.y,
-                    w: wall.w,
-                    h: wall.h,
-                };
-                // We need to insert with position mapping to this specific cell.
-                // Use a wrapper that overrides pos. Simpler: just insert centered on cell.
-                let _ = cx;
-                let _ = cy;
-                // The grid's insert uses the Positioned trait. Since WallEntry::pos() returns center
-                // of the wall, a large wall will only go into one cell. We need multi-cell insertion.
-                // Let's insert with a position set to each cell's center instead.
-                let cell_entry = WallEntry {
-                    x: wall.x,
-                    y: wall.y,
-                    w: wall.w,
-                    h: wall.h,
-                };
-                // We'll manually place it. But SpatialGrid only has insert which uses pos().
-                // We need to work around this. Let's create a special WallEntry for each cell
-                // whose "pos" maps to that cell.
-                // Actually, let's just use a different approach: insert the wall once and
-                // query with a large enough radius. The resolve_wall_collisions already uses
-                // query_radius = radius + WALL_GRID_CELL_SIZE which should catch nearby walls.
-                // But for correctness with large walls, we want multi-cell insertion.
-                // Let's create a CellWallEntry that has a fake position.
-                let _ = cell_entry;
-                // We'll handle this below with direct cell manipulation.
-                let _ = entry;
-                break; // break out, we'll use a different strategy
-            }
-            break;
-        }
-    }
-
-    // Better approach: insert each wall with its center position. The query radius in
-    // resolve_wall_collisions is generous enough. But for very large walls (like boundary walls
-    // spanning the full map), this won't work well. Let's create multiple entries per wall
-    // by creating WallEntry copies positioned at each cell they overlap.
-    let mut grid2 = SpatialGrid::new(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE);
-    for wall in walls {
-        let min_col = (wall.x / WALL_GRID_CELL_SIZE).floor().max(0.0) as usize;
-        let max_col = ((wall.x + wall.w) / WALL_GRID_CELL_SIZE)
-            .floor()
-            .max(0.0) as usize;
-        let min_row = (wall.y / WALL_GRID_CELL_SIZE).floor().max(0.0) as usize;
-        let max_row = ((wall.y + wall.h) / WALL_GRID_CELL_SIZE)
-            .floor()
-            .max(0.0) as usize;
-
-        for row in min_row..=max_row {
-            for col in min_col..=max_col {
-                let cx = (col as f64 + 0.5) * WALL_GRID_CELL_SIZE;
-                let cy = (row as f64 + 0.5) * WALL_GRID_CELL_SIZE;
-                // Create entry whose pos() returns cell center so it's inserted into correct cell
-                let entry = CellWallEntry {
-                    x: wall.x,
-                    y: wall.y,
-                    w: wall.w,
-                    h: wall.h,
-                    cell_x: cx,
-                    cell_y: cy,
-                };
-                // But our grid is SpatialGrid<WallEntry>, not SpatialGrid<CellWallEntry>.
-                // We need a unified approach.
-                let _ = entry;
-            }
-        }
-    }
-
-    // Simplest correct approach: use SpatialGrid with WallEntry where pos() returns center,
-    // and insert once per cell. We'll make WallEntry carry cell_x/cell_y for positioning
-    // but that changes the struct. Instead, let's just use a simple vec-based approach
-    // embedded in the grid by directly manipulating cells... but SpatialGrid doesn't expose
-    // cells publicly.
-    //
-    // OK, the cleanest solution: just insert each wall once (centered), and use a generous
-    // query radius. The max wall dimension is MAP_WIDTH (2400) for boundary walls.
-    // For the boundary walls, this won't work with a single-cell insert.
-    //
-    // Let's just fall back to: insert at center, and when querying, use a large enough radius.
-    // Actually, resolve_wall_collisions already queries with radius + WALL_GRID_CELL_SIZE.
-    // The boundary walls are handled by the map-bounds clamping that happens before wall
-    // collision resolution. So the spatial grid mostly needs to handle interior walls which
-    // are all small enough.
-    //
-    // For safety, let's insert each wall at multiple points along its extent.
-
-    drop(grid);
-    let mut grid = SpatialGrid::new(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE);
-    for wall in walls {
-        // Sample points along the wall, one per cell it spans
-        let x_steps = ((wall.w / WALL_GRID_CELL_SIZE).ceil() as usize).max(1);
-        let y_steps = ((wall.h / WALL_GRID_CELL_SIZE).ceil() as usize).max(1);
-
-        let mut inserted_cells = HashSet::new();
-        for yi in 0..=y_steps {
-            for xi in 0..=x_steps {
-                let sx = wall.x + (xi as f64 / x_steps as f64) * wall.w;
-                let sy = wall.y + (yi as f64 / y_steps as f64) * wall.h;
-                // Determine which cell this point falls in
-                let col = (sx / WALL_GRID_CELL_SIZE) as usize;
-                let row = (sy / WALL_GRID_CELL_SIZE) as usize;
-                if inserted_cells.insert((col, row)) {
-                    // Insert a WallEntry positioned at this sample point
-                    // so it ends up in the right cell
-                    grid.insert(WallEntryAt {
-                        x: wall.x,
-                        y: wall.y,
-                        w: wall.w,
-                        h: wall.h,
-                        pos_x: sx.min(MAP_WIDTH - 1.0).max(0.0),
-                        pos_y: sy.min(MAP_HEIGHT - 1.0).max(0.0),
-                    });
-                }
-            }
-        }
-    }
-
-    // Hmm, but grid is SpatialGrid<WallEntry> and WallEntryAt is different.
-    // Let me rethink this entirely.
-
-    drop(grid);
-
-    // Final approach: use SpatialGrid<WallEntryAt> everywhere for the wall grid.
-    build_wall_grid_impl(walls)
-}
-
-#[derive(Clone, Debug)]
-struct WallEntryAt {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    pos_x: f64,
-    pos_y: f64,
-}
-
-impl crate::spatial_grid::Positioned for WallEntryAt {
-    fn pos(&self) -> (f64, f64) {
-        (self.pos_x, self.pos_y)
-    }
-}
-
-fn build_wall_grid_impl(walls: &[Wall]) -> SpatialGrid<WallEntryAt> {
-    let mut grid = SpatialGrid::new(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE);
-    for wall in walls {
-        let x_steps = ((wall.w / WALL_GRID_CELL_SIZE).ceil() as usize).max(1);
-        let y_steps = ((wall.h / WALL_GRID_CELL_SIZE).ceil() as usize).max(1);
-
-        let mut inserted_cells = HashSet::new();
-        for yi in 0..=y_steps {
-            for xi in 0..=x_steps {
-                let sx = wall.x + (xi as f64 / x_steps as f64) * wall.w;
-                let sy = wall.y + (yi as f64 / y_steps as f64) * wall.h;
-                let col = (sx / WALL_GRID_CELL_SIZE) as usize;
-                let row = (sy / WALL_GRID_CELL_SIZE) as usize;
-                if inserted_cells.insert((col, row)) {
-                    grid.insert(WallEntryAt {
-                        x: wall.x,
-                        y: wall.y,
-                        w: wall.w,
-                        h: wall.h,
-                        pos_x: sx.min(MAP_WIDTH - 1.0).max(0.0),
-                        pos_y: sy.min(MAP_HEIGHT - 1.0).max(0.0),
-                    });
-                }
-            }
-        }
-    }
-    grid
-}
-
-fn resolve_wall_collisions_at(
+fn resolve_wall_collisions(
     mut px: f64,
     mut py: f64,
     radius: f64,
-    wall_grid: &SpatialGrid<WallEntryAt>,
+    wall_grid: &SpatialGrid<WallEntry>,
 ) -> (f64, f64) {
     let query_radius = radius + WALL_GRID_CELL_SIZE;
     let nearby = wall_grid.query(px, py, query_radius);
 
+    // Dedup walls by their rect (same wall may appear in multiple cells)
     let mut seen = HashSet::new();
-    let mut walls: Vec<&WallEntryAt> = Vec::new();
+    let mut walls: Vec<&WallEntry> = Vec::new();
     for w in &nearby {
         let key = (
             (w.x * 100.0) as i64,
@@ -332,7 +153,11 @@ fn resolve_wall_collisions_at(
     (px, py)
 }
 
-fn bullet_hits_wall_at(px: f64, py: f64, wall_grid: &SpatialGrid<WallEntryAt>) -> bool {
+fn point_in_rect(px: f64, py: f64, rx: f64, ry: f64, rw: f64, rh: f64) -> bool {
+    px >= rx && px <= rx + rw && py >= ry && py <= ry + rh
+}
+
+fn bullet_hits_wall(px: f64, py: f64, wall_grid: &SpatialGrid<WallEntry>) -> bool {
     let nearby = wall_grid.query(px, py, WALL_GRID_CELL_SIZE);
     for w in &nearby {
         if point_in_rect(px, py, w.x, w.y, w.w, w.h) {
@@ -340,6 +165,55 @@ fn bullet_hits_wall_at(px: f64, py: f64, wall_grid: &SpatialGrid<WallEntryAt>) -
         }
     }
     false
+}
+
+// ---------- Build wall grid ----------
+
+fn build_wall_grid(walls: &[Wall]) -> SpatialGrid<WallEntry> {
+    let mut grid: SpatialGrid<WallEntry> =
+        SpatialGrid::new(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE);
+
+    let grid_cols = (MAP_WIDTH / WALL_GRID_CELL_SIZE).ceil() as usize;
+    let grid_rows = (MAP_HEIGHT / WALL_GRID_CELL_SIZE).ceil() as usize;
+
+    for wall in walls {
+        let min_col = (wall.x / WALL_GRID_CELL_SIZE).floor().max(0.0) as usize;
+        let max_col = ((wall.x + wall.w) / WALL_GRID_CELL_SIZE)
+            .floor()
+            .max(0.0) as usize;
+        let min_row = (wall.y / WALL_GRID_CELL_SIZE).floor().max(0.0) as usize;
+        let max_row = ((wall.y + wall.h) / WALL_GRID_CELL_SIZE)
+            .floor()
+            .max(0.0) as usize;
+
+        for row in min_row..=max_row.min(grid_rows - 1) {
+            for col in min_col..=max_col.min(grid_cols - 1) {
+                let cx = (col as f64 + 0.5) * WALL_GRID_CELL_SIZE;
+                let cy = (row as f64 + 0.5) * WALL_GRID_CELL_SIZE;
+                grid.insert(WallEntry {
+                    x: wall.x,
+                    y: wall.y,
+                    w: wall.w,
+                    h: wall.h,
+                    cell_x: cx.min(MAP_WIDTH - 1.0),
+                    cell_y: cy.min(MAP_HEIGHT - 1.0),
+                });
+            }
+        }
+    }
+    grid
+}
+
+// ---------- Score helper ----------
+
+fn zombie_score(zombie_type: &ZombieType) -> f64 {
+    match zombie_type {
+        ZombieType::Vampire => 100.0,
+        ZombieType::Brute => 75.0,
+        ZombieType::Devil => 50.0,
+        ZombieType::Crawler => 25.0,
+        ZombieType::Zombie => 10.0,
+    }
 }
 
 // ---------- Game ----------
@@ -360,7 +234,7 @@ pub struct Game {
     game_time: f64,
     ammo_pickups: Vec<AmmoPickupInternal>,
     walls: Vec<Wall>,
-    wall_grid: SpatialGrid<WallEntryAt>,
+    wall_grid: SpatialGrid<WallEntry>,
     zombie_grid: SpatialGrid<ZombieRef>,
     player_grid: SpatialGrid<PlayerRef>,
 }
@@ -368,7 +242,7 @@ pub struct Game {
 impl Game {
     pub fn new() -> Self {
         let walls = generate_walls();
-        let wall_grid = build_wall_grid_impl(&walls);
+        let wall_grid = build_wall_grid(&walls);
 
         let ammo_points = ammo_spawn_points();
         let ammo_pickups: Vec<AmmoPickupInternal> = ammo_points
@@ -406,10 +280,10 @@ impl Game {
     }
 
     pub fn add_player(&mut self, id: &str) {
-        let spawn = spawn_zones();
-        let mut rng = rand::rng();
-        let idx = rng.random_range(0..spawn.len());
-        let (sx, sy) = spawn[idx];
+        let zones = spawn_zones();
+        let mut rng = rand::thread_rng();
+        let idx = rng.gen_range(0..zones.len());
+        let (sx, sy) = zones[idx];
 
         let player = Player {
             id: id.to_string(),
@@ -454,19 +328,11 @@ impl Game {
             }
         }
 
-        // Collect player IDs to iterate over
+        // Update players
         let player_ids: Vec<String> = self.players.keys().cloned().collect();
 
         for pid in &player_ids {
-            let health = {
-                let p = match self.players.get(pid) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                p.health
-            };
-
-            if health <= 0.0 {
+            if self.players.get(pid).map_or(true, |p| p.health <= 0.0) {
                 continue;
             }
 
@@ -497,53 +363,47 @@ impl Game {
                 dy /= len;
             }
 
-            let p = self.players.get_mut(pid).unwrap();
-            p.pos.x += dx * PLAYER_SPEED * dt;
-            p.pos.y += dy * PLAYER_SPEED * dt;
+            {
+                let p = self.players.get_mut(pid).unwrap();
+                p.pos.x += dx * PLAYER_SPEED * dt;
+                p.pos.y += dy * PLAYER_SPEED * dt;
 
-            // Clamp to map bounds
-            p.pos.x = p.pos.x.max(PLAYER_RADIUS).min(MAP_WIDTH - PLAYER_RADIUS);
-            p.pos.y = p.pos.y.max(PLAYER_RADIUS).min(MAP_HEIGHT - PLAYER_RADIUS);
+                p.pos.x = p.pos.x.max(PLAYER_RADIUS).min(MAP_WIDTH - PLAYER_RADIUS);
+                p.pos.y = p.pos.y.max(PLAYER_RADIUS).min(MAP_HEIGHT - PLAYER_RADIUS);
 
-            // Resolve wall collisions
-            let (nx, ny) =
-                resolve_wall_collisions_at(p.pos.x, p.pos.y, PLAYER_RADIUS, &self.wall_grid);
-            p.pos.x = nx;
-            p.pos.y = ny;
+                let (nx, ny) =
+                    resolve_wall_collisions(p.pos.x, p.pos.y, PLAYER_RADIUS, &self.wall_grid);
+                p.pos.x = nx;
+                p.pos.y = ny;
 
-            // Update angle
-            p.angle = (input.mouse_y - p.pos.y).atan2(input.mouse_x - p.pos.x);
+                p.angle = (input.mouse_y - p.pos.y).atan2(input.mouse_x - p.pos.x);
 
-            // Weapon switch
-            if input.switch_weapon {
-                p.weapon = p.weapon.next();
+                if input.switch_weapon {
+                    p.weapon = p.weapon.next();
+                }
             }
 
             // Decrement cooldowns
-            let shoot_cd = self.shoot_cooldowns.entry(pid.clone()).or_insert(0.0);
-            *shoot_cd -= dt;
-            let melee_cd = self.melee_cooldowns.entry(pid.clone()).or_insert(0.0);
-            *melee_cd -= dt;
+            *self.shoot_cooldowns.entry(pid.clone()).or_insert(0.0) -= dt;
+            *self.melee_cooldowns.entry(pid.clone()).or_insert(0.0) -= dt;
 
             // Melee attack
-            if input.melee && *melee_cd <= 0.0 {
-                *melee_cd = MELEE_COOLDOWN;
+            let melee_cd = *self.melee_cooldowns.get(pid).unwrap();
+            if input.melee && melee_cd <= 0.0 {
+                self.melee_cooldowns.insert(pid.clone(), MELEE_COOLDOWN);
 
                 let p = self.players.get(pid).unwrap();
                 let px = p.pos.x;
                 let py = p.pos.y;
                 let p_angle = p.angle;
 
-                let nearby_zombies = self.zombie_grid.query(px, py, MELEE_RANGE);
-                let mut zombie_indices_to_check: Vec<usize> = nearby_zombies
-                    .iter()
-                    .map(|zr| zr.index)
-                    .collect();
-                zombie_indices_to_check.sort_unstable();
-                zombie_indices_to_check.dedup();
+                let nearby = self.zombie_grid.query(px, py, MELEE_RANGE);
+                let mut indices: Vec<usize> = nearby.iter().map(|zr| zr.index).collect();
+                indices.sort_unstable();
+                indices.dedup();
 
                 let mut kills = 0u32;
-                for &zi in &zombie_indices_to_check {
+                for &zi in &indices {
                     if zi >= self.zombies.len() {
                         continue;
                     }
@@ -554,6 +414,7 @@ impl Game {
                     if dist > MELEE_RANGE {
                         continue;
                     }
+
                     let angle_to_zombie = zdy.atan2(zdx);
                     let mut angle_diff = (angle_to_zombie - p_angle).abs();
                     if angle_diff > PI {
@@ -563,10 +424,8 @@ impl Game {
                         continue;
                     }
 
-                    // Apply damage
                     self.zombies[zi].health -= MELEE_DAMAGE;
 
-                    // Knockback
                     if dist > 0.0 {
                         let knx = zdx / dist;
                         let kny = zdy / dist;
@@ -582,18 +441,18 @@ impl Game {
                         kills += 1;
                     }
                 }
-                self.wave_kills += kills;
 
-                // Remove dead zombies (iterate backwards)
+                self.wave_kills += kills;
                 self.zombies.retain(|z| z.health > 0.0);
             }
 
             // Shooting
-            let shoot_cd = self.shoot_cooldowns.get_mut(pid).unwrap();
-            if input.shooting && *shoot_cd <= 0.0 {
+            let shoot_cd = *self.shoot_cooldowns.get(pid).unwrap_or(&0.0);
+            if input.shooting && shoot_cd <= 0.0 {
                 let p = self.players.get(pid).unwrap();
                 if p.ammo > 0.0 {
-                    *shoot_cd = SHOOT_COOLDOWN;
+                    self.shoot_cooldowns.insert(pid.clone(), SHOOT_COOLDOWN);
+
                     let angle = p.angle;
                     let px = p.pos.x;
                     let py = p.pos.y;
@@ -601,17 +460,17 @@ impl Game {
                     let damage = weapon.damage();
                     let owner_id = pid.clone();
 
-                    let p = self.players.get_mut(pid).unwrap();
-                    p.ammo -= 1.0;
+                    self.players.get_mut(pid).unwrap().ammo -= 1.0;
 
                     match weapon {
                         Weapon::Shotgun => {
-                            // Shotgun fires multiple pellets
                             let spread = PI / 12.0;
                             for i in 0..5 {
                                 let a = angle - spread * 2.0 + spread * i as f64;
-                                let bullet = Bullet {
-                                    id: Uuid::new_v4().to_string(),
+                                let bid = Uuid::new_v4().to_string();
+                                self.bullet_lifetimes.insert(bid.clone(), BULLET_LIFETIME);
+                                self.bullets.push(Bullet {
+                                    id: bid,
                                     pos: Vector2 {
                                         x: px + a.cos() * PLAYER_RADIUS,
                                         y: py + a.sin() * PLAYER_RADIUS,
@@ -622,15 +481,14 @@ impl Game {
                                     },
                                     owner_id: owner_id.clone(),
                                     damage: damage / 5.0,
-                                };
-                                self.bullet_lifetimes
-                                    .insert(bullet.id.clone(), BULLET_LIFETIME);
-                                self.bullets.push(bullet);
+                                });
                             }
                         }
                         _ => {
-                            let bullet = Bullet {
-                                id: Uuid::new_v4().to_string(),
+                            let bid = Uuid::new_v4().to_string();
+                            self.bullet_lifetimes.insert(bid.clone(), BULLET_LIFETIME);
+                            self.bullets.push(Bullet {
+                                id: bid,
                                 pos: Vector2 {
                                     x: px + angle.cos() * PLAYER_RADIUS,
                                     y: py + angle.sin() * PLAYER_RADIUS,
@@ -639,12 +497,9 @@ impl Game {
                                     x: angle.cos() * BULLET_SPEED,
                                     y: angle.sin() * BULLET_SPEED,
                                 },
-                                owner_id: owner_id.clone(),
+                                owner_id,
                                 damage,
-                            };
-                            self.bullet_lifetimes
-                                .insert(bullet.id.clone(), BULLET_LIFETIME);
-                            self.bullets.push(bullet);
+                            });
                         }
                     }
                 }
@@ -681,29 +536,33 @@ impl Game {
             bullet.pos.y += bullet.vel.y * dt;
         }
 
-        // Update bullet lifetimes and filter bullets
-        let wall_grid = &self.wall_grid;
-        let bullet_lifetimes = &mut self.bullet_lifetimes;
-        self.bullets.retain(|b| {
-            if let Some(lt) = bullet_lifetimes.get_mut(&b.id) {
-                *lt -= dt;
-                if *lt <= 0.0 {
-                    bullet_lifetimes.remove(&b.id);
+        // Filter bullets (OOB / lifetime / wall)
+        {
+            let wall_grid = &self.wall_grid;
+            let lifetimes = &mut self.bullet_lifetimes;
+            self.bullets.retain(|b| {
+                if let Some(lt) = lifetimes.get_mut(&b.id) {
+                    *lt -= dt;
+                    if *lt <= 0.0 {
+                        lifetimes.remove(&b.id);
+                        return false;
+                    }
+                }
+                if b.pos.x < 0.0
+                    || b.pos.x > MAP_WIDTH
+                    || b.pos.y < 0.0
+                    || b.pos.y > MAP_HEIGHT
+                {
+                    lifetimes.remove(&b.id);
                     return false;
                 }
-            }
-            // OOB check
-            if b.pos.x < 0.0 || b.pos.x > MAP_WIDTH || b.pos.y < 0.0 || b.pos.y > MAP_HEIGHT {
-                bullet_lifetimes.remove(&b.id);
-                return false;
-            }
-            // Wall check
-            if bullet_hits_wall_at(b.pos.x, b.pos.y, wall_grid) {
-                bullet_lifetimes.remove(&b.id);
-                return false;
-            }
-            true
-        });
+                if bullet_hits_wall(b.pos.x, b.pos.y, wall_grid) {
+                    lifetimes.remove(&b.id);
+                    return false;
+                }
+                true
+            });
+        }
 
         // Spawn zombies
         self.zombie_spawn_timer -= dt;
@@ -720,12 +579,12 @@ impl Game {
                 .min(MAX_ZOMBIES_HARD_CAP) as usize;
 
             if self.zombies.len() < max_zombies && living_players > 0 {
-                let mut rng = rand::rng();
-                let spawn = spawn_zones();
-                let idx = rng.random_range(0..spawn.len());
-                let (sx, sy) = spawn[idx];
+                let mut rng = rand::thread_rng();
+                let zones = spawn_zones();
+                let idx = rng.gen_range(0..zones.len());
+                let (sx, sy) = zones[idx];
 
-                let r: f64 = rng.random();
+                let r: f64 = rng.gen();
                 let wave = self.wave;
 
                 let (zombie_type, hp, speed) = if wave >= 5 && r < 0.05 {
@@ -760,15 +619,14 @@ impl Game {
                     )
                 };
 
-                let zombie = Zombie {
+                self.zombies.push(Zombie {
                     id: Uuid::new_v4().to_string(),
                     zombie_type,
                     pos: Vector2 { x: sx, y: sy },
                     health: hp,
                     max_health: hp,
                     speed,
-                };
-                self.zombies.push(zombie);
+                });
             }
         }
 
@@ -790,11 +648,9 @@ impl Game {
             .map(|p| (p.id.clone(), p.pos.x, p.pos.y))
             .collect();
 
-        if player_positions.is_empty() {
-            // Check game over below
-        } else {
-            let mut zombie_indices_to_remove: Vec<usize> = Vec::new();
-            let mut bullet_indices_to_remove: Vec<usize> = Vec::new();
+        if !player_positions.is_empty() {
+            let mut zombie_kill_indices: Vec<usize> = Vec::new();
+            let mut bullet_kill_indices: Vec<usize> = Vec::new();
             let mut score_awards: Vec<(String, f64)> = Vec::new();
             let mut damage_to_players: Vec<(String, f64)> = Vec::new();
 
@@ -804,11 +660,10 @@ impl Game {
                 let zy = z.pos.y;
                 let z_speed = z.speed;
 
-                // Find nearest player
+                // Find nearest player (spatial query first, then fallback)
                 let mut nearest_id: Option<String> = None;
                 let mut nearest_dist = f64::MAX;
 
-                // Try spatial query first (600 radius)
                 let nearby_players = self.player_grid.query(zx, zy, 600.0);
                 for pr in &nearby_players {
                     let pdx = pr.x - zx;
@@ -820,7 +675,6 @@ impl Game {
                     }
                 }
 
-                // Fallback: check all players
                 if nearest_id.is_none() {
                     for (pid, px, py) in &player_positions {
                         let pdx = px - zx;
@@ -833,7 +687,7 @@ impl Game {
                     }
                 }
 
-                if let Some(target_id) = &nearest_id {
+                if let Some(ref target_id) = nearest_id {
                     let (tx, ty) = player_positions
                         .iter()
                         .find(|(id, _, _)| id == target_id)
@@ -845,18 +699,14 @@ impl Game {
                     let tdist = (tdx * tdx + tdy * tdy).sqrt();
 
                     if tdist > 0.0 {
-                        let move_x = (tdx / tdist) * z_speed * dt;
-                        let move_y = (tdy / tdist) * z_speed * dt;
                         let z = &mut self.zombies[zi];
-                        z.pos.x += move_x;
-                        z.pos.y += move_y;
+                        z.pos.x += (tdx / tdist) * z_speed * dt;
+                        z.pos.y += (tdy / tdist) * z_speed * dt;
 
-                        // Clamp
                         z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
                         z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
 
-                        // Resolve wall collisions
-                        let (nx, ny) = resolve_wall_collisions_at(
+                        let (nx, ny) = resolve_wall_collisions(
                             z.pos.x,
                             z.pos.y,
                             ZOMBIE_RADIUS,
@@ -886,7 +736,7 @@ impl Game {
 
                 // Check bullet collisions
                 for bi in (0..self.bullets.len()).rev() {
-                    if bullet_indices_to_remove.contains(&bi) {
+                    if bullet_kill_indices.contains(&bi) {
                         continue;
                     }
                     let b = &self.bullets[bi];
@@ -898,30 +748,27 @@ impl Game {
                         let damage = b.damage;
                         let owner_id = b.owner_id.clone();
                         self.zombies[zi].health -= damage;
-                        bullet_indices_to_remove.push(bi);
+                        bullet_kill_indices.push(bi);
 
                         if self.zombies[zi].health <= 0.0 {
                             let score = zombie_score(&self.zombies[zi].zombie_type);
                             score_awards.push((owner_id, score));
-                            zombie_indices_to_remove.push(zi);
-                            break; // zombie is dead, stop checking bullets
+                            zombie_kill_indices.push(zi);
+                            break;
                         }
                     }
                 }
             }
 
             // Decrement zombie attack cooldowns
-            for (_, cd) in self.zombie_attack_cooldowns.iter_mut() {
+            for cd in self.zombie_attack_cooldowns.values_mut() {
                 *cd -= dt;
             }
 
             // Apply damage to players
             for (pid, dmg) in &damage_to_players {
                 if let Some(p) = self.players.get_mut(pid) {
-                    p.health -= dmg;
-                    if p.health < 0.0 {
-                        p.health = 0.0;
-                    }
+                    p.health = (p.health - dmg).max(0.0);
                 }
             }
 
@@ -932,22 +779,21 @@ impl Game {
                 }
             }
 
-            // Remove dead zombies
-            zombie_indices_to_remove.sort_unstable();
-            zombie_indices_to_remove.dedup();
-            for &zi in zombie_indices_to_remove.iter().rev() {
+            // Remove dead zombies (reverse sorted to keep indices valid)
+            zombie_kill_indices.sort_unstable();
+            zombie_kill_indices.dedup();
+            for &zi in zombie_kill_indices.iter().rev() {
                 if zi < self.zombies.len() {
-                    self.zombie_attack_cooldowns
-                        .remove(&self.zombies[zi].id);
+                    self.zombie_attack_cooldowns.remove(&self.zombies[zi].id);
                     self.zombies.swap_remove(zi);
                 }
             }
-            self.wave_kills += zombie_indices_to_remove.len() as u32;
+            self.wave_kills += zombie_kill_indices.len() as u32;
 
             // Remove bullets that hit zombies
-            bullet_indices_to_remove.sort_unstable();
-            bullet_indices_to_remove.dedup();
-            for &bi in bullet_indices_to_remove.iter().rev() {
+            bullet_kill_indices.sort_unstable();
+            bullet_kill_indices.dedup();
+            for &bi in bullet_kill_indices.iter().rev() {
                 if bi < self.bullets.len() {
                     self.bullet_lifetimes.remove(&self.bullets[bi].id);
                     self.bullets.swap_remove(bi);
@@ -962,13 +808,12 @@ impl Game {
         }
 
         // Game over check
-        let any_alive = self.players.values().any(|p| p.health > 0.0);
-        if !self.players.is_empty() && !any_alive {
+        if !self.players.is_empty() && !self.players.values().any(|p| p.health > 0.0) {
             self.game_over = true;
         }
     }
 
-    // --- Getters ---
+    // ---- Getters ----
 
     pub fn players(&self) -> &HashMap<String, Player> {
         &self.players
@@ -1017,15 +862,5 @@ impl Game {
 
     pub fn is_game_over(&self) -> bool {
         self.game_over
-    }
-}
-
-fn zombie_score(zombie_type: &ZombieType) -> f64 {
-    match zombie_type {
-        ZombieType::Vampire => 100.0,
-        ZombieType::Brute => 75.0,
-        ZombieType::Devil => 50.0,
-        ZombieType::Crawler => 25.0,
-        ZombieType::Zombie => 10.0,
     }
 }
