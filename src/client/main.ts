@@ -13,9 +13,7 @@ const input: ClientInput = {
 };
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const wsPort = import.meta.env.DEV ? '3000' : window.location.port;
-const wsHost = `${window.location.hostname}:${wsPort}`;
-const ws = new WebSocket(`${wsProtocol}//${wsHost}`);
+const ws = new WebSocket(`${wsProtocol}//${window.location.host}`);
 
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);

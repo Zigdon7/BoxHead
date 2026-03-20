@@ -7,7 +7,11 @@ import { ClientInput } from '../shared/types';
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(express.static(path.join(__dirname, '../client')));
+// In production, serve built client from dist/client
+const clientDir = process.env.NODE_ENV === 'production'
+  ? path.join(__dirname, '../../dist/client')
+  : path.join(__dirname, '../client');
+app.use(express.static(clientDir));
 
 const server = app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
