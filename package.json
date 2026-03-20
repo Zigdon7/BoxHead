@@ -1,29 +1,14 @@
 {
   "name": "boxhead-remake",
-  "version": "1.0.0",
-  "description": "BoxHead remake with WebSockets and TypeScript",
+  "version": "2.0.0",
+  "description": "BoxHead remake — Rust backend + TypeScript/Vite frontend",
   "scripts": {
-    "dev:client": "vite",
-    "dev:server": "nodemon --exec ts-node --project tsconfig.server.json src/server/index.ts",
-    "dev": "npm run dev:client & npm run dev:server",
-    "build:client": "vite build",
-    "build:server": "tsc -p tsconfig.server.json",
-    "build": "npm run build:client && npm run build:server",
-    "start": "node dist/server/index.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "ws": "^8.16.0"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.12.7",
-    "@types/ws": "^8.5.10",
-    "@vitest/ui": "^4.1.0",
-    "nodemon": "^3.1.0",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.4.5",
-    "vite": "^5.2.8",
-    "vitest": "^4.1.0"
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && cargo watch -x run",
+    "dev": "npm run dev:backend & npm run dev:frontend",
+    "build:frontend": "cd frontend && npm run build",
+    "build:backend": "cd backend && cargo build --release",
+    "build": "npm run build:frontend && npm run build:backend",
+    "generate:types": "cd frontend && npm run generate:types"
   }
 }

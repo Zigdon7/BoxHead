@@ -1,4 +1,19 @@
-import { GameState, Player, Zombie, Bullet, Wall, ClientInput, WEAPON_STATS, DeltaState, SnapshotState, InitPayload, ServerMessage } from '../shared/types';
+import { Player, Zombie, Bullet, Wall, ClientInput, DeltaState, SnapshotState, InitPayload } from './generated/types';
+import { WEAPON_STATS } from './constants';
+
+// Local composite type for rendering
+interface GameState {
+  players: Record<string, Player>;
+  zombies: Zombie[];
+  bullets: Bullet[];
+  wave: number;
+  barricades: unknown[];
+  walls: Wall[];
+  ammoPickups: { id: string; pos: { x: number; y: number }; amount: number; respawnAt: number }[];
+  mapWidth: number;
+  mapHeight: number;
+  gameOver: boolean;
+}
 
 const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -181,7 +196,7 @@ const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
 // --- Message handling ---
 ws.onmessage = (event) => {
-  const data: ServerMessage = JSON.parse(event.data);
+  const data = JSON.parse(event.data) as { type: string };
 
   if (data.type === 'init') {
     const init = data as InitPayload;

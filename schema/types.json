@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "boxhead-types",
+  "$defs": {
+    "Vector2": {
+      "type": "object",
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      },
+      "required": ["x", "y"]
+    },
+    "Weapon": {
+      "type": "string",
+      "enum": ["pistol", "uzi", "shotgun", "barrel", "barricade"]
+    },
+    "ZombieType": {
+      "type": "string",
+      "enum": ["zombie", "devil", "crawler", "brute", "vampire"]
+    },
+    "Player": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "pos": { "$ref": "#/$defs/Vector2" },
+        "angle": { "type": "number" },
+        "score": { "type": "number" },
+        "health": { "type": "number" },
+        "ammo": { "type": "number" },
+        "maxAmmo": { "type": "number" },
+        "weapon": { "$ref": "#/$defs/Weapon" }
+      },
+      "required": ["id", "pos", "angle", "score", "health", "ammo", "maxAmmo", "weapon"]
+    },
+    "Zombie": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "$ref": "#/$defs/ZombieType" },
+        "pos": { "$ref": "#/$defs/Vector2" },
+        "health": { "type": "number" },
+        "maxHealth": { "type": "number" },
+        "speed": { "type": "number" }
+      },
+      "required": ["id", "type", "pos", "health", "maxHealth", "speed"]
+    },
+    "Bullet": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "pos": { "$ref": "#/$defs/Vector2" },
+        "vel": { "$ref": "#/$defs/Vector2" },
+        "ownerId": { "type": "string" },
+        "damage": { "type": "number" }
+      },
+      "required": ["id", "pos", "vel", "ownerId", "damage"]
+    },
+    "Wall": {
+      "type": "object",
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "w": { "type": "number" },
+        "h": { "type": "number" }
+      },
+      "required": ["x", "y", "w", "h"]
+    },
+    "AmmoSpawnPoint": {
+      "type": "object",
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "amount": { "type": "number" }
+      },
+      "required": ["x", "y", "amount"]
+    },
+    "AmmoPickupState": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "available": { "type": "boolean" }
+      },
+      "required": ["id", "available"]
+    },
+    "ClientInput": {
+      "type": "object",
+      "properties": {
+        "up": { "type": "boolean" },
+        "down": { "type": "boolean" },
+        "left": { "type": "boolean" },
+        "right": { "type": "boolean" },
+        "mouseX": { "type": "number" },
+        "mouseY": { "type": "number" },
+        "shooting": { "type": "boolean" },
+        "melee": { "type": "boolean" },
+        "switchWeapon": { "type": "boolean" }
+      },
+      "required": ["up", "down", "left", "right", "mouseX", "mouseY", "shooting", "melee", "switchWeapon"]
+    },
+    "InitPayload": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "init" },
+        "id": { "type": "string" },
+        "walls": { "type": "array", "items": { "$ref": "#/$defs/Wall" } },
+        "mapWidth": { "type": "number" },
+        "mapHeight": { "type": "number" },
+        "ammoSpawnPoints": { "type": "array", "items": { "$ref": "#/$defs/AmmoSpawnPoint" } }
+      },
+      "required": ["type", "id", "walls", "mapWidth", "mapHeight", "ammoSpawnPoints"]
+    },
+    "SnapshotState": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "snapshot" },
+        "tick": { "type": "number" },
+        "players": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Player" }
+        },
+        "zombies": { "type": "array", "items": { "$ref": "#/$defs/Zombie" } },
+        "bullets": { "type": "array", "items": { "$ref": "#/$defs/Bullet" } },
+        "wave": { "type": "number" },
+        "ammoPickups": { "type": "array", "items": { "$ref": "#/$defs/AmmoPickupState" } },
+        "gameOver": { "type": "boolean" }
+      },
+      "required": ["type", "tick", "players", "zombies", "bullets", "wave", "ammoPickups", "gameOver"]
+    },
+    "PlayerDelta": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "pos": { "$ref": "#/$defs/Vector2" },
+        "angle": { "type": "number" },
+        "score": { "type": "number" },
+        "health": { "type": "number" },
+        "ammo": { "type": "number" },
+        "maxAmmo": { "type": "number" },
+        "weapon": { "$ref": "#/$defs/Weapon" }
+      },
+      "required": ["id"]
+    },
+    "ZombieDelta": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "pos": { "$ref": "#/$defs/Vector2" },
+        "health": { "type": "number" }
+      },
+      "required": ["id"]
+    },
+    "DeltaState": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "delta" },
+        "tick": { "type": "number" },
+        "players": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/PlayerDelta" }
+        },
+        "playersRemoved": { "type": "array", "items": { "type": "string" } },
+        "zombiesNew": { "type": "array", "items": { "$ref": "#/$defs/Zombie" } },
+        "zombiesUpdated": { "type": "array", "items": { "$ref": "#/$defs/ZombieDelta" } },
+        "zombiesRemoved": { "type": "array", "items": { "type": "string" } },
+        "bulletsNew": { "type": "array", "items": { "$ref": "#/$defs/Bullet" } },
+        "bulletsRemoved": { "type": "array", "items": { "type": "string" } },
+        "wave": { "type": "number" },
+        "ammoPickups": { "type": "array", "items": { "$ref": "#/$defs/AmmoPickupState" } },
+        "gameOver": { "type": "boolean" }
+      },
+      "required": ["type", "tick"]
+    }
+  }
+}

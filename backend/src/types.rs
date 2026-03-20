@@ -1,0 +1,225 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Vector2 {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum Weapon {
+    Pistol,
+    Uzi,
+    Shotgun,
+    Barrel,
+    Barricade,
+}
+
+impl Weapon {
+    pub fn damage(&self) -> f64 {
+        match self {
+            Weapon::Pistol => 25.0,
+            Weapon::Uzi => 15.0,
+            Weapon::Shotgun => 80.0,
+            Weapon::Barrel => 0.0,
+            Weapon::Barricade => 0.0,
+        }
+    }
+
+    pub fn next(&self) -> Weapon {
+        match self {
+            Weapon::Pistol => Weapon::Uzi,
+            Weapon::Uzi => Weapon::Shotgun,
+            Weapon::Shotgun => Weapon::Barrel,
+            Weapon::Barrel => Weapon::Barricade,
+            Weapon::Barricade => Weapon::Pistol,
+        }
+    }
+}
+
+pub const MELEE_DAMAGE: f64 = 35.0;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ZombieType {
+    Zombie,
+    Devil,
+    Crawler,
+    Brute,
+    Vampire,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Player {
+    pub id: String,
+    pub pos: Vector2,
+    pub angle: f64,
+    pub score: f64,
+    pub health: f64,
+    pub ammo: f64,
+    #[serde(rename = "maxAmmo")]
+    pub max_ammo: f64,
+    pub weapon: Weapon,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Zombie {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub zombie_type: ZombieType,
+    pub pos: Vector2,
+    pub health: f64,
+    #[serde(rename = "maxHealth")]
+    pub max_health: f64,
+    pub speed: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Bullet {
+    pub id: String,
+    pub pos: Vector2,
+    pub vel: Vector2,
+    #[serde(rename = "ownerId")]
+    pub owner_id: String,
+    pub damage: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AmmoSpawnPoint {
+    pub x: f64,
+    pub y: f64,
+    pub amount: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AmmoPickupState {
+    pub id: String,
+    pub available: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClientInput {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    #[serde(rename = "mouseX")]
+    pub mouse_x: f64,
+    #[serde(rename = "mouseY")]
+    pub mouse_y: f64,
+    pub shooting: bool,
+    pub melee: bool,
+    #[serde(rename = "switchWeapon")]
+    pub switch_weapon: bool,
+}
+
+// --- Network messages ---
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InitPayload {
+    #[serde(rename = "type")]
+    pub msg_type: String, // "init"
+    pub id: String,
+    pub walls: Vec<crate::map::Wall>,
+    #[serde(rename = "mapWidth")]
+    pub map_width: f64,
+    #[serde(rename = "mapHeight")]
+    pub map_height: f64,
+    #[serde(rename = "ammoSpawnPoints")]
+    pub ammo_spawn_points: Vec<AmmoSpawnPoint>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotState {
+    #[serde(rename = "type")]
+    pub msg_type: String, // "snapshot"
+    pub tick: u64,
+    pub players: HashMap<String, Player>,
+    pub zombies: Vec<Zombie>,
+    pub bullets: Vec<Bullet>,
+    pub wave: u32,
+    #[serde(rename = "ammoPickups")]
+    pub ammo_pickups: Vec<AmmoPickupState>,
+    #[serde(rename = "gameOver")]
+    pub game_over: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerDelta {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<Vector2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ammo: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "maxAmmo")]
+    pub max_ammo: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weapon: Option<Weapon>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ZombieDelta {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<Vector2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<f64>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DeltaState {
+    #[serde(rename = "type")]
+    pub msg_type: String, // "delta"
+    pub tick: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub players: Option<HashMap<String, PlayerDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "playersRemoved")]
+    pub players_removed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "zombiesNew")]
+    pub zombies_new: Option<Vec<Zombie>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "zombiesUpdated")]
+    pub zombies_updated: Option<Vec<ZombieDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "zombiesRemoved")]
+    pub zombies_removed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "bulletsNew")]
+    pub bullets_new: Option<Vec<Bullet>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "bulletsRemoved")]
+    pub bullets_removed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wave: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "ammoPickups")]
+    pub ammo_pickups: Option<Vec<AmmoPickupState>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "gameOver")]
+    pub game_over: Option<bool>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ClientMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub input: Option<ClientInput>,
+}

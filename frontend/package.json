@@ -1,0 +1,17 @@
+{
+  "name": "boxhead-frontend",
+  "version": "1.0.0",
+  "description": "BoxHead frontend client",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "generate:types": "json-schema-to-typescript ../schema/types.json -o src/generated/types.ts --unreachableDefinitions"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vite": "^5.2.8",
+    "vitest": "^4.1.0",
+    "json-schema-to-typescript": "^15.0.0"
+  }
+}
