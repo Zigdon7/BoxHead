@@ -3,6 +3,13 @@ export interface Vector2 {
   y: number;
 }
 
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface Player {
   id: string;
   pos: Vector2;
@@ -29,12 +36,22 @@ export interface Bullet {
   ownerId: string;
 }
 
+export interface Wall {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface GameState {
   players: Record<string, Player>;
   zombies: Zombie[];
   bullets: Bullet[];
   wave: number;
   barricades: any[];
+  walls: Wall[];
+  mapWidth: number;
+  mapHeight: number;
   gameOver: boolean;
 }
 
