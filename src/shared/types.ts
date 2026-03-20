@@ -23,7 +23,7 @@ export interface Player {
 
 export interface Zombie {
   id: string;
-  type: 'zombie' | 'devil';
+  type: 'zombie' | 'devil' | 'crawler' | 'brute' | 'vampire';
   pos: Vector2;
   health: number;
   maxHealth: number;

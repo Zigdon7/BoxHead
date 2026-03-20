@@ -311,7 +311,8 @@ export class Game {
             if (z.health <= 0) {
               this.state.zombies.splice(zi, 1);
               delete this.zombieAttackCooldowns[z.id];
-              p.score += z.type === 'devil' ? 50 : 10;
+              const points = z.type === 'vampire' ? 100 : z.type === 'brute' ? 75 : z.type === 'devil' ? 50 : z.type === 'crawler' ? 25 : 10;
+              p.score += points;
               this.waveKills++;
               if (this.waveKills > this.state.wave * 10) {
                 this.state.wave++;
@@ -381,17 +382,41 @@ export class Game {
     const spawnInterval = Math.max(0.5, 3 - this.state.wave * 0.2);
     if (this.zombieSpawnTimer > spawnInterval) {
       this.zombieSpawnTimer = 0;
-      const isDevil = Math.random() < 0.1 * this.state.wave;
+      
+      let type: 'zombie' | 'devil' | 'crawler' | 'brute' | 'vampire' = 'zombie';
+      const rand = Math.random();
+      if (this.state.wave >= 5 && rand < 0.05) type = 'vampire';
+      else if (this.state.wave >= 4 && rand < 0.15) type = 'brute';
+      else if (this.state.wave >= 3 && rand < 0.30) type = 'crawler';
+      else if (this.state.wave >= 2 && rand < 0.40) type = 'devil';
+
       const zid = Math.random().toString();
       const spawn = SPAWN_ZONES[Math.floor(Math.random() * SPAWN_ZONES.length)];
-      const hp = isDevil ? (50 + this.state.wave * 20) : (20 + this.state.wave * 10);
+      
+      let hp = 20 + this.state.wave * 10;
+      let speed = 50 + this.state.wave * 5;
+
+      if (type === 'devil') {
+        hp = 50 + this.state.wave * 20;
+        speed = 80 + this.state.wave * 5;
+      } else if (type === 'crawler') {
+        hp = 10 + this.state.wave * 5;
+        speed = 120 + this.state.wave * 5;
+      } else if (type === 'brute') {
+        hp = 150 + this.state.wave * 30;
+        speed = 30 + this.state.wave * 2;
+      } else if (type === 'vampire') {
+        hp = 80 + this.state.wave * 15;
+        speed = 90 + this.state.wave * 5;
+      }
+
       this.state.zombies.push({
         id: zid,
-        type: isDevil ? 'devil' : 'zombie',
+        type,
         pos: { x: spawn.x, y: spawn.y },
         health: hp,
         maxHealth: hp,
-        speed: isDevil ? (80 + this.state.wave * 5) : (50 + this.state.wave * 5)
+        speed
       });
       this.zombieAttackCooldowns[zid] = 0;
     }
@@ -437,7 +462,8 @@ export class Game {
             this.state.zombies.splice(i, 1);
             delete this.zombieAttackCooldowns[z.id];
             if (this.state.players[b.ownerId]) {
-              this.state.players[b.ownerId].score += z.type === 'devil' ? 50 : 10;
+              const points = z.type === 'vampire' ? 100 : z.type === 'brute' ? 75 : z.type === 'devil' ? 50 : z.type === 'crawler' ? 25 : 10;
+              this.state.players[b.ownerId].score += points;
             }
             this.waveKills++;
             if (this.waveKills > this.state.wave * 10) {

@@ -4,7 +4,7 @@
   "description": "BoxHead remake with WebSockets and TypeScript",
   "scripts": {
     "dev:client": "vite",
-    "dev:server": "nodemon src/server/index.ts",
+    "dev:server": "nodemon --exec ts-node --project tsconfig.server.json src/server/index.ts",
     "dev": "npm run dev:client & npm run dev:server",
     "build:client": "vite build",
     "build:server": "tsc -p tsconfig.server.json",

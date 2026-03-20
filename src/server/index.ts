@@ -5,7 +5,7 @@ import { Game } from './game';
 import { ClientInput } from '../shared/types';
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3001;
 
 // In production, serve built client from dist/client
 const clientDir = process.env.NODE_ENV === 'production'

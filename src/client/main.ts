@@ -28,7 +28,7 @@ const input: ClientInput = {
 };
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const ws = new WebSocket(`${wsProtocol}//${window.location.host}`);
+const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
@@ -207,54 +207,123 @@ function drawTickHealthBar(sx: number, sy: number, health: number, maxHealth: nu
 function drawZombies() {
   if (!state) return;
 
-  // Get current player's weapon damage for tick marks
   const myPlayer = state.players[myId];
   const weaponDmg = myPlayer ? (WEAPON_STATS[myPlayer.weapon]?.damage ?? 25) : 25;
 
   for (const z of state.zombies) {
     const sx = z.pos.x - camX;
     const sy = z.pos.y - camY;
-    if (sx < -30 || sx > canvas.width + 30 || sy < -30 || sy > canvas.height + 30) continue;
+    if (sx < -60 || sx > canvas.width + 60 || sy < -60 || sy > canvas.height + 60) continue;
 
-    const isDevil = z.type === 'devil';
-    const size = isDevil ? 14 : 10;
+    let size = 10;
+    let bodyColor = '#4CAF50';
+    let shoulderColor = '#388E3C';
+    let eyeColor = '#fff';
 
+    if (z.type === 'devil') { size = 14; bodyColor = '#e53935'; shoulderColor = '#b71c1c'; eyeColor = '#ffeb3b'; }
+    if (z.type === 'crawler') { size = 8; bodyColor = '#bcc6cc'; shoulderColor = '#98a4ab'; eyeColor = '#b71c1c'; }
+    if (z.type === 'brute') { size = 20; bodyColor = '#5d4037'; shoulderColor = '#3e2723'; eyeColor = '#ff5722'; }
+    if (z.type === 'vampire') { size = 12; bodyColor = '#e0e0e0'; shoulderColor = '#9e9e9e'; eyeColor = '#d50000'; }
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    
+    let angle = 0;
+    let closestP = null;
+    let minDist = Infinity;
+    for (const pid in state.players) {
+      const p = state.players[pid];
+      if (p.health <= 0) continue;
+      const dist = Math.hypot(p.pos.x - z.pos.x, p.pos.y - z.pos.y);
+      if (dist < minDist) { minDist = dist; closestP = p; }
+    }
+    if (closestP) {
+      angle = Math.atan2(closestP.pos.y - z.pos.y, closestP.pos.x - z.pos.x);
+    }
+    
     // Shadow
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.beginPath();
-    ctx.ellipse(sx, sy + size + 2, size * 0.8, size * 0.3, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, size + 4, size * 1.5, size * 0.8, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Body
-    ctx.fillStyle = isDevil ? '#e53935' : '#4CAF50';
-    ctx.fillRect(sx - size, sy - size, size * 2, size * 2);
+    ctx.rotate(angle);
 
-    // Eyes
-    ctx.fillStyle = isDevil ? '#ffeb3b' : '#fff';
-    ctx.fillRect(sx - 5, sy - 5, 4, 4);
-    ctx.fillRect(sx + 2, sy - 5, 4, 4);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(sx - 4, sy - 4, 2, 2);
-    ctx.fillRect(sx + 3, sy - 4, 2, 2);
-
-    // Devil horns
-    if (isDevil) {
-      ctx.fillStyle = '#b71c1c';
+    // Cape for vampire
+    if (z.type === 'vampire') {
+      ctx.fillStyle = '#111';
       ctx.beginPath();
-      ctx.moveTo(sx - size, sy - size);
-      ctx.lineTo(sx - size + 4, sy - size - 8);
-      ctx.lineTo(sx - size + 8, sy - size);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.moveTo(sx + size - 8, sy - size);
-      ctx.lineTo(sx + size - 4, sy - size - 8);
-      ctx.lineTo(sx + size, sy - size);
+      ctx.moveTo(-size, 0);
+      ctx.lineTo(-size - 10, -size - 8);
+      ctx.lineTo(-size - 10, size + 8);
       ctx.fill();
     }
 
+    // Shoulders
+    ctx.fillStyle = shoulderColor;
+    ctx.fillRect(-size * 0.8, -size * 1.2, size * 1.6, size * 2.4);
+
+    if (z.type === 'brute') {
+      ctx.fillStyle = '#212121';
+      ctx.fillRect(-size * 0.9, -size * 1.3, size * 1.8, size * 2.6);
+    }
+
+    // Arms
+    ctx.fillStyle = bodyColor;
+    if (z.type === 'crawler') {
+      ctx.fillRect(0, -size * 1.5, size * 1.2, 4);
+      ctx.fillRect(0, size * 1.5 - 4, size * 1.2, 4);
+    } else {
+      ctx.fillRect(size * 0.2, -size * 1.4, size, size * 0.6);
+      ctx.fillRect(size * 0.2, size * 0.8, size, size * 0.6);
+    }
+
+    // Head
+    ctx.fillStyle = bodyColor;
+    ctx.fillRect(-size, -size, size * 2, size * 2);
+    
+    ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-size + 1, -size + 1, size * 2 - 2, size * 2 - 2);
+
+    // Eyes
+    ctx.fillStyle = eyeColor;
+    ctx.fillRect(size * 0.4, -size * 0.6, size * 0.3, size * 0.3);
+    ctx.fillRect(size * 0.4, size * 0.3, size * 0.3, size * 0.3);
+    
+    // Pupils
+    if (z.type !== 'vampire' && z.type !== 'brute') {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(size * 0.5, -size * 0.5, size * 0.1, size * 0.1);
+      ctx.fillRect(size * 0.5, size * 0.4, size * 0.1, size * 0.1);
+    }
+
+    // Horns
+    if (z.type === 'devil') {
+      ctx.fillStyle = '#b71c1c';
+      ctx.beginPath();
+      ctx.moveTo(-size * 0.5, -size);
+      ctx.lineTo(size * 0.5, -size - 8);
+      ctx.lineTo(size * 0.5, -size);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(-size * 0.5, size);
+      ctx.lineTo(size * 0.5, size + 8);
+      ctx.lineTo(size * 0.5, size);
+      ctx.fill();
+    }
+    
+    // Blood / Mouth
+    if (z.type === 'brute') {
+      ctx.fillStyle = '#8e0000';
+      ctx.fillRect(size * 0.6, -size * 0.3, size * 0.4, size * 0.6);
+    }
+
+    ctx.restore();
+
     // Health bar with tick marks
-    const barW = size * 2 + 4;
-    drawTickHealthBar(sx - barW / 2, sy - size - 8, z.health, z.maxHealth, barW, weaponDmg);
+    const barW = size * 2 + 10;
+    drawTickHealthBar(sx - barW / 2, sy - size - 16, z.health, z.maxHealth, barW, weaponDmg);
   }
 }
 
@@ -326,36 +395,73 @@ function drawPlayers() {
     ctx.translate(sx, sy);
 
     // Shadow
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.beginPath();
-    ctx.ellipse(0, 18, 12, 5, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 20, 16, 8, 0, 0, Math.PI * 2);
     ctx.fill();
 
     ctx.rotate(p.angle);
 
     const isMe = id === myId;
-    ctx.fillStyle = isMe ? '#2196F3' : '#F44336';
-    ctx.fillRect(-15, -15, 30, 30);
-    ctx.strokeStyle = isMe ? '#1565C0' : '#C62828';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(-15, -15, 30, 30);
+    const suitColor = isMe ? '#1976D2' : '#D32F2F'; // Shoulders
+    const skinColor = '#FFC107'; // Boxhead classic skin
+    const gunColor = '#424242';
 
-    // Gun barrel
-    ctx.fillStyle = '#757575';
-    ctx.fillRect(15, -4, 18, 8);
-    ctx.fillStyle = '#616161';
-    ctx.fillRect(15, -4, 18, 2);
+    // Shoulders (Body)
+    ctx.fillStyle = suitColor;
+    ctx.fillRect(-10, -18, 20, 36);
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-10, -18, 20, 36);
+
+    // Hands
+    ctx.fillStyle = skinColor;
+    ctx.fillRect(10, -16, 8, 8);
+    ctx.fillRect(10, 8, 8, 8);
+    ctx.strokeRect(10, -16, 8, 8);
+    ctx.strokeRect(10, 8, 8, 8);
+
+    // Gun
+    ctx.fillStyle = gunColor;
+    if (p.weapon === 'pistol') {
+      ctx.fillRect(15, -4, 18, 8);
+    } else if (p.weapon === 'uzi') {
+      ctx.fillRect(12, -4, 20, 8);
+      ctx.fillRect(20, -6, 4, 12);
+    } else if (p.weapon === 'shotgun') {
+      ctx.fillRect(10, -5, 26, 10);
+      ctx.fillStyle = '#795548'; // Wood grip
+      ctx.fillRect(10, -4, 8, 8);
+    } else {
+      ctx.fillRect(15, -4, 18, 8);
+    }
+    ctx.strokeRect(15, -4, 18, 8);
+
+    // Head
+    ctx.fillStyle = skinColor;
+    ctx.fillRect(-12, -12, 24, 24);
+    
+    // Head shading
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.strokeRect(-12, -12, 24, 24);
+    ctx.fillStyle = 'rgba(0,0,0,0.1)';
+    ctx.fillRect(-12, 0, 24, 12); // subtle half shadow
+
+    // Eyes
+    ctx.fillStyle = '#000';
+    ctx.fillRect(6, -6, 3, 3);
+    ctx.fillRect(6, 3, 3, 3);
 
     ctx.restore();
 
     // Health bar
     const barW = 34;
     ctx.fillStyle = '#333';
-    ctx.fillRect(sx - barW / 2 - 1, sy - 28, barW + 2, 6);
+    ctx.fillRect(sx - barW / 2 - 1, sy - 32, barW + 2, 6);
     ctx.fillStyle = '#c62828';
-    ctx.fillRect(sx - barW / 2, sy - 27, barW, 4);
+    ctx.fillRect(sx - barW / 2, sy - 31, barW, 4);
     ctx.fillStyle = p.health > 30 ? '#4CAF50' : '#FF9800';
-    ctx.fillRect(sx - barW / 2, sy - 27, barW * (p.health / 100), 4);
+    ctx.fillRect(sx - barW / 2, sy - 31, barW * (p.health / 100), 4);
   }
 }
 
