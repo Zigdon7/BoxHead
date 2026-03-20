@@ -86,3 +86,45 @@ export type ClientInput = {
   melee: boolean;
   switchWeapon: boolean;
 };
+
+// --- Network message types ---
+
+/** Sent once on connect with static data */
+export interface InitPayload {
+  type: 'init';
+  id: string;
+  walls: Wall[];
+  mapWidth: number;
+  mapHeight: number;
+  ammoSpawnPoints: { x: number; y: number; amount: number }[];
+}
+
+/** Full state snapshot (sent on connect and for resync) */
+export interface SnapshotState {
+  type: 'snapshot';
+  tick: number;
+  players: Record<string, Player>;
+  zombies: Zombie[];
+  bullets: Bullet[];
+  wave: number;
+  ammoPickups: { id: string; available: boolean }[];
+  gameOver: boolean;
+}
+
+/** Incremental delta (sent every tick) */
+export interface DeltaState {
+  type: 'delta';
+  tick: number;
+  players?: Record<string, Partial<Player> & { id: string }>;
+  playersRemoved?: string[];
+  zombiesNew?: Zombie[];
+  zombiesUpdated?: (Partial<Zombie> & { id: string })[];
+  zombiesRemoved?: string[];
+  bulletsNew?: Bullet[];
+  bulletsRemoved?: string[];
+  wave?: number;
+  ammoPickups?: { id: string; available: boolean }[];
+  gameOver?: boolean;
+}
+
+export type ServerMessage = InitPayload | SnapshotState | DeltaState;

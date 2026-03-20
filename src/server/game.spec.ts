@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Game } from './game';
+import { ClientInput } from '../shared/types';
+
+function mkInput(overrides: Partial<ClientInput> = {}): ClientInput {
+  return { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, shooting: false, melee: false, switchWeapon: false, ...overrides };
+}
 
 describe('Feature parity: Old BoxHead → New Rebuild', () => {
   let game: Game;
@@ -29,13 +34,13 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
       game.addPlayer('p1');
       const p = game.getState().players['p1'];
       expect(p).toHaveProperty('ammo');
-      expect((p as any).ammo).toBeGreaterThan(0);
+      expect(p.ammo).toBeGreaterThan(0);
     });
 
     it('moves with WASD input', () => {
       game.addPlayer('p1');
       const startPos = { ...game.getState().players['p1'].pos };
-      game.handleInput('p1', { up: false, down: true, left: false, right: true, mouseX: 0, mouseY: 0, shooting: false, switchWeapon: false });
+      game.handleInput('p1', mkInput({ down: true, right: true }));
       game.update(1/60);
       const newPos = game.getState().players['p1'].pos;
       expect(newPos.x).toBeGreaterThan(startPos.x);
@@ -44,18 +49,18 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
 
     it('angle updates from mouse position', () => {
       game.addPlayer('p1');
-      game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 999, mouseY: 300, shooting: false, switchWeapon: false });
+      const pPos = game.getState().players['p1'].pos;
+      // Aim to the right of the player
+      game.handleInput('p1', mkInput({ mouseX: pPos.x + 500, mouseY: pPos.y }));
       game.update(1/60);
       const angle = game.getState().players['p1'].angle;
-      // Aiming to the right should be roughly 0
       expect(Math.abs(angle)).toBeLessThan(Math.PI / 2);
     });
 
     it('stays in bounds (old: keepInBounds)', () => {
       game.addPlayer('p1');
-      // Move far left
       for (let i = 0; i < 200; i++) {
-        game.handleInput('p1', { up: false, down: false, left: true, right: false, mouseX: 0, mouseY: 0, shooting: false, switchWeapon: false });
+        game.handleInput('p1', mkInput({ left: true }));
         game.update(1/60);
       }
       expect(game.getState().players['p1'].pos.x).toBeGreaterThanOrEqual(0);
@@ -66,9 +71,8 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
       const state = game.getState();
       state.players['p1'].health = 0;
       game.update(1/60);
-      // Player should be marked dead or removed
       const p = state.players['p1'];
-      expect(!p || p.health <= 0 || (p as any).alive === false).toBe(true);
+      expect(!p || p.health <= 0).toBe(true);
     });
   });
 
@@ -76,15 +80,17 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
   describe('Shooting', () => {
     it('creates bullets when shooting', () => {
       game.addPlayer('p1');
-      game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 500, mouseY: 300, shooting: true, switchWeapon: false });
-      // Run many frames to overcome any cooldown/random
+      // Move player to safe open area away from walls
+      game.getState().players['p1'].pos = { x: 800, y: 700 };
+      game.handleInput('p1', mkInput({ mouseX: 800, mouseY: 100, shooting: true }));
       for (let i = 0; i < 100; i++) game.update(1/60);
       expect(game.getState().bullets.length).toBeGreaterThan(0);
     });
 
     it('bullets have owner', () => {
       game.addPlayer('p1');
-      game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 500, mouseY: 300, shooting: true, switchWeapon: false });
+      const pPos = game.getState().players['p1'].pos;
+      game.handleInput('p1', mkInput({ mouseX: pPos.x + 500, mouseY: pPos.y, shooting: true }));
       for (let i = 0; i < 100; i++) game.update(1/60);
       const bullets = game.getState().bullets;
       if (bullets.length > 0) {
@@ -94,43 +100,35 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
 
     it('shoot cooldown exists (old: 200ms between shots)', () => {
       game.addPlayer('p1');
-      game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 500, mouseY: 300, shooting: true, switchWeapon: false });
+      const pPos = game.getState().players['p1'].pos;
+      game.handleInput('p1', mkInput({ mouseX: pPos.x + 500, mouseY: pPos.y, shooting: true }));
       game.update(1/60);
-      const count1 = game.getState().bullets.length;
       game.update(1/60);
-      const count2 = game.getState().bullets.length;
-      // Should NOT fire every single frame (old had cooldown)
-      // With random 0.1 chance this is probabilistic but with cooldown it's deterministic
-      // We just check bullets don't equal frame count after many frames
       let totalBullets = 0;
       for (let i = 0; i < 60; i++) game.update(1/60);
       totalBullets = game.getState().bullets.length;
-      expect(totalBullets).toBeLessThan(60); // Not every frame
+      expect(totalBullets).toBeLessThan(60);
     });
 
     it('ammo decreases when shooting', () => {
       game.addPlayer('p1');
-      const p = game.getState().players['p1'] as any;
-      if (p.ammo === undefined) {
-        expect.fail('Player should have ammo property');
-        return;
-      }
+      const p = game.getState().players['p1'];
       const startAmmo = p.ammo;
-      game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 500, mouseY: 300, shooting: true, switchWeapon: false });
+      const pPos = p.pos;
+      game.handleInput('p1', mkInput({ mouseX: pPos.x + 500, mouseY: pPos.y, shooting: true }));
       for (let i = 0; i < 100; i++) game.update(1/60);
       expect(p.ammo).toBeLessThan(startAmmo);
     });
 
     it('cannot shoot when out of ammo', () => {
       game.addPlayer('p1');
-      const p = game.getState().players['p1'] as any;
-      if (p.ammo !== undefined) {
-        p.ammo = 0;
-        game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 500, mouseY: 300, shooting: true, switchWeapon: false });
-        const bulletsBefore = game.getState().bullets.length;
-        for (let i = 0; i < 20; i++) game.update(1/60);
-        expect(game.getState().bullets.length).toBe(bulletsBefore);
-      }
+      const p = game.getState().players['p1'];
+      p.ammo = 0;
+      const pPos = p.pos;
+      game.handleInput('p1', mkInput({ mouseX: pPos.x + 500, mouseY: pPos.y, shooting: true }));
+      const bulletsBefore = game.getState().bullets.length;
+      for (let i = 0; i < 20; i++) game.update(1/60);
+      expect(game.getState().bullets.length).toBe(bulletsBefore);
     });
   });
 
@@ -146,14 +144,12 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
       game.addPlayer('p1');
       const state = game.getState();
       state.players['p1'].pos = { x: 400, y: 300 };
-      // Spawn a zombie far away
       state.zombies.push({
-        id: 'z1', type: 'zombie', pos: { x: 100, y: 300 }, health: 50, speed: 100
+        id: 'z1', type: 'zombie', pos: { x: 100, y: 300 }, health: 50, maxHealth: 50, speed: 100
       });
-      const startX = state.zombies[0].pos.x;
+      const startX = state.zombies[state.zombies.length - 1].pos.x;
       game.update(1/60);
-      // Zombie should move toward player (x increases)
-      expect(state.zombies[0].pos.x).toBeGreaterThan(startX);
+      expect(state.zombies.find(z => z.id === 'z1')!.pos.x).toBeGreaterThan(startX);
     });
 
     it('deal melee damage to players on proximity (old: zombie.attack)', () => {
@@ -161,7 +157,7 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
       const state = game.getState();
       state.players['p1'].pos = { x: 400, y: 300 };
       state.zombies.push({
-        id: 'z1', type: 'zombie', pos: { x: 401, y: 300 }, health: 50, speed: 0
+        id: 'z1', type: 'zombie', pos: { x: 401, y: 300 }, health: 50, maxHealth: 50, speed: 0
       });
       const startHealth = state.players['p1'].health;
       for (let i = 0; i < 120; i++) game.update(1/60);
@@ -171,14 +167,16 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
     it('die when health reaches 0 from bullets', () => {
       game.addPlayer('p1');
       const state = game.getState();
+      // Place zombie and bullet in open area (away from walls)
       state.zombies.push({
-        id: 'z1', type: 'zombie', pos: { x: 500, y: 300 }, health: 1, speed: 0
+        id: 'z1', type: 'zombie', pos: { x: 800, y: 700 }, health: 1, maxHealth: 1, speed: 0
       });
       state.bullets.push({
-        id: 'b1', pos: { x: 499, y: 300 }, vel: { x: 100, y: 0 }, ownerId: 'p1'
+        id: 'b1', pos: { x: 799, y: 700 }, vel: { x: 100, y: 0 }, ownerId: 'p1', damage: 25
       });
       game.update(1/60);
-      const zombie = state.zombies.find(z => z.id === 'z1');
+      const freshState = game.getState();
+      const zombie = freshState.zombies.find(z => z.id === 'z1');
       expect(!zombie || zombie.health <= 0).toBe(true);
     });
 
@@ -186,13 +184,13 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
       game.addPlayer('p1');
       const state = game.getState();
       state.zombies.push({
-        id: 'z1', type: 'zombie', pos: { x: 500, y: 300 }, health: 1, speed: 0
+        id: 'z1', type: 'zombie', pos: { x: 800, y: 700 }, health: 1, maxHealth: 1, speed: 0
       });
       state.bullets.push({
-        id: 'b1', pos: { x: 499, y: 300 }, vel: { x: 100, y: 0 }, ownerId: 'p1'
+        id: 'b1', pos: { x: 799, y: 700 }, vel: { x: 100, y: 0 }, ownerId: 'p1', damage: 25
       });
       game.update(1/60);
-      expect(state.players['p1'].score).toBeGreaterThan(0);
+      expect(game.getState().players['p1'].score).toBeGreaterThan(0);
     });
   });
 
@@ -205,13 +203,12 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
     it('wave advances after enough kills', () => {
       game.addPlayer('p1');
       const state = game.getState();
-      // Kill many zombies to advance wave
       for (let i = 0; i < 20; i++) {
         state.zombies.push({
-          id: `z${i}`, type: 'zombie', pos: { x: 500, y: 300 }, health: 1, speed: 0
+          id: `z${i}`, type: 'zombie', pos: { x: 500, y: 300 }, health: 1, maxHealth: 1, speed: 0
         });
         state.bullets.push({
-          id: `b${i}`, pos: { x: 499, y: 300 }, vel: { x: 100, y: 0 }, ownerId: 'p1'
+          id: `b${i}`, pos: { x: 499, y: 300 }, vel: { x: 100, y: 0 }, ownerId: 'p1', damage: 25
         });
         game.update(1/60);
       }
@@ -226,20 +223,22 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
       const state = game.getState();
       state.players['p1'].health = -1;
       game.update(1/60);
-      expect(state.gameOver).toBe(true);
+      // Re-fetch state since getState() returns a shallow copy
+      expect(game.getState().gameOver).toBe(true);
     });
   });
 
-  // === BULLETS ===  
+  // === BULLETS ===
   describe('Bullets', () => {
     it('removed when out of bounds', () => {
       game.addPlayer('p1');
       const state = game.getState();
       state.bullets.push({
-        id: 'b1', pos: { x: -100, y: 300 }, vel: { x: -100, y: 0 }, ownerId: 'p1'
+        id: 'b1', pos: { x: -100, y: 300 }, vel: { x: -100, y: 0 }, ownerId: 'p1', damage: 25
       });
       game.update(1/60);
-      expect(state.bullets.find(b => b.id === 'b1')).toBeUndefined();
+      // Re-fetch state since bullet filter creates a new array
+      expect(game.getState().bullets.find(b => b.id === 'b1')).toBeUndefined();
     });
   });
 
@@ -248,7 +247,7 @@ describe('Feature parity: Old BoxHead → New Rebuild', () => {
     it('cycles weapons', () => {
       game.addPlayer('p1');
       const w1 = game.getState().players['p1'].weapon;
-      game.handleInput('p1', { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, shooting: false, switchWeapon: true });
+      game.handleInput('p1', mkInput({ switchWeapon: true }));
       game.update(1/60);
       expect(game.getState().players['p1'].weapon).not.toBe(w1);
     });

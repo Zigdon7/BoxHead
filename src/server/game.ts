@@ -1,4 +1,5 @@
-import { GameState, Player, ClientInput, Zombie, Bullet, Wall, AmmoPickup, WEAPON_STATS } from '../shared/types';
+import { GameState, Player, ClientInput, Zombie, Wall, AmmoPickup, WEAPON_STATS } from '../shared/types';
+import { SpatialGrid } from './spatial-grid';
 
 const MAP_WIDTH = 2400;
 const MAP_HEIGHT = 1800;
@@ -12,6 +13,11 @@ const ZOMBIE_DAMAGE = 20;
 const SHOOT_COOLDOWN = 0.2;
 const BULLET_SPEED = 800;
 const BULLET_LIFETIME = 2.0;
+
+// Zombie population scaling
+const MAX_ZOMBIES_BASE = 30;
+const MAX_ZOMBIES_PER_PLAYER = 8;
+const MAX_ZOMBIES_HARD_CAP = 200;
 
 // Melee
 const MELEE_RANGE = 50;
@@ -103,6 +109,26 @@ function generateWalls(): Wall[] {
 
 const WALLS = generateWalls();
 
+// Static wall grid — walls have pos at their center for spatial lookup
+const WALL_GRID_CELL_SIZE = 200;
+type WallEntry = Wall & { pos: { x: number; y: number } };
+const wallEntries: WallEntry[] = WALLS.map(w => ({ ...w, pos: { x: w.x + w.w / 2, y: w.y + w.h / 2 } }));
+const wallGrid = new SpatialGrid<WallEntry>(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE);
+// Insert each wall into every cell it overlaps
+for (const w of wallEntries) {
+  const minCol = Math.max(0, Math.floor(w.x / WALL_GRID_CELL_SIZE));
+  const maxCol = Math.min(Math.ceil(MAP_WIDTH / WALL_GRID_CELL_SIZE) - 1, Math.floor((w.x + w.w) / WALL_GRID_CELL_SIZE));
+  const minRow = Math.max(0, Math.floor(w.y / WALL_GRID_CELL_SIZE));
+  const maxRow = Math.min(Math.ceil(MAP_HEIGHT / WALL_GRID_CELL_SIZE) - 1, Math.floor((w.y + w.h) / WALL_GRID_CELL_SIZE));
+  for (let r = minRow; r <= maxRow; r++) {
+    for (let c = minCol; c <= maxCol; c++) {
+      // Insert with adjusted pos to land in the right cell
+      const entry = { ...w, pos: { x: c * WALL_GRID_CELL_SIZE + 1, y: r * WALL_GRID_CELL_SIZE + 1 } };
+      wallGrid.insert(entry);
+    }
+  }
+}
+
 // Collision helpers
 function rectContains(rx: number, ry: number, rw: number, rh: number, px: number, py: number, radius: number): boolean {
   const closestX = Math.max(rx, Math.min(px, rx + rw));
@@ -138,7 +164,12 @@ function resolveCircleRect(px: number, py: number, radius: number, rx: number, r
 
 function resolveWallCollisions(px: number, py: number, radius: number): { x: number; y: number } {
   let x = px, y = py;
-  for (const w of WALLS) {
+  const nearby = wallGrid.query(x, y, radius + WALL_GRID_CELL_SIZE);
+  const seen = new Set<string>();
+  for (const w of nearby) {
+    const key = `${w.x},${w.y},${w.w},${w.h}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     if (rectContains(w.x, w.y, w.w, w.h, x, y, radius)) {
       const resolved = resolveCircleRect(x, y, radius, w.x, w.y, w.w, w.h);
       x = resolved.x;
@@ -153,7 +184,8 @@ function pointInRect(px: number, py: number, rx: number, ry: number, rw: number,
 }
 
 function bulletHitsWall(px: number, py: number): boolean {
-  for (const w of WALLS) {
+  const nearby = wallGrid.query(px, py, WALL_GRID_CELL_SIZE);
+  for (const w of nearby) {
     if (pointInRect(px, py, w.x, w.y, w.w, w.h)) return true;
   }
   return false;
@@ -182,6 +214,8 @@ export class Game {
   private zombieAttackCooldowns: Record<string, number> = {};
   private bulletLifetimes: Record<string, number> = {};
   private gameTime = 0; // total elapsed seconds
+  private zombieGrid = new SpatialGrid<Zombie>(MAP_WIDTH, MAP_HEIGHT, 200);
+  private playerGrid = new SpatialGrid<Player>(MAP_WIDTH, MAP_HEIGHT, 200);
 
   constructor() {
     // Initialize ammo pickups
@@ -241,6 +275,13 @@ export class Game {
 
     if (this.state.gameOver) return;
 
+    // Rebuild spatial grids
+    this.playerGrid.clear();
+    for (const id in this.state.players) {
+      const p = this.state.players[id];
+      if (p.health > 0) this.playerGrid.insert(p);
+    }
+
     const speed = 200;
 
     // Update players
@@ -288,8 +329,8 @@ export class Game {
         this.meleeCooldowns[id] = MELEE_COOLDOWN;
         const meleeDmg = WEAPON_STATS.melee.damage;
 
-        for (let zi = this.state.zombies.length - 1; zi >= 0; zi--) {
-          const z = this.state.zombies[zi];
+        const nearbyZombies = this.zombieGrid.query(p.pos.x, p.pos.y, MELEE_RANGE);
+        for (const z of nearbyZombies) {
           const dist = Math.hypot(z.pos.x - p.pos.x, z.pos.y - p.pos.y);
           if (dist > MELEE_RANGE) continue;
 
@@ -309,7 +350,8 @@ export class Game {
             z.pos.y += Math.sin(kbAngle) * kb;
 
             if (z.health <= 0) {
-              this.state.zombies.splice(zi, 1);
+              const idx = this.state.zombies.indexOf(z);
+              if (idx !== -1) this.state.zombies.splice(idx, 1);
               delete this.zombieAttackCooldowns[z.id];
               const points = z.type === 'vampire' ? 100 : z.type === 'brute' ? 75 : z.type === 'devil' ? 50 : z.type === 'crawler' ? 25 : 10;
               p.score += points;
@@ -379,10 +421,12 @@ export class Game {
 
     // Spawn zombies
     this.zombieSpawnTimer += dt;
-    const spawnInterval = Math.max(0.5, 3 - this.state.wave * 0.2);
-    if (this.zombieSpawnTimer > spawnInterval) {
+    const playerCount = Object.keys(this.state.players).length;
+    const maxZombies = Math.min(MAX_ZOMBIES_HARD_CAP, MAX_ZOMBIES_BASE + playerCount * MAX_ZOMBIES_PER_PLAYER);
+    const spawnInterval = Math.max(0.3 + playerCount * 0.02, 3 - this.state.wave * 0.2);
+    if (this.zombieSpawnTimer > spawnInterval && this.state.zombies.length < maxZombies) {
       this.zombieSpawnTimer = 0;
-      
+
       let type: 'zombie' | 'devil' | 'crawler' | 'brute' | 'vampire' = 'zombie';
       const rand = Math.random();
       if (this.state.wave >= 5 && rand < 0.05) type = 'vampire';
@@ -421,14 +465,22 @@ export class Game {
       this.zombieAttackCooldowns[zid] = 0;
     }
 
+    // Rebuild zombie grid before zombie update
+    this.zombieGrid.clear();
+    this.zombieGrid.insertAll(this.state.zombies);
+
     // Update zombies
     for (let i = this.state.zombies.length - 1; i >= 0; i--) {
       const z = this.state.zombies[i];
 
+      // Find nearest player using spatial grid (600px aggro radius, fallback to all)
       let target: Player | null = null;
       let minDist = Infinity;
-      for (const pid in this.state.players) {
-        const p = this.state.players[pid];
+      let nearbyPlayers = this.playerGrid.query(z.pos.x, z.pos.y, 600);
+      if (nearbyPlayers.length === 0) {
+        nearbyPlayers = Object.values(this.state.players).filter(p => p.health > 0);
+      }
+      for (const p of nearbyPlayers) {
         if (p.health <= 0) continue;
         const dist = Math.hypot(p.pos.x - z.pos.x, p.pos.y - z.pos.y);
         if (dist < minDist) { minDist = dist; target = p; }
@@ -489,5 +541,45 @@ export class Game {
       ...this.state,
       ammoPickups: this.state.ammoPickups.filter(p => p.respawnAt <= this.gameTime)
     };
+  }
+
+  getPlayers(): Record<string, import('../shared/types').Player> {
+    return this.state.players;
+  }
+
+  getZombies(): import('../shared/types').Zombie[] {
+    return this.state.zombies;
+  }
+
+  getBullets(): import('../shared/types').Bullet[] {
+    return this.state.bullets;
+  }
+
+  getWave(): number {
+    return this.state.wave;
+  }
+
+  getWalls(): import('../shared/types').Wall[] {
+    return this.state.walls;
+  }
+
+  getMapDimensions(): { width: number; height: number } {
+    return { width: MAP_WIDTH, height: MAP_HEIGHT };
+  }
+
+  getAmmoAvailability(): Map<string, boolean> {
+    const map = new Map<string, boolean>();
+    for (const p of this.state.ammoPickups) {
+      map.set(p.id, p.respawnAt <= this.gameTime);
+    }
+    return map;
+  }
+
+  getAmmoSpawnPoints(): { x: number; y: number; amount: number }[] {
+    return this.state.ammoPickups.map(p => ({ x: p.pos.x, y: p.pos.y, amount: p.amount }));
+  }
+
+  isGameOver(): boolean {
+    return this.state.gameOver;
   }
 }
