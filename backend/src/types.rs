@@ -13,8 +13,7 @@ pub enum Weapon {
     Pistol,
     Uzi,
     Shotgun,
-    Barrel,
-    Barricade,
+    RocketLauncher,
 }
 
 impl Weapon {
@@ -23,20 +22,45 @@ impl Weapon {
             Weapon::Pistol => 25.0,
             Weapon::Uzi => 15.0,
             Weapon::Shotgun => 80.0,
-            Weapon::Barrel => 0.0,
-            Weapon::Barricade => 0.0,
+            Weapon::RocketLauncher => 150.0,
         }
     }
 
-    pub fn next(&self) -> Weapon {
+    pub fn cooldown(&self) -> f64 {
         match self {
-            Weapon::Pistol => Weapon::Uzi,
-            Weapon::Uzi => Weapon::Shotgun,
-            Weapon::Shotgun => Weapon::Barrel,
-            Weapon::Barrel => Weapon::Barricade,
-            Weapon::Barricade => Weapon::Pistol,
+            Weapon::Pistol => crate::map::PISTOL_COOLDOWN,
+            Weapon::Uzi => crate::map::UZI_COOLDOWN,
+            Weapon::Shotgun => crate::map::SHOTGUN_COOLDOWN,
+            Weapon::RocketLauncher => crate::map::ROCKET_COOLDOWN,
         }
     }
+
+    pub fn slot(&self) -> usize {
+        match self {
+            Weapon::Pistol => 0,
+            Weapon::Uzi => 1,
+            Weapon::Shotgun => 2,
+            Weapon::RocketLauncher => 3,
+        }
+    }
+
+    pub fn from_slot(slot: usize) -> Option<Weapon> {
+        match slot {
+            0 => Some(Weapon::Pistol),
+            1 => Some(Weapon::Uzi),
+            2 => Some(Weapon::Shotgun),
+            3 => Some(Weapon::RocketLauncher),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum DropType {
+    Ammo,
+    Health,
+    Weapon,
 }
 
 pub const MELEE_DAMAGE: f64 = 35.0;
@@ -63,6 +87,8 @@ pub struct Player {
     #[serde(rename = "maxAmmo")]
     pub max_ammo: f64,
     pub weapon: Weapon,
+    #[serde(rename = "weaponSlots")]
+    pub weapon_slots: [bool; 4],
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -114,8 +140,17 @@ pub struct ClientInput {
     pub mouse_y: f64,
     pub shooting: bool,
     pub melee: bool,
-    #[serde(rename = "switchWeapon")]
-    pub switch_weapon: bool,
+    #[serde(rename = "selectWeapon")]
+    pub select_weapon: u8,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPickup {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub drop_type: DropType,
+    pub pos: Vector2,
 }
 
 // --- Network messages ---
@@ -147,6 +182,7 @@ pub struct SnapshotState {
     pub wave: u32,
     #[serde(rename = "ammoPickups")]
     pub ammo_pickups: Vec<AmmoPickupState>,
+    pub drops: Vec<DropPickup>,
     #[serde(rename = "gameOver")]
     pub game_over: bool,
 }
@@ -170,6 +206,9 @@ pub struct PlayerDelta {
     pub max_ammo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weapon: Option<Weapon>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "weaponSlots")]
+    pub weapon_slots: Option<[bool; 4]>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -207,6 +246,12 @@ pub struct DeltaState {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "bulletsRemoved")]
     pub bullets_removed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dropsNew")]
+    pub drops_new: Option<Vec<DropPickup>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dropsRemoved")]
+    pub drops_removed: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wave: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

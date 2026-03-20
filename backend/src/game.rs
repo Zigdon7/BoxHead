@@ -216,6 +216,43 @@ fn zombie_score(zombie_type: &ZombieType) -> f64 {
     }
 }
 
+// ---------- Drop internal ----------
+
+struct DropInternal {
+    id: String,
+    drop_type: DropType,
+    x: f64,
+    y: f64,
+    despawn_at: f64,
+}
+
+// ---------- Drop roll ----------
+
+fn roll_drop(zombie_type: &ZombieType, x: f64, y: f64, game_time: f64) -> Option<DropInternal> {
+    let mut rng = rand::rng();
+    let roll: f64 = rng.random();
+
+    let (ammo_chance, health_chance, weapon_chance) = match zombie_type {
+        ZombieType::Zombie => (0.20, 0.05, 0.02),
+        ZombieType::Devil => (0.30, 0.10, 0.05),
+        ZombieType::Crawler => (0.15, 0.05, 0.03),
+        ZombieType::Brute => (0.40, 0.15, 0.10),
+        ZombieType::Vampire => (0.25, 0.20, 0.08),
+    };
+
+    let drop_type = if roll < ammo_chance { Some(DropType::Ammo) }
+        else if roll < ammo_chance + health_chance { Some(DropType::Health) }
+        else if roll < ammo_chance + health_chance + weapon_chance { Some(DropType::Weapon) }
+        else { None };
+
+    drop_type.map(|dt| DropInternal {
+        id: uuid::Uuid::new_v4().to_string(),
+        drop_type: dt,
+        x, y,
+        despawn_at: game_time + DROP_DESPAWN_TIME,
+    })
+}
+
 // ---------- Game ----------
 
 pub struct Game {
@@ -223,6 +260,7 @@ pub struct Game {
     inputs: HashMap<String, ClientInput>,
     zombies: Vec<Zombie>,
     bullets: Vec<Bullet>,
+    drops: Vec<DropInternal>,
     wave: u32,
     game_over: bool,
     zombie_spawn_timer: f64,
@@ -262,6 +300,7 @@ impl Game {
             inputs: HashMap::new(),
             zombies: Vec::new(),
             bullets: Vec::new(),
+            drops: Vec::new(),
             wave: 1,
             game_over: false,
             zombie_spawn_timer: 0.0,
@@ -280,20 +319,16 @@ impl Game {
     }
 
     pub fn add_player(&mut self, id: &str) {
-        let zones = spawn_zones();
-        let mut rng = rand::thread_rng();
-        let idx = rng.gen_range(0..zones.len());
-        let (sx, sy) = zones[idx];
-
         let player = Player {
             id: id.to_string(),
-            pos: Vector2 { x: sx, y: sy },
+            pos: Vector2 { x: MAP_WIDTH / 2.0, y: MAP_HEIGHT / 2.0 },
             angle: 0.0,
             score: 0.0,
             health: 100.0,
             ammo: 30.0,
             max_ammo: 30.0,
             weapon: Weapon::Pistol,
+            weapon_slots: [true, false, false, false],
         };
         self.players.insert(id.to_string(), player);
     }
@@ -378,8 +413,13 @@ impl Game {
 
                 p.angle = (input.mouse_y - p.pos.y).atan2(input.mouse_x - p.pos.x);
 
-                if input.switch_weapon {
-                    p.weapon = p.weapon.next();
+                if input.select_weapon > 0 && input.select_weapon <= 4 {
+                    let slot = (input.select_weapon - 1) as usize;
+                    if p.weapon_slots[slot] {
+                        if let Some(w) = Weapon::from_slot(slot) {
+                            p.weapon = w;
+                        }
+                    }
                 }
             }
 
@@ -435,6 +475,9 @@ impl Game {
 
                     if self.zombies[zi].health <= 0.0 {
                         let score = zombie_score(&self.zombies[zi].zombie_type);
+                        if let Some(d) = roll_drop(&self.zombies[zi].zombie_type, self.zombies[zi].pos.x, self.zombies[zi].pos.y, self.game_time) {
+                            self.drops.push(d);
+                        }
                         if let Some(p) = self.players.get_mut(pid) {
                             p.score += score;
                         }
@@ -450,17 +493,20 @@ impl Game {
             let shoot_cd = *self.shoot_cooldowns.get(pid).unwrap_or(&0.0);
             if input.shooting && shoot_cd <= 0.0 {
                 let p = self.players.get(pid).unwrap();
-                if p.ammo > 0.0 {
-                    self.shoot_cooldowns.insert(pid.clone(), SHOOT_COOLDOWN);
+                let is_pistol = p.weapon == Weapon::Pistol;
+                if is_pistol || p.ammo > 0.0 {
+                    let weapon = p.weapon.clone();
+                    self.shoot_cooldowns.insert(pid.clone(), weapon.cooldown());
 
                     let angle = p.angle;
                     let px = p.pos.x;
                     let py = p.pos.y;
-                    let weapon = p.weapon.clone();
                     let damage = weapon.damage();
                     let owner_id = pid.clone();
 
-                    self.players.get_mut(pid).unwrap().ammo -= 1.0;
+                    if !is_pistol {
+                        self.players.get_mut(pid).unwrap().ammo -= 1.0;
+                    }
 
                     match weapon {
                         Weapon::Shotgun => {
@@ -483,6 +529,23 @@ impl Game {
                                     damage: damage / 5.0,
                                 });
                             }
+                        }
+                        Weapon::RocketLauncher => {
+                            let bid = Uuid::new_v4().to_string();
+                            self.bullet_lifetimes.insert(bid.clone(), BULLET_LIFETIME);
+                            self.bullets.push(Bullet {
+                                id: bid,
+                                pos: Vector2 {
+                                    x: px + angle.cos() * PLAYER_RADIUS,
+                                    y: py + angle.sin() * PLAYER_RADIUS,
+                                },
+                                vel: Vector2 {
+                                    x: angle.cos() * ROCKET_SPEED,
+                                    y: angle.sin() * ROCKET_SPEED,
+                                },
+                                owner_id,
+                                damage: ROCKET_DAMAGE,
+                            });
                         }
                         _ => {
                             let bid = Uuid::new_v4().to_string();
@@ -519,6 +582,34 @@ impl Game {
                     pickup.respawn_at = Some(self.game_time + AMMO_RESPAWN_TIME);
                 }
             }
+
+            // Drop pickup collision
+            let mut rng = rand::rng();
+            let mut drops_to_remove = Vec::new();
+            for (di, drop) in self.drops.iter().enumerate() {
+                if drop.despawn_at <= self.game_time { continue; } // already expired
+                let dist = f64::hypot(p.pos.x - drop.x, p.pos.y - drop.y);
+                if dist < PLAYER_RADIUS + DROP_PICKUP_RADIUS {
+                    match drop.drop_type {
+                        DropType::Ammo => { p.ammo = (p.ammo + DROP_AMMO_AMOUNT).min(p.max_ammo); }
+                        DropType::Health => { p.health = (p.health + DROP_HEALTH_AMOUNT).min(100.0); }
+                        DropType::Weapon => {
+                            // Unlock a random locked weapon slot
+                            let locked: Vec<usize> = (1..4).filter(|&s| !p.weapon_slots[s]).collect();
+                            if locked.is_empty() {
+                                p.ammo = (p.ammo + DROP_AMMO_AMOUNT).min(p.max_ammo); // fallback to ammo
+                            } else {
+                                let idx = locked[rng.random_range(0..locked.len())];
+                                p.weapon_slots[idx] = true;
+                            }
+                        }
+                    }
+                    drops_to_remove.push(di);
+                }
+            }
+            for &di in drops_to_remove.iter().rev() {
+                self.drops.remove(di);
+            }
         }
 
         // Update ammo pickup respawns
@@ -536,8 +627,9 @@ impl Game {
             bullet.pos.y += bullet.vel.y * dt;
         }
 
-        // Filter bullets (OOB / lifetime / wall)
+        // Filter bullets (OOB / lifetime / wall) — rockets explode on wall hit
         {
+            let mut rocket_explosions: Vec<(f64, f64)> = Vec::new();
             let wall_grid = &self.wall_grid;
             let lifetimes = &mut self.bullet_lifetimes;
             self.bullets.retain(|b| {
@@ -545,6 +637,9 @@ impl Game {
                     *lt -= dt;
                     if *lt <= 0.0 {
                         lifetimes.remove(&b.id);
+                        if b.damage >= 100.0 {
+                            rocket_explosions.push((b.pos.x, b.pos.y));
+                        }
                         return false;
                     }
                 }
@@ -554,14 +649,30 @@ impl Game {
                     || b.pos.y > MAP_HEIGHT
                 {
                     lifetimes.remove(&b.id);
+                    if b.damage >= 100.0 {
+                        rocket_explosions.push((b.pos.x, b.pos.y));
+                    }
                     return false;
                 }
                 if bullet_hits_wall(b.pos.x, b.pos.y, wall_grid) {
                     lifetimes.remove(&b.id);
+                    if b.damage >= 100.0 {
+                        rocket_explosions.push((b.pos.x, b.pos.y));
+                    }
                     return false;
                 }
                 true
             });
+
+            // Apply rocket AoE damage from wall/OOB explosions
+            for (ex, ey) in &rocket_explosions {
+                for z in &mut self.zombies {
+                    let dist = f64::hypot(z.pos.x - ex, z.pos.y - ey);
+                    if dist < ROCKET_EXPLOSION_RADIUS {
+                        z.health -= ROCKET_DAMAGE;
+                    }
+                }
+            }
         }
 
         // Spawn zombies
@@ -579,12 +690,12 @@ impl Game {
                 .min(MAX_ZOMBIES_HARD_CAP) as usize;
 
             if self.zombies.len() < max_zombies && living_players > 0 {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let zones = spawn_zones();
-                let idx = rng.gen_range(0..zones.len());
+                let idx = rng.random_range(0..zones.len());
                 let (sx, sy) = zones[idx];
 
-                let r: f64 = rng.gen();
+                let r: f64 = rng.random();
                 let wave = self.wave;
 
                 let (zombie_type, hp, speed) = if wave >= 5 && r < 0.05 {
@@ -747,14 +858,33 @@ impl Game {
                     if dist < ZOMBIE_RADIUS + BULLET_RADIUS {
                         let damage = b.damage;
                         let owner_id = b.owner_id.clone();
-                        self.zombies[zi].health -= damage;
+                        let is_rocket = damage >= 100.0;
+                        let impact_x = b.pos.x;
+                        let impact_y = b.pos.y;
                         bullet_kill_indices.push(bi);
 
-                        if self.zombies[zi].health <= 0.0 {
-                            let score = zombie_score(&self.zombies[zi].zombie_type);
-                            score_awards.push((owner_id, score));
-                            zombie_kill_indices.push(zi);
+                        if is_rocket {
+                            // Rocket AoE: damage all zombies in explosion radius
+                            for zj in 0..self.zombies.len() {
+                                let aoe_dist = f64::hypot(self.zombies[zj].pos.x - impact_x, self.zombies[zj].pos.y - impact_y);
+                                if aoe_dist < ROCKET_EXPLOSION_RADIUS {
+                                    self.zombies[zj].health -= ROCKET_DAMAGE;
+                                    if self.zombies[zj].health <= 0.0 && !zombie_kill_indices.contains(&zj) {
+                                        let score = zombie_score(&self.zombies[zj].zombie_type);
+                                        score_awards.push((owner_id.clone(), score));
+                                        zombie_kill_indices.push(zj);
+                                    }
+                                }
+                            }
                             break;
+                        } else {
+                            self.zombies[zi].health -= damage;
+                            if self.zombies[zi].health <= 0.0 {
+                                let score = zombie_score(&self.zombies[zi].zombie_type);
+                                score_awards.push((owner_id, score));
+                                zombie_kill_indices.push(zi);
+                                break;
+                            }
                         }
                     }
                 }
@@ -784,6 +914,9 @@ impl Game {
             zombie_kill_indices.dedup();
             for &zi in zombie_kill_indices.iter().rev() {
                 if zi < self.zombies.len() {
+                    if let Some(d) = roll_drop(&self.zombies[zi].zombie_type, self.zombies[zi].pos.x, self.zombies[zi].pos.y, self.game_time) {
+                        self.drops.push(d);
+                    }
                     self.zombie_attack_cooldowns.remove(&self.zombies[zi].id);
                     self.zombies.swap_remove(zi);
                 }
@@ -800,6 +933,9 @@ impl Game {
                 }
             }
         }
+
+        // Despawn expired drops
+        self.drops.retain(|d| d.despawn_at > self.game_time);
 
         // Wave advancement
         if self.wave_kills >= self.wave * 10 {
@@ -825,6 +961,14 @@ impl Game {
 
     pub fn bullets(&self) -> &[Bullet] {
         &self.bullets
+    }
+
+    pub fn drops(&self) -> Vec<DropPickup> {
+        self.drops.iter().map(|d| DropPickup {
+            id: d.id.clone(),
+            drop_type: d.drop_type.clone(),
+            pos: Vector2 { x: d.x, y: d.y },
+        }).collect()
     }
 
     pub fn wave(&self) -> u32 {

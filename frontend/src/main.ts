@@ -1,4 +1,4 @@
-import { Player, Zombie, Bullet, Wall, ClientInput, DeltaState, SnapshotState, InitPayload } from './generated/types';
+import { Player, Zombie, Bullet, Wall, ClientInput, DeltaState, SnapshotState, InitPayload, DropPickup } from './generated/types';
 import { WEAPON_STATS } from './constants';
 
 // Local composite type for rendering
@@ -13,6 +13,7 @@ interface GameState {
   mapWidth: number;
   mapHeight: number;
   gameOver: boolean;
+  drops: DropPickup[];
 }
 
 const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
@@ -40,6 +41,7 @@ let bulletCreationTime: Map<string, number> = new Map(); // id -> performance.no
 let wave = 1;
 let ammoAvailability: Map<string, boolean> = new Map();
 let gameOver = false;
+let dropMap: Map<string, DropPickup> = new Map();
 
 let myId = '';
 let camX = 0;
@@ -188,7 +190,7 @@ function getExtrapolatedBullets(): { pos: { x: number; y: number } }[] {
 
 const input: ClientInput = {
   up: false, down: false, left: false, right: false,
-  mouseX: 0, mouseY: 0, shooting: false, melee: false, switchWeapon: false
+  mouseX: 0, mouseY: 0, shooting: false, melee: false, selectWeapon: 0
 };
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -229,6 +231,12 @@ ws.onmessage = (event) => {
     for (const a of snap.ammoPickups) {
       ammoAvailability.set(a.id, a.available);
     }
+    dropMap.clear();
+    if (snap.drops) {
+      for (const d of snap.drops) {
+        dropMap.set(d.id, d);
+      }
+    }
     pushStateSnapshot();
   } else if (data.type === 'delta') {
     applyDelta(data as DeltaState);
@@ -250,6 +258,7 @@ function applyDelta(delta: DeltaState) {
         if (diff.ammo !== undefined) existing.ammo = diff.ammo;
         if (diff.maxAmmo !== undefined) existing.maxAmmo = diff.maxAmmo;
         if (diff.weapon !== undefined) existing.weapon = diff.weapon;
+        if (diff.weaponSlots !== undefined) existing.weaponSlots = diff.weaponSlots;
       } else {
         // New player — diff should be a full Player
         players[id] = diff as Player;
@@ -306,6 +315,16 @@ function applyDelta(delta: DeltaState) {
       ammoAvailability.set(a.id, a.available);
     }
   }
+  if (delta.dropsNew) {
+    for (const d of delta.dropsNew) {
+      dropMap.set(d.id, d);
+    }
+  }
+  if (delta.dropsRemoved) {
+    for (const id of delta.dropsRemoved) {
+      dropMap.delete(id);
+    }
+  }
 }
 
 // --- Input ---
@@ -320,6 +339,9 @@ window.addEventListener('keydown', (e) => {
     const p = players[myId];
     if (p) meleeSwingAngle = p.angle;
   }
+  if (e.key >= '1' && e.key <= '4') {
+    input.selectWeapon = parseInt(e.key);
+  }
 });
 
 window.addEventListener('keyup', (e) => {
@@ -328,6 +350,9 @@ window.addEventListener('keyup', (e) => {
   if (e.key === 'a' || e.key === 'A') input.left = false;
   if (e.key === 'd' || e.key === 'D') input.right = false;
   if (e.key === ' ' || e.key === 'e' || e.key === 'E') input.melee = false;
+  if (e.key >= '1' && e.key <= '4') {
+    input.selectWeapon = 0;
+  }
 });
 
 window.addEventListener('mousemove', (e) => {
@@ -387,7 +412,8 @@ function buildRenderState(): GameState | null {
     })),
     mapWidth: staticMapWidth,
     mapHeight: staticMapHeight,
-    gameOver
+    gameOver,
+    drops: Array.from(dropMap.values()),
   };
 }
 
@@ -467,6 +493,55 @@ function drawAmmoPickups() {
     ctx.fillText('AMMO', sx, sy + 4);
 
     ctx.shadowBlur = 0;
+  }
+}
+
+function drawDrops(state: GameState) {
+  for (const d of state.drops) {
+    const sx = d.pos.x - camX;
+    const sy = d.pos.y - camY;
+    if (sx < -30 || sx > canvas.width + 30 || sy < -30 || sy > canvas.height + 30) continue;
+
+    const pulse = 0.7 + 0.3 * Math.sin(performance.now() / 200);
+
+    if (d.type === 'ammo') {
+      // Yellow ammo box
+      ctx.fillStyle = `rgba(255, 200, 0, ${pulse})`;
+      ctx.fillRect(sx - 10, sy - 7, 20, 14);
+      ctx.strokeStyle = '#aa7700';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(sx - 10, sy - 7, 20, 14);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 8px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('AMMO', sx, sy + 3);
+    } else if (d.type === 'health') {
+      // Green cross
+      ctx.fillStyle = `rgba(76, 175, 80, ${pulse})`;
+      ctx.fillRect(sx - 4, sy - 10, 8, 20);
+      ctx.fillRect(sx - 10, sy - 4, 20, 8);
+      ctx.strokeStyle = '#2E7D32';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(sx - 4, sy - 10, 8, 20);
+      ctx.strokeRect(sx - 10, sy - 4, 20, 8);
+    } else if (d.type === 'weapon') {
+      // Purple diamond
+      ctx.fillStyle = `rgba(156, 39, 176, ${pulse})`;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy - 12);
+      ctx.lineTo(sx + 10, sy);
+      ctx.lineTo(sx, sy + 12);
+      ctx.lineTo(sx - 10, sy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#7B1FA2';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 7px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GUN', sx, sy + 3);
+    }
   }
 }
 
@@ -723,6 +798,14 @@ function drawPlayers(state: GameState) {
       ctx.fillRect(10, -5, 26, 10);
       ctx.fillStyle = '#795548';
       ctx.fillRect(10, -4, 8, 8);
+    } else if (p.weapon === 'rocketLauncher') {
+      ctx.fillRect(8, -6, 28, 12);
+      ctx.fillStyle = '#795548';
+      ctx.fillRect(8, -4, 8, 8);
+      ctx.fillStyle = '#f44336';
+      ctx.beginPath();
+      ctx.arc(34, 0, 5, 0, Math.PI * 2);
+      ctx.fill();
     } else {
       ctx.fillRect(15, -4, 18, 8);
     }
@@ -781,6 +864,11 @@ function drawMinimap(state: GameState) {
     ctx.fillRect(mmX + pickup.x * scaleX - 2, mmY + pickup.y * scaleY - 2, 4, 4);
   }
 
+  for (const d of state.drops) {
+    ctx.fillStyle = d.type === 'ammo' ? '#ffb400' : d.type === 'health' ? '#4CAF50' : '#9C27B0';
+    ctx.fillRect(mmX + d.pos.x * scaleX - 1, mmY + d.pos.y * scaleY - 1, 3, 3);
+  }
+
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
   ctx.lineWidth = 1;
   ctx.strokeRect(mmX + camX * scaleX, mmY + camY * scaleY, canvas.width * scaleX, canvas.height * scaleY);
@@ -816,12 +904,63 @@ function drawHUD(state: GameState) {
   ctx.fillText(`HP: ${p.health}`, 160, 52);
   ctx.font = '13px monospace';
   ctx.fillStyle = '#aaa';
-  ctx.fillText(`[${p.weapon.toUpperCase()}]  Melee: Space/E`, 20, 72);
+  ctx.fillText(`Melee: Space/E`, 20, 72);
+}
 
-  const dmg = WEAPON_STATS[p.weapon]?.damage ?? 0;
-  if (dmg > 0) {
-    ctx.fillStyle = '#ffb400';
-    ctx.fillText(`DMG: ${dmg}`, 20, 84);
+function drawWeaponBar(state: GameState) {
+  const p = state.players[myId];
+  if (!p) return;
+
+  const slotW = 60;
+  const slotH = 50;
+  const gap = 4;
+  const totalW = slotW * 4 + gap * 3;
+  const barX = (canvas.width - totalW) / 2;
+  const barY = canvas.height - slotH - 10;
+
+  const weapons = ['pistol', 'uzi', 'shotgun', 'rocketLauncher'];
+  const names = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
+  const slots = p.weaponSlots || [true, false, false, false];
+
+  for (let i = 0; i < 4; i++) {
+    const x = barX + i * (slotW + gap);
+    const unlocked = slots[i];
+    const active = p.weapon === weapons[i];
+
+    // Background
+    ctx.fillStyle = active ? 'rgba(33, 150, 243, 0.7)' : unlocked ? 'rgba(0, 0, 0, 0.5)' : 'rgba(0, 0, 0, 0.3)';
+    ctx.fillRect(x, barY, slotW, slotH);
+
+    // Border
+    ctx.strokeStyle = active ? '#64B5F6' : unlocked ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = active ? 2 : 1;
+    ctx.strokeRect(x, barY, slotW, slotH);
+
+    // Slot number
+    ctx.fillStyle = active ? '#fff' : unlocked ? '#aaa' : '#555';
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${i + 1}`, x + 4, barY + 13);
+
+    if (unlocked) {
+      // Weapon name
+      ctx.fillStyle = active ? '#fff' : '#ccc';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(names[i], x + slotW / 2, barY + 28);
+
+      // Damage
+      const dmg = WEAPON_STATS[weapons[i]]?.damage ?? 0;
+      ctx.fillStyle = '#ffb400';
+      ctx.font = '9px monospace';
+      ctx.fillText(`${dmg} dmg`, x + slotW / 2, barY + 42);
+    } else {
+      // Locked indicator
+      ctx.fillStyle = '#555';
+      ctx.font = '18px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('[?]', x + slotW / 2, barY + 34);
+    }
   }
 }
 
@@ -844,12 +983,14 @@ function draw() {
     drawGrid();
     drawWalls();
     drawAmmoPickups();
+    drawDrops(state);
     drawBullets(state);
     drawZombies(state);
     drawPlayers(state);
     drawMeleeSwing(dt, state);
     drawMinimap(state);
     drawHUD(state);
+    drawWeaponBar(state);
 
     if (state.gameOver) {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';

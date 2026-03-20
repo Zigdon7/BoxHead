@@ -12,7 +12,20 @@
     },
     "Weapon": {
       "type": "string",
-      "enum": ["pistol", "uzi", "shotgun", "barrel", "barricade"]
+      "enum": ["pistol", "uzi", "shotgun", "rocketLauncher"]
+    },
+    "DropType": {
+      "type": "string",
+      "enum": ["ammo", "health", "weapon"]
+    },
+    "DropPickup": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "$ref": "#/$defs/DropType" },
+        "pos": { "$ref": "#/$defs/Vector2" }
+      },
+      "required": ["id", "type", "pos"]
     },
     "ZombieType": {
       "type": "string",
@@ -28,9 +41,10 @@
         "health": { "type": "number" },
         "ammo": { "type": "number" },
         "maxAmmo": { "type": "number" },
-        "weapon": { "$ref": "#/$defs/Weapon" }
+        "weapon": { "$ref": "#/$defs/Weapon" },
+        "weaponSlots": { "type": "array", "items": { "type": "boolean" }, "minItems": 4, "maxItems": 4 }
       },
-      "required": ["id", "pos", "angle", "score", "health", "ammo", "maxAmmo", "weapon"]
+      "required": ["id", "pos", "angle", "score", "health", "ammo", "maxAmmo", "weapon", "weaponSlots"]
     },
     "Zombie": {
       "type": "object",
@@ -93,9 +107,9 @@
         "mouseY": { "type": "number" },
         "shooting": { "type": "boolean" },
         "melee": { "type": "boolean" },
-        "switchWeapon": { "type": "boolean" }
+        "selectWeapon": { "type": "number" }
       },
-      "required": ["up", "down", "left", "right", "mouseX", "mouseY", "shooting", "melee", "switchWeapon"]
+      "required": ["up", "down", "left", "right", "mouseX", "mouseY", "shooting", "melee", "selectWeapon"]
     },
     "InitPayload": {
       "type": "object",
@@ -122,9 +136,10 @@
         "bullets": { "type": "array", "items": { "$ref": "#/$defs/Bullet" } },
         "wave": { "type": "number" },
         "ammoPickups": { "type": "array", "items": { "$ref": "#/$defs/AmmoPickupState" } },
+        "drops": { "type": "array", "items": { "$ref": "#/$defs/DropPickup" } },
         "gameOver": { "type": "boolean" }
       },
-      "required": ["type", "tick", "players", "zombies", "bullets", "wave", "ammoPickups", "gameOver"]
+      "required": ["type", "tick", "players", "zombies", "bullets", "wave", "ammoPickups", "drops", "gameOver"]
     },
     "PlayerDelta": {
       "type": "object",
@@ -136,7 +151,8 @@
         "health": { "type": "number" },
         "ammo": { "type": "number" },
         "maxAmmo": { "type": "number" },
-        "weapon": { "$ref": "#/$defs/Weapon" }
+        "weapon": { "$ref": "#/$defs/Weapon" },
+        "weaponSlots": { "type": "array", "items": { "type": "boolean" }, "minItems": 4, "maxItems": 4 }
       },
       "required": ["id"]
     },
@@ -164,6 +180,8 @@
         "zombiesRemoved": { "type": "array", "items": { "type": "string" } },
         "bulletsNew": { "type": "array", "items": { "$ref": "#/$defs/Bullet" } },
         "bulletsRemoved": { "type": "array", "items": { "type": "string" } },
+        "dropsNew": { "type": "array", "items": { "$ref": "#/$defs/DropPickup" } },
+        "dropsRemoved": { "type": "array", "items": { "type": "string" } },
         "wave": { "type": "number" },
         "ammoPickups": { "type": "array", "items": { "$ref": "#/$defs/AmmoPickupState" } },
         "gameOver": { "type": "boolean" }

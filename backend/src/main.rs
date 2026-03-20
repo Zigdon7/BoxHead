@@ -170,6 +170,7 @@ async fn tick(state: &AppState) {
         let players = game.players().clone();
         let zombies = game.zombies().to_vec();
         let bullets = game.bullets().to_vec();
+        let drops = game.drops();
         let wave = game.wave();
         let ammo_avail_vec = game.ammo_availability();
         let ammo_availability: HashMap<String, bool> = ammo_avail_vec.iter()
@@ -177,14 +178,14 @@ async fn tick(state: &AppState) {
         let game_over = game.is_game_over();
 
         let mut dt = state.delta_tracker.lock().await;
-        let delta = dt.compute_delta(&players, &zombies, &bullets, wave, &ammo_availability, game_over);
+        let delta = dt.compute_delta(&players, &zombies, &bullets, &drops, wave, &ammo_availability, game_over);
         let delta_str = serde_json::to_string(&delta).unwrap();
 
         let pending = state.pending_snapshots.lock().await;
         let snapshot_ids: Vec<String> = pending.iter().cloned().collect();
 
         let snapshot_str = if !snapshot_ids.is_empty() {
-            let snapshot = dt.build_snapshot(&players, &zombies, &bullets, wave, &ammo_availability, game_over);
+            let snapshot = dt.build_snapshot(&players, &zombies, &bullets, &drops, wave, &ammo_availability, game_over);
             Some(serde_json::to_string(&snapshot).unwrap())
         } else {
             None

@@ -5,6 +5,7 @@ struct PrevState {
     players: HashMap<String, Player>,
     zombie_map: HashMap<String, Zombie>,
     bullet_set: HashSet<String>,
+    drop_set: HashSet<String>,
     wave: u32,
     ammo_availability: HashMap<String, bool>,
     game_over: bool,
@@ -29,6 +30,7 @@ impl DeltaTracker {
         players: &HashMap<String, Player>,
         zombies: &[Zombie],
         bullets: &[Bullet],
+        drops: &[DropPickup],
         wave: u32,
         ammo_availability: &HashMap<String, bool>,
         game_over: bool,
@@ -36,7 +38,7 @@ impl DeltaTracker {
         self.tick += 1;
 
         if self.prev.is_none() {
-            self.save_state(players, zombies, bullets, wave, ammo_availability, game_over);
+            self.save_state(players, zombies, bullets, drops, wave, ammo_availability, game_over);
             let player_deltas: HashMap<String, PlayerDelta> = players.iter().map(|(id, p)| {
                 (id.clone(), PlayerDelta {
                     id: p.id.clone(),
@@ -47,6 +49,7 @@ impl DeltaTracker {
                     ammo: Some(p.ammo),
                     max_ammo: Some(p.max_ammo),
                     weapon: Some(p.weapon.clone()),
+                    weapon_slots: Some(p.weapon_slots),
                 })
             }).collect();
 
@@ -60,6 +63,8 @@ impl DeltaTracker {
                 zombies_removed: None,
                 bullets_new: Some(bullets.to_vec()),
                 bullets_removed: None,
+                drops_new: if drops.is_empty() { None } else { Some(drops.to_vec()) },
+                drops_removed: None,
                 wave: Some(wave),
                 ammo_pickups: None,
                 game_over: Some(game_over),
@@ -77,6 +82,8 @@ impl DeltaTracker {
             zombies_removed: None,
             bullets_new: None,
             bullets_removed: None,
+            drops_new: None,
+            drops_removed: None,
             wave: None,
             ammo_pickups: None,
             game_over: None,
@@ -91,7 +98,7 @@ impl DeltaTracker {
                 let mut pd = PlayerDelta {
                     id: id.clone(),
                     pos: None, angle: None, score: None, health: None,
-                    ammo: None, max_ammo: None, weapon: None,
+                    ammo: None, max_ammo: None, weapon: None, weapon_slots: None,
                 };
                 let mut changed = false;
 
@@ -110,6 +117,7 @@ impl DeltaTracker {
                 if curr.score != prev_p.score { pd.score = Some(curr.score); changed = true; }
                 if curr.ammo != prev_p.ammo { pd.ammo = Some(curr.ammo); changed = true; }
                 if curr.weapon != prev_p.weapon { pd.weapon = Some(curr.weapon.clone()); changed = true; }
+                if curr.weapon_slots != prev_p.weapon_slots { pd.weapon_slots = Some(curr.weapon_slots); changed = true; }
 
                 if changed {
                     player_changes.insert(id.clone(), pd);
@@ -125,6 +133,7 @@ impl DeltaTracker {
                     ammo: Some(curr.ammo),
                     max_ammo: Some(curr.max_ammo),
                     weapon: Some(curr.weapon.clone()),
+                    weapon_slots: Some(curr.weapon_slots),
                 });
             }
         }
@@ -185,6 +194,24 @@ impl DeltaTracker {
         if !bullets_new.is_empty() { delta.bullets_new = Some(bullets_new); }
         if !bullets_removed.is_empty() { delta.bullets_removed = Some(bullets_removed); }
 
+        // Drops
+        let curr_drop_ids: HashSet<String> = drops.iter().map(|d| d.id.clone()).collect();
+        let mut drops_new: Vec<DropPickup> = Vec::new();
+        let mut drops_removed: Vec<String> = Vec::new();
+
+        for d in drops {
+            if !prev.drop_set.contains(&d.id) {
+                drops_new.push(d.clone());
+            }
+        }
+        for id in &prev.drop_set {
+            if !curr_drop_ids.contains(id) {
+                drops_removed.push(id.clone());
+            }
+        }
+        if !drops_new.is_empty() { delta.drops_new = Some(drops_new); }
+        if !drops_removed.is_empty() { delta.drops_removed = Some(drops_removed); }
+
         // Wave
         if wave != prev.wave { delta.wave = Some(wave); }
 
@@ -200,7 +227,7 @@ impl DeltaTracker {
         // Game over
         if game_over != prev.game_over { delta.game_over = Some(game_over); }
 
-        self.save_state(players, zombies, bullets, wave, ammo_availability, game_over);
+        self.save_state(players, zombies, bullets, drops, wave, ammo_availability, game_over);
         delta
     }
 
@@ -209,6 +236,7 @@ impl DeltaTracker {
         players: &HashMap<String, Player>,
         zombies: &[Zombie],
         bullets: &[Bullet],
+        drops: &[DropPickup],
         wave: u32,
         ammo_availability: &HashMap<String, bool>,
         game_over: bool,
@@ -223,6 +251,7 @@ impl DeltaTracker {
             ammo_pickups: ammo_availability.iter().map(|(id, avail)| {
                 AmmoPickupState { id: id.clone(), available: *avail }
             }).collect(),
+            drops: drops.to_vec(),
             game_over,
         }
     }
@@ -232,6 +261,7 @@ impl DeltaTracker {
         players: &HashMap<String, Player>,
         zombies: &[Zombie],
         bullets: &[Bullet],
+        drops: &[DropPickup],
         wave: u32,
         ammo_availability: &HashMap<String, bool>,
         game_over: bool,
@@ -244,6 +274,7 @@ impl DeltaTracker {
             players: players.clone(),
             zombie_map,
             bullet_set: bullets.iter().map(|b| b.id.clone()).collect(),
+            drop_set: drops.iter().map(|d| d.id.clone()).collect(),
             wave,
             ammo_availability: ammo_availability.clone(),
             game_over,

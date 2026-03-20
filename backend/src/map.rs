@@ -16,10 +16,16 @@ pub const ZOMBIE_ATTACK_COOLDOWN: f64 = 1.0;
 pub const ZOMBIE_ATTACK_RANGE: f64 = ZOMBIE_RADIUS + PLAYER_RADIUS + 5.0;
 pub const ZOMBIE_DAMAGE: f64 = 20.0;
 
-// Shooting
-pub const SHOOT_COOLDOWN: f64 = 0.2;
+// Per-weapon fire rates
+pub const PISTOL_COOLDOWN: f64 = 0.2;
+pub const UZI_COOLDOWN: f64 = 0.08;
+pub const SHOTGUN_COOLDOWN: f64 = 0.5;
+pub const ROCKET_COOLDOWN: f64 = 1.0;
 pub const BULLET_SPEED: f64 = 800.0;
+pub const ROCKET_SPEED: f64 = 500.0;
 pub const BULLET_LIFETIME: f64 = 2.0;
+pub const ROCKET_EXPLOSION_RADIUS: f64 = 80.0;
+pub const ROCKET_DAMAGE: f64 = 150.0;
 
 // Melee
 pub const MELEE_RANGE: f64 = 50.0;
@@ -30,6 +36,12 @@ pub const MELEE_COOLDOWN: f64 = 0.4;
 pub const AMMO_PICKUP_RADIUS: f64 = 18.0;
 pub const AMMO_PICKUP_AMOUNT: i32 = 15;
 pub const AMMO_RESPAWN_TIME: f64 = 15.0;
+
+// Drop pickups
+pub const DROP_PICKUP_RADIUS: f64 = 18.0;
+pub const DROP_DESPAWN_TIME: f64 = 10.0;
+pub const DROP_AMMO_AMOUNT: f64 = 15.0;
+pub const DROP_HEALTH_AMOUNT: f64 = 25.0;
 
 // Zombie spawning
 pub const MAX_ZOMBIES_BASE: i32 = 30;

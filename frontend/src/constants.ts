@@ -1,8 +1,7 @@
-export const WEAPON_STATS: Record<string, { damage: number; name: string }> = {
-  pistol:    { damage: 25, name: 'Pistol' },
-  uzi:       { damage: 15, name: 'Uzi' },
-  shotgun:   { damage: 80, name: 'Shotgun' },
-  barrel:    { damage: 0,  name: 'Barrel' },
-  barricade: { damage: 0,  name: 'Barricade' },
-  melee:     { damage: 35, name: 'Melee' },
+export const WEAPON_STATS: Record<string, { damage: number; name: string; slot: number }> = {
+  pistol:         { damage: 25,  name: 'Pistol',          slot: 1 },
+  uzi:            { damage: 15,  name: 'Uzi',             slot: 2 },
+  shotgun:        { damage: 80,  name: 'Shotgun',         slot: 3 },
+  rocketLauncher: { damage: 150, name: 'Rocket Launcher', slot: 4 },
+  melee:          { damage: 35,  name: 'Melee',           slot: 0 },
 };

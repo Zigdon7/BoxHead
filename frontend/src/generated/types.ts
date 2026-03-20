@@ -9,7 +9,12 @@
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "Weapon".
  */
-export type Weapon = "pistol" | "uzi" | "shotgun" | "barrel" | "barricade";
+export type Weapon = "pistol" | "uzi" | "shotgun" | "rocketLauncher";
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "DropType".
+ */
+export type DropType = "ammo" | "health" | "weapon";
 /**
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "ZombieType".
@@ -30,6 +35,16 @@ export interface Vector2 {
 }
 /**
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "DropPickup".
+ */
+export interface DropPickup {
+  id: string;
+  type: DropType;
+  pos: Vector2;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "Player".
  */
 export interface Player {
@@ -41,6 +56,11 @@ export interface Player {
   ammo: number;
   maxAmmo: number;
   weapon: Weapon;
+  /**
+   * @minItems 4
+   * @maxItems 4
+   */
+  weaponSlots: [boolean, boolean, boolean, boolean];
   [k: string]: unknown;
 }
 /**
@@ -111,7 +131,7 @@ export interface ClientInput {
   mouseY: number;
   shooting: boolean;
   melee: boolean;
-  switchWeapon: boolean;
+  selectWeapon: number;
   [k: string]: unknown;
 }
 /**
@@ -141,6 +161,7 @@ export interface SnapshotState {
   bullets: Bullet[];
   wave: number;
   ammoPickups: AmmoPickupState[];
+  drops: DropPickup[];
   gameOver: boolean;
   [k: string]: unknown;
 }
@@ -157,6 +178,11 @@ export interface PlayerDelta {
   ammo?: number;
   maxAmmo?: number;
   weapon?: Weapon;
+  /**
+   * @minItems 4
+   * @maxItems 4
+   */
+  weaponSlots?: [boolean, boolean, boolean, boolean];
   [k: string]: unknown;
 }
 /**
@@ -185,6 +211,8 @@ export interface DeltaState {
   zombiesRemoved?: string[];
   bulletsNew?: Bullet[];
   bulletsRemoved?: string[];
+  dropsNew?: DropPickup[];
+  dropsRemoved?: string[];
   wave?: number;
   ammoPickups?: AmmoPickupState[];
   gameOver?: boolean;
