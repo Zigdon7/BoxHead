@@ -5,3 +5,7 @@ export const WEAPON_STATS: Record<string, { damage: number; name: string; slot: 
   rocketLauncher: { damage: 150, name: 'Rocket Launcher', slot: 4 },
   melee:          { damage: 35,  name: 'Melee',           slot: 0 },
 };
+
+// Shared physics constants (must match backend map.rs)
+export const PLAYER_SPEED = 200.0;
+export const PLAYER_RADIUS = 15.0;

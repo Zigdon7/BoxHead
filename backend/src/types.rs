@@ -79,6 +79,7 @@ pub enum ZombieType {
 #[serde(rename_all = "camelCase")]
 pub struct Player {
     pub id: String,
+    pub name: String,
     pub pos: Vector2,
     pub angle: f64,
     pub score: f64,
@@ -192,6 +193,8 @@ pub struct SnapshotState {
 pub struct PlayerDelta {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pos: Option<Vector2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub angle: Option<f64>,
@@ -267,4 +270,5 @@ pub struct ClientMessage {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub input: Option<ClientInput>,
+    pub name: Option<String>,
 }

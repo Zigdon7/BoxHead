@@ -257,6 +257,7 @@ fn roll_drop(zombie_type: &ZombieType, x: f64, y: f64, game_time: f64) -> Option
 
 pub struct Game {
     players: HashMap<String, Player>,
+    player_names: HashMap<String, String>,
     inputs: HashMap<String, ClientInput>,
     zombies: Vec<Zombie>,
     bullets: Vec<Bullet>,
@@ -297,6 +298,7 @@ impl Game {
 
         Self {
             players: HashMap::new(),
+            player_names: HashMap::new(),
             inputs: HashMap::new(),
             zombies: Vec::new(),
             bullets: Vec::new(),
@@ -318,9 +320,38 @@ impl Game {
         }
     }
 
-    pub fn add_player(&mut self, id: &str) {
+    /// Reset the game world but keep connected players (respawn them).
+    pub fn reset(&mut self) {
+        self.zombies.clear();
+        self.bullets.clear();
+        self.drops.clear();
+        self.wave = 1;
+        self.game_over = false;
+        self.zombie_spawn_timer = 0.0;
+        self.wave_kills = 0;
+        self.shoot_cooldowns.clear();
+        self.melee_cooldowns.clear();
+        self.zombie_attack_cooldowns.clear();
+        self.bullet_lifetimes.clear();
+        self.game_time = 0.0;
+        for pickup in &mut self.ammo_pickups {
+            pickup.respawn_at = None;
+        }
+        // Respawn all players (preserve names)
+        let ids: Vec<String> = self.players.keys().cloned().collect();
+        self.players.clear();
+        self.inputs.clear();
+        for id in ids {
+            let name = self.player_names.get(&id).cloned().unwrap_or_default();
+            self.add_player(&id, &name);
+        }
+    }
+
+    pub fn add_player(&mut self, id: &str, name: &str) {
+        self.player_names.insert(id.to_string(), name.to_string());
         let player = Player {
             id: id.to_string(),
+            name: name.to_string(),
             pos: Vector2 { x: MAP_WIDTH / 2.0, y: MAP_HEIGHT / 2.0 },
             angle: 0.0,
             score: 0.0,
@@ -335,6 +366,7 @@ impl Game {
 
     pub fn remove_player(&mut self, id: &str) {
         self.players.remove(id);
+        self.player_names.remove(id);
         self.inputs.remove(id);
         self.shoot_cooldowns.remove(id);
         self.melee_cooldowns.remove(id);
@@ -811,20 +843,108 @@ impl Game {
 
                     if tdist > 0.0 {
                         let z = &mut self.zombies[zi];
-                        z.pos.x += (tdx / tdist) * z_speed * dt;
-                        z.pos.y += (tdy / tdist) * z_speed * dt;
+                        let z_type = z.zombie_type.clone();
+                        let zid_hash = z.id.as_bytes().iter().fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
+
+                        // Per-type movement AI
+                        let (mut move_dx, mut move_dy) = (tdx / tdist, tdy / tdist);
+
+                        match z_type {
+                            ZombieType::Crawler => {
+                                // Skitter: zigzag toward player
+                                let phase = (self.game_time * 8.0 + zid_hash as f64 * 0.1).sin() * 0.7;
+                                let perp_x = -move_dy;
+                                let perp_y = move_dx;
+                                move_dx += perp_x * phase;
+                                move_dy += perp_y * phase;
+                                let len = (move_dx * move_dx + move_dy * move_dy).sqrt();
+                                if len > 0.0 { move_dx /= len; move_dy /= len; }
+                            }
+                            ZombieType::Devil => {
+                                // Hellion: periodic charge bursts (2x speed for 0.3s every 2s)
+                                let cycle = (self.game_time + zid_hash as f64 * 0.3) % 2.0;
+                                if cycle < 0.3 {
+                                    let burst = 2.0;
+                                    move_dx *= burst;
+                                    move_dy *= burst;
+                                }
+                            }
+                            ZombieType::Vampire => {
+                                // Shade: flank — approach at an angle, circle when close
+                                if tdist < 200.0 {
+                                    // Circle the player
+                                    let circle_dir = if zid_hash % 2 == 0 { 1.0 } else { -1.0 };
+                                    let perp_x = -move_dy * circle_dir;
+                                    let perp_y = move_dx * circle_dir;
+                                    move_dx = move_dx * 0.3 + perp_x * 0.7;
+                                    move_dy = move_dy * 0.3 + perp_y * 0.7;
+                                    let len = (move_dx * move_dx + move_dy * move_dy).sqrt();
+                                    if len > 0.0 { move_dx /= len; move_dy /= len; }
+                                } else {
+                                    // Approach at 30-degree offset
+                                    let angle_offset: f64 = if zid_hash % 2 == 0 { 0.5 } else { -0.5 };
+                                    let cos_a = angle_offset.cos();
+                                    let sin_a = angle_offset.sin();
+                                    let rx = move_dx * cos_a - move_dy * sin_a;
+                                    let ry = move_dx * sin_a + move_dy * cos_a;
+                                    move_dx = rx;
+                                    move_dy = ry;
+                                }
+                            }
+                            _ => {} // Walker and Brute: direct approach
+                        }
+
+                        z.pos.x += move_dx * z_speed * dt;
+                        z.pos.y += move_dy * z_speed * dt;
 
                         z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
                         z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
 
-                        let (nx, ny) = resolve_wall_collisions(
-                            z.pos.x,
-                            z.pos.y,
-                            ZOMBIE_RADIUS,
-                            &self.wall_grid,
-                        );
-                        z.pos.x = nx;
-                        z.pos.y = ny;
+                        // Wall collision — Brutes and Crawlers ignore walls
+                        match z_type {
+                            ZombieType::Brute | ZombieType::Crawler => {
+                                // These types phase/smash through walls
+                            }
+                            _ => {
+                                // Wall sliding: try to resolve, and if stuck, slide along the wall
+                                let (nx, ny) = resolve_wall_collisions(
+                                    z.pos.x, z.pos.y, ZOMBIE_RADIUS, &self.wall_grid,
+                                );
+
+                                // If wall collision pushed us back, try sliding along axes individually
+                                let wall_blocked_x = (nx - z.pos.x).abs() > 0.1;
+                                let wall_blocked_y = (ny - z.pos.y).abs() > 0.1;
+
+                                if wall_blocked_x && wall_blocked_y {
+                                    // Try X-only movement
+                                    let try_x = zx + move_dx * z_speed * dt;
+                                    let (sx, _) = resolve_wall_collisions(
+                                        try_x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS),
+                                        zy, ZOMBIE_RADIUS, &self.wall_grid,
+                                    );
+                                    // Try Y-only movement
+                                    let try_y = zy + move_dy * z_speed * dt;
+                                    let (_, sy) = resolve_wall_collisions(
+                                        zx,
+                                        try_y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS),
+                                        ZOMBIE_RADIUS, &self.wall_grid,
+                                    );
+                                    // Use whichever axis made more progress
+                                    let x_progress = (sx - zx).abs();
+                                    let y_progress = (sy - zy).abs();
+                                    if x_progress > y_progress {
+                                        z.pos.x = sx;
+                                        z.pos.y = zy;
+                                    } else {
+                                        z.pos.x = zx;
+                                        z.pos.y = sy;
+                                    }
+                                } else {
+                                    z.pos.x = nx;
+                                    z.pos.y = ny;
+                                }
+                            }
+                        }
                     }
 
                     // Zombie melee attack
@@ -833,14 +953,31 @@ impl Game {
                     let zdy = ty - z.pos.y;
                     let dist_to_target = (zdx * zdx + zdy * zdy).sqrt();
 
+                    let attack_damage = match z.zombie_type {
+                        ZombieType::Brute => ZOMBIE_DAMAGE * 2.0,    // Juggernaut hits hard
+                        ZombieType::Vampire => ZOMBIE_DAMAGE * 0.8,  // Shade: lighter hit but heals
+                        _ => ZOMBIE_DAMAGE,
+                    };
+
                     if dist_to_target < ZOMBIE_ATTACK_RANGE {
                         let cd = self
                             .zombie_attack_cooldowns
                             .entry(z.id.clone())
                             .or_insert(0.0);
                         if *cd <= 0.0 {
-                            *cd = ZOMBIE_ATTACK_COOLDOWN;
-                            damage_to_players.push((target_id.clone(), ZOMBIE_DAMAGE));
+                            let attack_speed = match z.zombie_type {
+                                ZombieType::Crawler => ZOMBIE_ATTACK_COOLDOWN * 0.5, // Skitter attacks fast
+                                ZombieType::Brute => ZOMBIE_ATTACK_COOLDOWN * 1.5,   // Juggernaut slow swing
+                                _ => ZOMBIE_ATTACK_COOLDOWN,
+                            };
+                            *cd = attack_speed;
+                            damage_to_players.push((target_id.clone(), attack_damage));
+
+                            // Vampire heals on hit
+                            if z.zombie_type == ZombieType::Vampire {
+                                let z_mut = &mut self.zombies[zi];
+                                z_mut.health = (z_mut.health + 15.0).min(z_mut.max_health);
+                            }
                         }
                     }
                 }

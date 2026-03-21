@@ -42,6 +42,7 @@ impl DeltaTracker {
             let player_deltas: HashMap<String, PlayerDelta> = players.iter().map(|(id, p)| {
                 (id.clone(), PlayerDelta {
                     id: p.id.clone(),
+                    name: Some(p.name.clone()),
                     pos: Some(p.pos.clone()),
                     angle: Some(p.angle),
                     score: Some(p.score),
@@ -97,7 +98,7 @@ impl DeltaTracker {
             if let Some(prev_p) = prev.players.get(id) {
                 let mut pd = PlayerDelta {
                     id: id.clone(),
-                    pos: None, angle: None, score: None, health: None,
+                    name: None, pos: None, angle: None, score: None, health: None,
                     ammo: None, max_ammo: None, weapon: None, weapon_slots: None,
                 };
                 let mut changed = false;
@@ -126,6 +127,7 @@ impl DeltaTracker {
                 // New player
                 player_changes.insert(id.clone(), PlayerDelta {
                     id: curr.id.clone(),
+                    name: Some(curr.name.clone()),
                     pos: Some(curr.pos.clone()),
                     angle: Some(curr.angle),
                     score: Some(curr.score),

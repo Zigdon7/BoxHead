@@ -1,5 +1,5 @@
 import { Player, Zombie, Bullet, Wall, ClientInput, DeltaState, SnapshotState, InitPayload, DropPickup } from './generated/types';
-import { WEAPON_STATS } from './constants';
+import { WEAPON_STATS, PLAYER_SPEED, PLAYER_RADIUS } from './constants';
 
 // Local composite type for rendering
 interface GameState {
@@ -19,6 +19,7 @@ interface GameState {
 const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
 document.getElementById('scoreDisplay');
+const nameInputEl = document.getElementById('nameInput') as HTMLInputElement;
 
 function resizeCanvas() {
   canvas.width = window.innerWidth;
@@ -26,6 +27,14 @@ function resizeCanvas() {
 }
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
+
+// --- Screen state ---
+type Screen = 'menu' | 'playing' | 'gameover';
+let currentScreen: Screen = 'menu';
+let finalWave = 0;
+let finalScore = 0;
+let playerName = localStorage.getItem('boxhead_name') || '';
+let nameInputFocused = false;
 
 // --- Static data (received once on init) ---
 let staticWalls: Wall[] = [];
@@ -49,6 +58,82 @@ let camY = 0;
 let screenMouseX = 0;
 let screenMouseY = 0;
 
+// --- Client-side prediction ---
+let predictedX = 0;
+let predictedY = 0;
+let predictionInitialized = false;
+
+function resolveCircleRect(px: number, py: number, radius: number, rx: number, ry: number, rw: number, rh: number): [number, number] {
+  const closestX = Math.max(rx, Math.min(rx + rw, px));
+  const closestY = Math.max(ry, Math.min(ry + rh, py));
+  const dx = px - closestX;
+  const dy = py - closestY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  if (dist > 0 && dist < radius) {
+    const overlap = radius - dist;
+    return [px + (dx / dist) * overlap, py + (dy / dist) * overlap];
+  } else if (dist === 0) {
+    const left = px - rx;
+    const right = (rx + rw) - px;
+    const top = py - ry;
+    const bottom = (ry + rh) - py;
+    const min = Math.min(left, right, top, bottom);
+    if (min === left) return [rx - radius, py];
+    if (min === right) return [rx + rw + radius, py];
+    if (min === top) return [px, ry - radius];
+    return [px, ry + rh + radius];
+  }
+  return [px, py];
+}
+
+function predictLocalMovement(dt: number) {
+  if (!predictionInitialized || currentScreen !== 'playing') return;
+
+  let dx = 0;
+  let dy = 0;
+  if (input.up) dy -= 1;
+  if (input.down) dy += 1;
+  if (input.left) dx -= 1;
+  if (input.right) dx += 1;
+
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len > 0) {
+    dx /= len;
+    dy /= len;
+  }
+
+  predictedX += dx * PLAYER_SPEED * dt;
+  predictedY += dy * PLAYER_SPEED * dt;
+
+  // Clamp to map bounds
+  predictedX = Math.max(PLAYER_RADIUS, Math.min(staticMapWidth - PLAYER_RADIUS, predictedX));
+  predictedY = Math.max(PLAYER_RADIUS, Math.min(staticMapHeight - PLAYER_RADIUS, predictedY));
+
+  // Wall collision (brute force — only ~40 walls)
+  for (const w of staticWalls) {
+    const cx = Math.max(w.x, Math.min(w.x + w.w, predictedX));
+    const cy = Math.max(w.y, Math.min(w.y + w.h, predictedY));
+    const ddx = predictedX - cx;
+    const ddy = predictedY - cy;
+    const dist = Math.sqrt(ddx * ddx + ddy * ddy);
+    if (dist < PLAYER_RADIUS) {
+      [predictedX, predictedY] = resolveCircleRect(predictedX, predictedY, PLAYER_RADIUS, w.x, w.y, w.w, w.h);
+    }
+  }
+}
+
+// --- Mobile detection ---
+const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+// --- Name input wiring ---
+nameInputEl.value = playerName;
+nameInputEl.addEventListener('input', () => {
+  playerName = nameInputEl.value;
+});
+nameInputEl.addEventListener('focus', () => { nameInputFocused = true; });
+nameInputEl.addEventListener('blur', () => { nameInputFocused = false; });
+
 // Melee visual effect
 let meleeSwingTime = 0;
 let meleeSwingAngle = 0;
@@ -60,8 +145,8 @@ interface StateSnapshot {
   timestamp: number;
 }
 const stateBuffer: StateSnapshot[] = [];
-const INTERP_DELAY = 60; // ms behind latest state
-const MAX_BUFFER_SIZE = 5;
+const INTERP_DELAY = isMobile ? 100 : 60; // ms behind latest state (wider buffer on mobile)
+const MAX_BUFFER_SIZE = 10;
 
 function clonePlayersForInterp(p: Record<string, Player>): Record<string, Player> {
   const result: Record<string, Player> = {};
@@ -120,13 +205,28 @@ function getInterpolatedPlayers(): Record<string, Player> {
       result[id] = { ...n, pos: { ...n.pos } };
       continue;
     }
+
+    // Local player uses client-side prediction
+    if (id === myId && predictionInitialized) {
+      result[id] = {
+        ...n,
+        pos: { x: predictedX, y: predictedY },
+      };
+      continue;
+    }
+
+    // Fix angle wrapping across -PI/+PI boundary
+    let angleDiff = n.angle - o.angle;
+    if (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+    if (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+
     result[id] = {
       ...n,
       pos: {
         x: o.pos.x + (n.pos.x - o.pos.x) * t,
         y: o.pos.y + (n.pos.y - o.pos.y) * t
       },
-      angle: o.angle + (n.angle - o.angle) * t
+      angle: o.angle + angleDiff * t
     };
   }
   return result;
@@ -193,56 +293,126 @@ const input: ClientInput = {
   mouseX: 0, mouseY: 0, shooting: false, melee: false, selectWeapon: 0
 };
 
-const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+let ws: WebSocket | null = null;
+let inputInterval: ReturnType<typeof setInterval> | null = null;
 
-// --- Message handling ---
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data) as { type: string };
+// --- Delta queue (batch-process on mobile to reduce per-frame work) ---
+const pendingDeltas: DeltaState[] = [];
+const MAX_DELTAS_PER_FRAME = isMobile ? 3 : 999;
 
-  if (data.type === 'init') {
-    const init = data as InitPayload;
-    myId = init.id;
-    staticWalls = init.walls;
-    staticMapWidth = init.mapWidth;
-    staticMapHeight = init.mapHeight;
-    staticAmmoSpawns = init.ammoSpawnPoints;
-    // Initialize ammo availability (all available until told otherwise)
-    for (let i = 0; i < staticAmmoSpawns.length; i++) {
-      ammoAvailability.set(`ammo_${i}`, true);
-    }
-  } else if (data.type === 'snapshot') {
-    const snap = data as SnapshotState;
-    players = snap.players;
-    zombieMap.clear();
-    for (const z of snap.zombies) {
-      zombieMap.set(z.id, z);
-    }
-    bulletMap.clear();
-    bulletCreationTime.clear();
-    const now = performance.now();
-    for (const b of snap.bullets) {
-      bulletMap.set(b.id, b);
-      bulletCreationTime.set(b.id, now);
-    }
-    wave = snap.wave;
-    gameOver = snap.gameOver;
-    ammoAvailability.clear();
-    for (const a of snap.ammoPickups) {
-      ammoAvailability.set(a.id, a.available);
-    }
-    dropMap.clear();
-    if (snap.drops) {
-      for (const d of snap.drops) {
-        dropMap.set(d.id, d);
-      }
-    }
+function drainDeltaQueue() {
+  const count = Math.min(pendingDeltas.length, MAX_DELTAS_PER_FRAME);
+  for (let i = 0; i < count; i++) {
+    applyDelta(pendingDeltas[i]);
     pushStateSnapshot();
-  } else if (data.type === 'delta') {
-    applyDelta(data as DeltaState);
-    pushStateSnapshot();
+    // Detect game over transition
+    if (gameOver && currentScreen === 'playing') {
+      const me = players[myId];
+      finalWave = wave;
+      finalScore = me ? me.score : 0;
+      currentScreen = 'gameover';
+    }
   }
-};
+  pendingDeltas.splice(0, count);
+}
+
+function resetGameState() {
+  players = {};
+  zombieMap.clear();
+  bulletMap.clear();
+  bulletCreationTime.clear();
+  wave = 1;
+  ammoAvailability.clear();
+  gameOver = false;
+  dropMap.clear();
+  myId = '';
+  stateBuffer.length = 0;
+  lastSentInput = '';
+  lastSendTime = 0;
+  predictionInitialized = false;
+  pendingDeltas.length = 0;
+}
+
+function connectToServer() {
+  resetGameState();
+  currentScreen = 'playing';
+  localStorage.setItem('boxhead_name', playerName);
+
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+
+  ws.onopen = () => {
+    ws!.send(JSON.stringify({ type: 'join', name: playerName }));
+  };
+
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data) as { type: string };
+
+    if (data.type === 'init') {
+      const init = data as InitPayload;
+      myId = init.id;
+      staticWalls = init.walls;
+      staticMapWidth = init.mapWidth;
+      staticMapHeight = init.mapHeight;
+      staticAmmoSpawns = init.ammoSpawnPoints;
+      for (let i = 0; i < staticAmmoSpawns.length; i++) {
+        ammoAvailability.set(`ammo_${i}`, true);
+      }
+    } else if (data.type === 'snapshot') {
+      const snap = data as SnapshotState;
+      players = snap.players;
+      // Initialize prediction from snapshot
+      const mySnap = snap.players[myId];
+      if (mySnap) {
+        predictedX = mySnap.pos.x;
+        predictedY = mySnap.pos.y;
+        predictionInitialized = true;
+      }
+      zombieMap.clear();
+      for (const z of snap.zombies) {
+        zombieMap.set(z.id, z);
+      }
+      bulletMap.clear();
+      bulletCreationTime.clear();
+      const now = performance.now();
+      for (const b of snap.bullets) {
+        bulletMap.set(b.id, b);
+        bulletCreationTime.set(b.id, now);
+      }
+      wave = snap.wave;
+      gameOver = snap.gameOver;
+      ammoAvailability.clear();
+      for (const a of snap.ammoPickups) {
+        ammoAvailability.set(a.id, a.available);
+      }
+      dropMap.clear();
+      if (snap.drops) {
+        for (const d of snap.drops) {
+          dropMap.set(d.id, d);
+        }
+      }
+
+      // If snapshot says game is no longer over (restart happened), go back to playing
+      if (!snap.gameOver && currentScreen === 'gameover') {
+        currentScreen = 'playing';
+      }
+
+      pushStateSnapshot();
+    } else if (data.type === 'delta') {
+      pendingDeltas.push(data as DeltaState);
+    }
+  };
+
+  ws.onclose = () => {
+    if (inputInterval) { clearInterval(inputInterval); inputInterval = null; }
+    if (currentScreen === 'playing') {
+      currentScreen = 'menu';
+    }
+  };
+
+  // Start sending input
+  inputInterval = setInterval(maybeSendInput, 1000 / 30);
+}
 
 function applyDelta(delta: DeltaState) {
   // Players
@@ -251,7 +421,25 @@ function applyDelta(delta: DeltaState) {
       const diff = delta.players[id];
       const existing = players[id];
       if (existing) {
-        if (diff.pos) existing.pos = diff.pos;
+        if (diff.name !== undefined) existing.name = diff.name;
+        if (diff.pos) {
+          existing.pos = diff.pos;
+          // Reconcile prediction with server for local player
+          if (id === myId && predictionInitialized) {
+            const errX = diff.pos.x - predictedX;
+            const errY = diff.pos.y - predictedY;
+            const errDist = Math.sqrt(errX * errX + errY * errY);
+            if (errDist > 50) {
+              // Snap if too far (teleport, respawn, etc.)
+              predictedX = diff.pos.x;
+              predictedY = diff.pos.y;
+            } else if (errDist > 2) {
+              // Smooth correction
+              predictedX += errX * 0.3;
+              predictedY += errY * 0.3;
+            }
+          }
+        }
         if (diff.angle !== undefined) existing.angle = diff.angle;
         if (diff.health !== undefined) existing.health = diff.health;
         if (diff.score !== undefined) existing.score = diff.score;
@@ -329,6 +517,7 @@ function applyDelta(delta: DeltaState) {
 
 // --- Input ---
 window.addEventListener('keydown', (e) => {
+  if (nameInputFocused) return;
   if (e.key === 'w' || e.key === 'W') input.up = true;
   if (e.key === 's' || e.key === 'S') input.down = true;
   if (e.key === 'a' || e.key === 'A') input.left = true;
@@ -345,6 +534,7 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('keyup', (e) => {
+  if (nameInputFocused) return;
   if (e.key === 'w' || e.key === 'W') input.up = false;
   if (e.key === 's' || e.key === 'S') input.down = false;
   if (e.key === 'a' || e.key === 'A') input.left = false;
@@ -364,13 +554,146 @@ window.addEventListener('mousedown', () => input.shooting = true);
 window.addEventListener('mouseup', () => input.shooting = false);
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
+// --- Mobile touch controls ---
+// Left half: virtual joystick (movement)
+// Right half: aim direction + auto-shoot
+// Bottom-right buttons: melee, weapon cycle
+
+let moveStickId: number | null = null;
+let moveStickOrigin = { x: 0, y: 0 };
+let aimTouchId: number | null = null;
+let touchMeleeBtn = { x: 0, y: 0, r: 30 };
+let touchWeaponBtn = { x: 0, y: 0, r: 30 };
+// Visual feedback for joystick
+let moveStickPos = { x: 0, y: 0 };
+let moveStickActive = false;
+
+const JOYSTICK_DEAD_ZONE = 15;
+const JOYSTICK_MAX = 60;
+
+function handleTouchStart(e: TouchEvent) {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    const tx = t.clientX;
+    const ty = t.clientY;
+
+    // Check melee button
+    if (currentScreen === 'playing') {
+      const mdx = tx - touchMeleeBtn.x;
+      const mdy = ty - touchMeleeBtn.y;
+      if (mdx * mdx + mdy * mdy < (touchMeleeBtn.r + 10) ** 2) {
+        input.melee = true;
+        meleeSwingTime = 0.3;
+        const p = players[myId];
+        if (p) meleeSwingAngle = p.angle;
+        continue;
+      }
+
+      // Check weapon cycle button
+      const wdx = tx - touchWeaponBtn.x;
+      const wdy = ty - touchWeaponBtn.y;
+      if (wdx * wdx + wdy * wdy < (touchWeaponBtn.r + 10) ** 2) {
+        // Cycle to next available weapon
+        const p = players[myId];
+        if (p) {
+          const currentSlot = ['pistol', 'uzi', 'shotgun', 'rocketLauncher'].indexOf(p.weapon);
+          for (let s = 1; s <= 4; s++) {
+            const next = (currentSlot + s) % 4;
+            if (p.weaponSlots[next]) {
+              input.selectWeapon = next + 1;
+              // Reset after a short delay
+              setTimeout(() => { input.selectWeapon = 0; }, 100);
+              break;
+            }
+          }
+        }
+        continue;
+      }
+    }
+
+    // Left half: movement joystick
+    if (tx < canvas.width / 2 && moveStickId === null) {
+      moveStickId = t.identifier;
+      moveStickOrigin = { x: tx, y: ty };
+      moveStickPos = { x: tx, y: ty };
+      moveStickActive = true;
+    }
+    // Right half: aim + shoot
+    else if (tx >= canvas.width / 2 && aimTouchId === null) {
+      aimTouchId = t.identifier;
+      screenMouseX = tx;
+      screenMouseY = ty;
+      input.shooting = true;
+    }
+  }
+}
+
+function handleTouchMove(e: TouchEvent) {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+
+    if (t.identifier === moveStickId) {
+      const dx = t.clientX - moveStickOrigin.x;
+      const dy = t.clientY - moveStickOrigin.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      moveStickPos = { x: t.clientX, y: t.clientY };
+
+      if (dist < JOYSTICK_DEAD_ZONE) {
+        input.up = input.down = input.left = input.right = false;
+      } else {
+        const angle = Math.atan2(dy, dx);
+        // 8-direction snapping
+        input.right = angle > -Math.PI / 4 && angle < Math.PI / 4;
+        input.down = angle > Math.PI / 4 && angle < 3 * Math.PI / 4;
+        input.left = angle > 3 * Math.PI / 4 || angle < -3 * Math.PI / 4;
+        input.up = angle > -3 * Math.PI / 4 && angle < -Math.PI / 4;
+      }
+    }
+
+    if (t.identifier === aimTouchId) {
+      screenMouseX = t.clientX;
+      screenMouseY = t.clientY;
+    }
+  }
+}
+
+function handleTouchEnd(e: TouchEvent) {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+
+    if (t.identifier === moveStickId) {
+      moveStickId = null;
+      moveStickActive = false;
+      input.up = input.down = input.left = input.right = false;
+    }
+    if (t.identifier === aimTouchId) {
+      aimTouchId = null;
+      input.shooting = false;
+    }
+  }
+  // Clear melee on any touch end
+  input.melee = false;
+}
+
+if (isMobile) {
+  canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
+  canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
+  canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
+  canvas.addEventListener('touchcancel', handleTouchEnd, { passive: false });
+}
+
 // Phase 6: Only send input when it changes (+ heartbeat)
 let lastSentInput = '';
 let lastSendTime = 0;
 const HEARTBEAT_INTERVAL = 500;
 
 function maybeSendInput() {
-  if (ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (currentScreen !== 'playing') return;
   // Compute world mouse coords
   input.mouseX = Math.round(screenMouseX + camX);
   input.mouseY = Math.round(screenMouseY + camY);
@@ -384,9 +707,6 @@ function maybeSendInput() {
     lastSendTime = now;
   }
 }
-
-// Send input check every frame (cheap — only actually sends on change)
-setInterval(maybeSendInput, 1000 / 30);
 
 // --- Legacy state accessor for draw functions ---
 // Build a GameState-like object for rendering (using interpolated data)
@@ -420,11 +740,12 @@ function buildRenderState(): GameState | null {
 let lastFrameTime = performance.now();
 
 function updateCamera() {
-  const p = players[myId];
-  if (!p) return;
-  // Use latest (non-interpolated) player pos for camera to reduce input lag feel
-  const targetX = p.pos.x - canvas.width / 2;
-  const targetY = p.pos.y - canvas.height / 2;
+  if (!players[myId]) return;
+  // Use predicted position for instant camera response
+  const px = predictionInitialized ? predictedX : players[myId].pos.x;
+  const py = predictionInitialized ? predictedY : players[myId].pos.y;
+  const targetX = px - canvas.width / 2;
+  const targetY = py - canvas.height / 2;
   camX = Math.max(0, Math.min(staticMapWidth - canvas.width, targetX));
   camY = Math.max(0, Math.min(staticMapHeight - canvas.height, targetY));
 }
@@ -478,8 +799,10 @@ function drawAmmoPickups() {
 
     const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 300);
 
-    ctx.shadowColor = `rgba(255, 200, 0, ${pulse * 0.5})`;
-    ctx.shadowBlur = 15;
+    if (!isMobile) {
+      ctx.shadowColor = `rgba(255, 200, 0, ${pulse * 0.5})`;
+      ctx.shadowBlur = 15;
+    }
 
     ctx.fillStyle = `rgba(255, 180, 0, ${pulse})`;
     ctx.fillRect(sx - 12, sy - 8, 24, 16);
@@ -699,8 +1022,10 @@ function drawZombies(state: GameState) {
 
 function drawBullets(state: GameState) {
   ctx.fillStyle = '#FFEB3B';
-  ctx.shadowColor = '#FFEB3B';
-  ctx.shadowBlur = 6;
+  if (!isMobile) {
+    ctx.shadowColor = '#FFEB3B';
+    ctx.shadowBlur = 6;
+  }
   for (const b of state.bullets) {
     const sx = b.pos.x - camX;
     const sy = b.pos.y - camY;
@@ -827,6 +1152,14 @@ function drawPlayers(state: GameState) {
 
     ctx.restore();
 
+    // Player name
+    const displayName = p.name || p.id.slice(0, 6);
+    ctx.fillStyle = isMe ? '#64B5F6' : '#eee';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(displayName, sx, sy - 36);
+
     // Health bar
     const barW = 34;
     ctx.fillStyle = '#333';
@@ -900,11 +1233,14 @@ function drawHUD(state: GameState) {
   ctx.textAlign = 'left';
   ctx.fillText(`Score: ${p.score}`, 20, 32);
   ctx.fillText(`Wave: ${state.wave}`, 160, 32);
-  ctx.fillText(`Ammo: ${p.ammo}/${p.maxAmmo}`, 20, 52);
+  const ammoText = p.weapon === 'pistol' ? 'Ammo: \u221E' : `Ammo: ${p.ammo}/${p.maxAmmo}`;
+  ctx.fillText(ammoText, 20, 52);
   ctx.fillText(`HP: ${p.health}`, 160, 52);
-  ctx.font = '13px monospace';
-  ctx.fillStyle = '#aaa';
-  ctx.fillText(`Melee: Space/E`, 20, 72);
+  if (!isMobile) {
+    ctx.font = '13px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(`Melee: Space/E`, 20, 72);
+  }
 }
 
 function drawWeaponBar(state: GameState) {
@@ -964,51 +1300,390 @@ function drawWeaponBar(state: GameState) {
   }
 }
 
+function drawScoreboard(state: GameState) {
+  const playerList = Object.values(state.players)
+    .sort((a, b) => b.score - a.score);
+
+  if (playerList.length === 0) return;
+
+  const rowH = 22;
+  const headerH = 28;
+  const padX = 12;
+  const padY = 8;
+  const boardW = isMobile ? 160 : 200;
+  const boardH = headerH + padY * 2 + playerList.length * rowH;
+  const boardX = canvas.width - boardW - 15;
+  const boardY = 10;
+
+  // Background
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.fillRect(boardX, boardY, boardW, boardH);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(boardX, boardY, boardW, boardH);
+
+  // Header
+  ctx.fillStyle = '#888';
+  ctx.font = 'bold 11px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText('PLAYER', boardX + padX, boardY + 8);
+  ctx.textAlign = 'right';
+  ctx.fillText('SCORE', boardX + boardW - padX, boardY + 8);
+
+  // Divider
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+  ctx.beginPath();
+  ctx.moveTo(boardX + 6, boardY + headerH);
+  ctx.lineTo(boardX + boardW - 6, boardY + headerH);
+  ctx.stroke();
+
+  // Rows
+  for (let i = 0; i < playerList.length; i++) {
+    const p = playerList[i];
+    const y = boardY + headerH + padY + i * rowH;
+    const isMe = p.id === myId;
+    const dead = p.health <= 0;
+
+    // Highlight own row
+    if (isMe) {
+      ctx.fillStyle = 'rgba(33, 150, 243, 0.15)';
+      ctx.fillRect(boardX + 2, y - 2, boardW - 4, rowH);
+    }
+
+    // Name
+    ctx.fillStyle = dead ? '#666' : isMe ? '#64B5F6' : '#ddd';
+    ctx.font = isMe ? 'bold 12px sans-serif' : '12px sans-serif';
+    ctx.textAlign = 'left';
+    const name = (p.name || p.id.slice(0, 6));
+    ctx.fillText(name.length > 12 ? name.slice(0, 11) + '…' : name, boardX + padX, y + 2);
+
+    // Score
+    ctx.fillStyle = dead ? '#666' : '#ffb400';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(`${Math.floor(p.score)}`, boardX + boardW - padX, y + 2);
+  }
+}
+
+function drawMobileControls() {
+  if (!isMobile || currentScreen !== 'playing') return;
+
+  // --- Virtual joystick (left side) ---
+  const joyBaseX = 90;
+  const joyBaseY = canvas.height - 110;
+
+  if (moveStickActive) {
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(moveStickOrigin.x, moveStickOrigin.y, JOYSTICK_MAX, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Inner stick (clamped to max radius)
+    let dx = moveStickPos.x - moveStickOrigin.x;
+    let dy = moveStickPos.y - moveStickOrigin.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > JOYSTICK_MAX) {
+      dx = (dx / dist) * JOYSTICK_MAX;
+      dy = (dy / dist) * JOYSTICK_MAX;
+    }
+    ctx.beginPath();
+    ctx.arc(moveStickOrigin.x + dx, moveStickOrigin.y + dy, 22, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+    ctx.fill();
+  } else {
+    // Static hint
+    ctx.beginPath();
+    ctx.arc(joyBaseX, joyBaseY, JOYSTICK_MAX, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(joyBaseX, joyBaseY, 22, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('MOVE', joyBaseX, joyBaseY);
+  }
+
+  // --- Melee button (bottom-right) ---
+  const meleeX = canvas.width - 70;
+  const meleeY = canvas.height - 160;
+  touchMeleeBtn = { x: meleeX, y: meleeY, r: 30 };
+
+  ctx.beginPath();
+  ctx.arc(meleeX, meleeY, 30, 0, Math.PI * 2);
+  ctx.fillStyle = input.melee ? 'rgba(229, 57, 53, 0.6)' : 'rgba(255, 255, 255, 0.12)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.font = 'bold 12px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('MELEE', meleeX, meleeY);
+
+  // --- Weapon cycle button ---
+  const weapX = canvas.width - 70;
+  const weapY = canvas.height - 90;
+  touchWeaponBtn = { x: weapX, y: weapY, r: 30 };
+
+  ctx.beginPath();
+  ctx.arc(weapX, weapY, 30, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.font = 'bold 10px sans-serif';
+  ctx.fillText('WEAPON', weapX, weapY - 5);
+  ctx.font = '9px sans-serif';
+  ctx.fillText('▶▶', weapX, weapY + 9);
+
+  // --- Aim crosshair feedback (right side) ---
+  if (aimTouchId !== null) {
+    ctx.beginPath();
+    ctx.arc(screenMouseX, screenMouseY, 20, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(229, 57, 53, 0.5)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(screenMouseX - 10, screenMouseY);
+    ctx.lineTo(screenMouseX + 10, screenMouseY);
+    ctx.moveTo(screenMouseX, screenMouseY - 10);
+    ctx.lineTo(screenMouseX, screenMouseY + 10);
+    ctx.stroke();
+  }
+}
+
+// --- Menu button hit detection ---
+let menuPlayBtn = { x: 0, y: 0, w: 0, h: 0 };
+let gameOverMenuBtn = { x: 0, y: 0, w: 0, h: 0 };
+
+function handleMenuClick(mx: number, my: number) {
+  if (currentScreen === 'menu') {
+    // Name input click
+    if (mx >= menuNameBtn.x && mx <= menuNameBtn.x + menuNameBtn.w &&
+        my >= menuNameBtn.y && my <= menuNameBtn.y + menuNameBtn.h) {
+      nameInputEl.style.pointerEvents = 'auto';
+      nameInputEl.focus();
+      setTimeout(() => { nameInputEl.style.pointerEvents = 'none'; }, 100);
+      return;
+    }
+    // Blur name input if clicking elsewhere
+    nameInputEl.blur();
+    // Play button
+    if (mx >= menuPlayBtn.x && mx <= menuPlayBtn.x + menuPlayBtn.w &&
+        my >= menuPlayBtn.y && my <= menuPlayBtn.y + menuPlayBtn.h) {
+      connectToServer();
+    }
+  } else if (currentScreen === 'gameover') {
+    if (mx >= gameOverMenuBtn.x && mx <= gameOverMenuBtn.x + gameOverMenuBtn.w &&
+        my >= gameOverMenuBtn.y && my <= gameOverMenuBtn.y + gameOverMenuBtn.h) {
+      if (ws) { ws.close(); ws = null; }
+      currentScreen = 'menu';
+    }
+  }
+}
+
+canvas.addEventListener('click', (e) => handleMenuClick(e.clientX, e.clientY));
+canvas.addEventListener('touchstart', (e) => {
+  if (currentScreen === 'menu' || currentScreen === 'gameover') {
+    const t = e.changedTouches[0];
+    handleMenuClick(t.clientX, t.clientY);
+  }
+}, { passive: true });
+
+let menuNameBtn = { x: 0, y: 0, w: 0, h: 0 };
+
+function drawMenu() {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  // Background
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Title
+  ctx.fillStyle = '#e53935';
+  ctx.font = 'bold 72px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('BOXHEAD', cx, cy - 120);
+
+  // Subtitle
+  ctx.fillStyle = '#8888aa';
+  ctx.font = '20px sans-serif';
+  ctx.fillText('Survive the horde', cx, cy - 70);
+
+  // Name input field
+  const fieldW = 260;
+  const fieldH = 44;
+  const fieldX = cx - fieldW / 2;
+  const fieldY = cy - 35;
+  menuNameBtn = { x: fieldX, y: fieldY, w: fieldW, h: fieldH };
+
+  ctx.fillStyle = nameInputFocused ? '#2a2a4e' : '#16213e';
+  ctx.fillRect(fieldX, fieldY, fieldW, fieldH);
+  ctx.strokeStyle = nameInputFocused ? '#64B5F6' : '#444';
+  ctx.lineWidth = nameInputFocused ? 2 : 1;
+  ctx.strokeRect(fieldX, fieldY, fieldW, fieldH);
+
+  ctx.textAlign = 'left';
+  if (playerName) {
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px sans-serif';
+    ctx.fillText(playerName + (nameInputFocused ? '|' : ''), fieldX + 12, fieldY + fieldH / 2 + 1);
+  } else {
+    ctx.fillStyle = '#666';
+    ctx.font = '18px sans-serif';
+    ctx.fillText(nameInputFocused ? '|' : 'Enter name...', fieldX + 12, fieldY + fieldH / 2 + 1);
+  }
+
+  // Play button
+  ctx.textAlign = 'center';
+  const btnW = 240;
+  const btnH = 56;
+  const btnX = cx - btnW / 2;
+  const btnY = cy + 25;
+  menuPlayBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
+
+  ctx.fillStyle = '#e53935';
+  ctx.beginPath();
+  ctx.moveTo(btnX + 10, btnY);
+  ctx.arcTo(btnX + btnW, btnY, btnX + btnW, btnY + btnH, 10);
+  ctx.arcTo(btnX + btnW, btnY + btnH, btnX, btnY + btnH, 10);
+  ctx.arcTo(btnX, btnY + btnH, btnX, btnY, 10);
+  ctx.arcTo(btnX, btnY, btnX + btnW, btnY, 10);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillText('PLAY', cx, btnY + btnH / 2);
+
+  // Controls
+  ctx.fillStyle = '#555';
+  ctx.font = '14px sans-serif';
+  if (isMobile) {
+    ctx.fillText('Left stick to move  |  Right side to aim & shoot', cx, cy + 125);
+  } else {
+    ctx.fillText('WASD to move  |  Click to shoot  |  Space for melee  |  1-4 switch weapons', cx, cy + 125);
+  }
+}
+
+function drawGameOver() {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  // Darken game underneath
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Title
+  ctx.fillStyle = '#e53935';
+  ctx.font = 'bold 64px sans-serif';
+  ctx.fillText('GAME OVER', cx, cy - 80);
+
+  // Stats
+  ctx.fillStyle = '#fff';
+  ctx.font = '28px sans-serif';
+  ctx.fillText(`Wave: ${finalWave}`, cx, cy - 20);
+  ctx.fillStyle = '#ffb400';
+  ctx.fillText(`Score: ${Math.floor(finalScore)}`, cx, cy + 20);
+
+  // Menu button
+  const btnW = 260;
+  const btnH = 52;
+  const btnX = cx - btnW / 2;
+  const btnY = cy + 60;
+  gameOverMenuBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
+
+  ctx.fillStyle = '#333';
+  ctx.beginPath();
+  ctx.moveTo(btnX + 10, btnY);
+  ctx.arcTo(btnX + btnW, btnY, btnX + btnW, btnY + btnH, 10);
+  ctx.arcTo(btnX + btnW, btnY + btnH, btnX, btnY + btnH, 10);
+  ctx.arcTo(btnX, btnY + btnH, btnX, btnY, 10);
+  ctx.arcTo(btnX, btnY, btnX + btnW, btnY, 10);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('BACK TO MENU', cx, btnY + btnH / 2);
+}
+
 function draw() {
   const now = performance.now();
   const dt = (now - lastFrameTime) / 1000;
   lastFrameTime = now;
 
+  // Process queued deltas (batched on mobile)
+  drainDeltaQueue();
+
+  // Client-side prediction — runs every frame for instant response
+  predictLocalMovement(dt);
+
   ctx.fillStyle = '#2a2a2a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const state = buildRenderState();
+  canvas.style.cursor = currentScreen === 'playing' ? 'crosshair' : 'default';
 
-  if (state) {
-    updateCamera();
+  if (currentScreen === 'menu') {
+    drawMenu();
+  } else if (currentScreen === 'playing' || currentScreen === 'gameover') {
+    const state = buildRenderState();
 
-    ctx.fillStyle = '#3d3d3d';
-    ctx.fillRect(-camX, -camY, staticMapWidth, staticMapHeight);
+    if (state) {
+      updateCamera();
 
-    drawGrid();
-    drawWalls();
-    drawAmmoPickups();
-    drawDrops(state);
-    drawBullets(state);
-    drawZombies(state);
-    drawPlayers(state);
-    drawMeleeSwing(dt, state);
-    drawMinimap(state);
-    drawHUD(state);
-    drawWeaponBar(state);
+      ctx.fillStyle = '#3d3d3d';
+      ctx.fillRect(-camX, -camY, staticMapWidth, staticMapHeight);
 
-    if (state.gameOver) {
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#e53935';
-      ctx.font = 'bold 64px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 30);
+      if (!isMobile) drawGrid();
+      drawWalls();
+      drawAmmoPickups();
+      drawDrops(state);
+      drawBullets(state);
+      drawZombies(state);
+      drawPlayers(state);
+      drawMeleeSwing(dt, state);
+      if (!isMobile) drawMinimap(state);
+      drawHUD(state);
+      drawScoreboard(state);
+      if (!isMobile) drawWeaponBar(state);
+      drawMobileControls();
+
+      if (currentScreen === 'gameover') {
+        drawGameOver();
+      }
+    } else {
       ctx.fillStyle = '#fff';
-      ctx.font = '28px sans-serif';
-      ctx.fillText(`Wave: ${state.wave}`, canvas.width / 2, canvas.height / 2 + 20);
-      ctx.fillText('Refresh to play again', canvas.width / 2, canvas.height / 2 + 60);
+      ctx.font = '24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Connecting...', canvas.width / 2, canvas.height / 2);
     }
-  } else {
-    ctx.fillStyle = '#fff';
-    ctx.font = '24px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('Connecting...', canvas.width / 2, canvas.height / 2);
   }
 
   requestAnimationFrame(draw);

@@ -49,6 +49,7 @@ export interface DropPickup {
  */
 export interface Player {
   id: string;
+  name: string;
   pos: Vector2;
   angle: number;
   score: number;
@@ -171,6 +172,7 @@ export interface SnapshotState {
  */
 export interface PlayerDelta {
   id: string;
+  name?: string;
   pos?: Vector2;
   angle?: number;
   score?: number;
