@@ -3,6 +3,7 @@ mod map;
 mod spatial_grid;
 mod game;
 mod delta;
+mod social;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use tokio::sync::mpsc;
 use crate::types::*;
 use crate::game::Game;
 use crate::delta::DeltaTracker;
+use crate::social::{SocialState, AuthUser};
 
 // Bounded channel: capacity = a few ticks of headroom.
 // If a client falls behind, we skip deltas rather than buffer indefinitely.
@@ -34,6 +36,7 @@ struct AppState {
     delta_tracker: Mutex<DeltaTracker>,
     clients: Mutex<HashMap<String, ClientSender>>,
     pending_snapshots: Mutex<HashSet<String>>,
+    social: Mutex<SocialState>,
 }
 
 #[tokio::main]
@@ -43,6 +46,7 @@ async fn main() {
         delta_tracker: Mutex::new(DeltaTracker::new()),
         clients: Mutex::new(HashMap::new()),
         pending_snapshots: Mutex::new(HashSet::new()),
+        social: Mutex::new(SocialState::new()),
     });
 
     // 60 Hz physics + adaptive-rate network broadcast (up to 60 Hz per client)
@@ -63,6 +67,10 @@ async fn main() {
         .route("/admin", get(admin_panel))
         .route("/admin/restart", post(admin_restart))
         .route("/admin/status", get(admin_status))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/friends", get(friends_list))
+        .route("/api/friends/add", post(friends_add))
+        .route("/api/friends/remove", post(friends_remove))
         .fallback_service(ServeDir::new(static_dir))
         .with_state(state);
 
@@ -85,24 +93,33 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Wait for join message with player name
-    let player_name = loop {
+    // Wait for join message with player name and optional auth token
+    let (player_name, auth_token) = loop {
         match ws_receiver.next().await {
             Some(Ok(Message::Text(text))) => {
                 let text_str: &str = &text;
                 if let Ok(msg) = serde_json::from_str::<ClientMessage>(text_str) {
                     if msg.msg_type == "join" {
                         let name = msg.name.unwrap_or_default();
-                        // Sanitize: limit length, trim whitespace
                         let name = name.trim().chars().take(16).collect::<String>();
-                        break if name.is_empty() { format!("Player_{}", &player_id[..4]) } else { name };
+                        let name = if name.is_empty() { format!("Player_{}", &player_id[..4]) } else { name };
+                        break (name, msg.token);
                     }
                 }
             }
             Some(Ok(_)) => continue,
-            _ => return, // disconnected before joining
+            _ => return,
         }
     };
+
+    // Link player to auth identity if they have a valid token
+    if let Some(ref token) = auth_token {
+        let mut social = state.social.lock().await;
+        if social.get_user(token).is_some() {
+            let did = social.get_user(token).unwrap().did.clone();
+            social.link_player(&player_id, &did);
+        }
+    }
 
     // Bounded channel — drops deltas for slow clients instead of buffering
     let (tx, mut rx) = mpsc::channel::<String>(CLIENT_CHANNEL_CAPACITY);
@@ -186,6 +203,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     {
         let mut pending = state.pending_snapshots.lock().await;
         pending.remove(&pid_cleanup);
+    }
+    {
+        let mut social = state.social.lock().await;
+        social.unlink_player(&pid_cleanup);
     }
 }
 
@@ -366,4 +387,107 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         "wave": wave,
         "game_over": game_over,
     }))
+}
+
+// --- Auth & Friends API ---
+
+async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let handle = body["handle"].as_str().unwrap_or("");
+    let password = body["password"].as_str().unwrap_or("");
+
+    if handle.is_empty() || password.is_empty() {
+        return Json(serde_json::json!({ "ok": false, "error": "Handle and app password required" }));
+    }
+
+    match social::bsky_login(handle, password).await {
+        Ok(session) => {
+            let token = uuid::Uuid::new_v4().to_string();
+            let user = AuthUser {
+                did: session.did.clone(),
+                handle: session.handle.clone(),
+                display_name: session.handle.clone(),
+            };
+            let mut social = state.social.lock().await;
+            social.add_session(&token, user);
+
+            Json(serde_json::json!({
+                "ok": true,
+                "token": token,
+                "handle": session.handle,
+                "did": session.did,
+            }))
+        }
+        Err(e) => {
+            Json(serde_json::json!({ "ok": false, "error": e }))
+        }
+    }
+}
+
+async fn friends_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let token = params.get("token").map(|s| s.as_str()).unwrap_or("");
+    let social = state.social.lock().await;
+
+    let user = match social.get_user(token) {
+        Some(u) => u.clone(),
+        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
+    };
+
+    let friends = social.get_friends(&user.did);
+    Json(serde_json::json!({ "ok": true, "friends": friends }))
+}
+
+async fn friends_add(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let token = body["token"].as_str().unwrap_or("");
+    let friend_handle = body["handle"].as_str().unwrap_or("");
+
+    if friend_handle.is_empty() {
+        return Json(serde_json::json!({ "ok": false, "error": "Friend handle required" }));
+    }
+
+    let user_did = {
+        let social = state.social.lock().await;
+        match social.get_user(token) {
+            Some(u) => u.did.clone(),
+            None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
+        }
+    };
+
+    // Resolve friend handle to DID
+    match social::resolve_handle(friend_handle).await {
+        Ok(friend_did) => {
+            let mut social = state.social.lock().await;
+            social.handle_to_did.insert(friend_handle.to_string(), friend_did.clone());
+            social.add_friend(&user_did, &friend_did);
+            Json(serde_json::json!({ "ok": true, "did": friend_did, "handle": friend_handle }))
+        }
+        Err(e) => {
+            Json(serde_json::json!({ "ok": false, "error": e }))
+        }
+    }
+}
+
+async fn friends_remove(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let token = body["token"].as_str().unwrap_or("");
+    let friend_did = body["did"].as_str().unwrap_or("");
+
+    let mut social = state.social.lock().await;
+    let user = match social.get_user(token) {
+        Some(u) => u.clone(),
+        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
+    };
+
+    social.remove_friend(&user.did, friend_did);
+    Json(serde_json::json!({ "ok": true }))
 }

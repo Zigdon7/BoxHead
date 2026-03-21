@@ -271,4 +271,5 @@ pub struct ClientMessage {
     pub msg_type: String,
     pub input: Option<ClientInput>,
     pub name: Option<String>,
+    pub token: Option<String>,
 }

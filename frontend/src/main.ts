@@ -36,6 +36,107 @@ let finalScore = 0;
 let playerName = localStorage.getItem('boxhead_name') || '';
 let nameInputFocused = false;
 
+// --- Bluesky auth ---
+let authToken = localStorage.getItem('boxhead_auth_token') || '';
+let authHandle = localStorage.getItem('boxhead_auth_handle') || '';
+let authDid = localStorage.getItem('boxhead_auth_did') || '';
+let isLoggedIn = !!authToken;
+let loginError = '';
+let loginLoading = false;
+
+// --- Friends ---
+interface Friend { handle: string; did: string; online: boolean; }
+let friendsList: Friend[] = [];
+let friendsOpen = false;
+let addFriendInput = '';
+let addFriendError = '';
+
+async function bskyLogin(handle: string, password: string) {
+  loginLoading = true;
+  loginError = '';
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle, password }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      authToken = data.token;
+      authHandle = data.handle;
+      authDid = data.did;
+      isLoggedIn = true;
+      playerName = authHandle;
+      nameInputEl.value = playerName;
+      localStorage.setItem('boxhead_auth_token', authToken);
+      localStorage.setItem('boxhead_auth_handle', authHandle);
+      localStorage.setItem('boxhead_auth_did', authDid);
+      localStorage.setItem('boxhead_name', playerName);
+      refreshFriends();
+    } else {
+      loginError = data.error || 'Login failed';
+    }
+  } catch {
+    loginError = 'Network error';
+  }
+  loginLoading = false;
+}
+
+function bskyLogout() {
+  authToken = '';
+  authHandle = '';
+  authDid = '';
+  isLoggedIn = false;
+  friendsList = [];
+  localStorage.removeItem('boxhead_auth_token');
+  localStorage.removeItem('boxhead_auth_handle');
+  localStorage.removeItem('boxhead_auth_did');
+}
+
+async function refreshFriends() {
+  if (!authToken) return;
+  try {
+    const res = await fetch(`/api/friends?token=${encodeURIComponent(authToken)}`);
+    const data = await res.json();
+    if (data.ok) friendsList = data.friends;
+  } catch { /* ignore */ }
+}
+
+async function addFriend(handle: string) {
+  addFriendError = '';
+  try {
+    const res = await fetch('/api/friends/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: authToken, handle }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      addFriendInput = '';
+      refreshFriends();
+    } else {
+      addFriendError = data.error || 'Failed';
+    }
+  } catch {
+    addFriendError = 'Network error';
+  }
+}
+
+async function removeFriend(did: string) {
+  try {
+    await fetch('/api/friends/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: authToken, did }),
+    });
+    refreshFriends();
+  } catch { /* ignore */ }
+}
+
+// Refresh friends periodically when logged in
+setInterval(() => { if (isLoggedIn) refreshFriends(); }, 5000);
+if (isLoggedIn) refreshFriends();
+
 // --- Static data (received once on init) ---
 let staticWalls: Wall[] = [];
 let staticMapWidth = 2400;
@@ -126,13 +227,21 @@ function predictLocalMovement(dt: number) {
 // --- Mobile detection ---
 const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
-// --- Name input wiring ---
+// --- Input element wiring ---
+const bskyHandleEl = document.getElementById('bskyHandleInput') as HTMLInputElement;
+const bskyPassEl = document.getElementById('bskyPassInput') as HTMLInputElement;
+const addFriendEl = document.getElementById('addFriendInputEl') as HTMLInputElement;
+
 nameInputEl.value = playerName;
-nameInputEl.addEventListener('input', () => {
-  playerName = nameInputEl.value;
-});
-nameInputEl.addEventListener('focus', () => { nameInputFocused = true; });
-nameInputEl.addEventListener('blur', () => { nameInputFocused = false; });
+nameInputEl.addEventListener('input', () => { playerName = nameInputEl.value; });
+bskyHandleEl.addEventListener('input', () => { loginError = ''; });
+addFriendEl.addEventListener('input', () => { addFriendInput = addFriendEl.value; addFriendError = ''; });
+
+const allInputs = [nameInputEl, bskyHandleEl, bskyPassEl, addFriendEl];
+for (const el of allInputs) {
+  el.addEventListener('focus', () => { nameInputFocused = true; });
+  el.addEventListener('blur', () => { nameInputFocused = false; });
+}
 
 // Melee visual effect
 let meleeSwingTime = 0;
@@ -342,7 +451,7 @@ function connectToServer() {
   ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: 'join', name: playerName }));
+    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined }));
   };
 
   ws.onmessage = (event) => {
@@ -1473,26 +1582,112 @@ function drawMobileControls() {
 let menuPlayBtn = { x: 0, y: 0, w: 0, h: 0 };
 let gameOverMenuBtn = { x: 0, y: 0, w: 0, h: 0 };
 
+function focusHiddenInput(el: HTMLInputElement) {
+  el.style.pointerEvents = 'auto';
+  el.focus();
+  setTimeout(() => { el.style.pointerEvents = 'none'; }, 100);
+}
+
+function hitTest(mx: number, my: number, r: {x:number;y:number;w:number;h:number}) {
+  return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+}
+
 function handleMenuClick(mx: number, my: number) {
   if (currentScreen === 'menu') {
-    // Name input click
-    if (mx >= menuNameBtn.x && mx <= menuNameBtn.x + menuNameBtn.w &&
-        my >= menuNameBtn.y && my <= menuNameBtn.y + menuNameBtn.h) {
-      nameInputEl.style.pointerEvents = 'auto';
-      nameInputEl.focus();
-      setTimeout(() => { nameInputEl.style.pointerEvents = 'none'; }, 100);
+    // Friends panel interactions (check first since it overlays)
+    if (friendsOpen && isLoggedIn) {
+      const panelW = 280;
+      const panelH = Math.min(400, 100 + friendsList.length * 30 + 50);
+      const panelX = (canvas.width - panelW) / 2;
+      const panelY = (canvas.height - panelH) / 2;
+
+      // Close button
+      if (mx >= panelX + panelW - 30 && mx <= panelX + panelW && my >= panelY && my <= panelY + 35) {
+        friendsOpen = false;
+        return;
+      }
+
+      // Remove friend buttons
+      let y = panelY + 45;
+      for (const f of friendsList) {
+        if (mx >= panelX + panelW - 30 && mx <= panelX + panelW && my >= y - 8 && my <= y + 20) {
+          removeFriend(f.did);
+          return;
+        }
+        y += 28;
+      }
+
+      // Add friend input
+      y += 8;
+      const addX = panelX + 10;
+      const addW = panelW - 80;
+      const addH = 28;
+      if (mx >= addX && mx <= addX + addW && my >= y && my <= y + addH) {
+        focusHiddenInput(addFriendEl);
+        return;
+      }
+
+      // Add friend button
+      const addBtnX = addX + addW + 5;
+      if (mx >= addBtnX && mx <= addBtnX + 55 && my >= y && my <= y + addH) {
+        if (addFriendInput.trim()) addFriend(addFriendInput.trim());
+        return;
+      }
+
+      // Click outside panel closes it
+      if (mx < panelX || mx > panelX + panelW || my < panelY || my > panelY + panelH) {
+        friendsOpen = false;
+      }
       return;
     }
-    // Blur name input if clicking elsewhere
-    nameInputEl.blur();
+
+    // Name input
+    if (hitTest(mx, my, menuNameBtn)) {
+      focusHiddenInput(nameInputEl);
+      return;
+    }
+
+    // Bluesky handle input
+    if (!isLoggedIn && hitTest(mx, my, menuBskyHandleBtn)) {
+      focusHiddenInput(bskyHandleEl);
+      return;
+    }
+
+    // Bluesky password input
+    if (!isLoggedIn && hitTest(mx, my, menuBskyPassBtn)) {
+      focusHiddenInput(bskyPassEl);
+      return;
+    }
+
+    // Bluesky login button
+    if (!isLoggedIn && hitTest(mx, my, menuBskyLoginBtn) && !loginLoading) {
+      if (bskyHandleEl.value && bskyPassEl.value) {
+        bskyLogin(bskyHandleEl.value, bskyPassEl.value);
+      }
+      return;
+    }
+
+    // Logout button
+    if (isLoggedIn && hitTest(mx, my, menuBskyLogoutBtn)) {
+      bskyLogout();
+      return;
+    }
+
+    // Friends button
+    if (isLoggedIn && hitTest(mx, my, menuFriendsBtn)) {
+      friendsOpen = !friendsOpen;
+      return;
+    }
+
+    // Blur all inputs
+    for (const el of allInputs) el.blur();
+
     // Play button
-    if (mx >= menuPlayBtn.x && mx <= menuPlayBtn.x + menuPlayBtn.w &&
-        my >= menuPlayBtn.y && my <= menuPlayBtn.y + menuPlayBtn.h) {
+    if (hitTest(mx, my, menuPlayBtn)) {
       connectToServer();
     }
   } else if (currentScreen === 'gameover') {
-    if (mx >= gameOverMenuBtn.x && mx <= gameOverMenuBtn.x + gameOverMenuBtn.w &&
-        my >= gameOverMenuBtn.y && my <= gameOverMenuBtn.y + gameOverMenuBtn.h) {
+    if (hitTest(mx, my, gameOverMenuBtn)) {
       if (ws) { ws.close(); ws = null; }
       currentScreen = 'menu';
     }
@@ -1508,12 +1703,16 @@ canvas.addEventListener('touchstart', (e) => {
 }, { passive: true });
 
 let menuNameBtn = { x: 0, y: 0, w: 0, h: 0 };
+let menuBskyHandleBtn = { x: 0, y: 0, w: 0, h: 0 };
+let menuBskyPassBtn = { x: 0, y: 0, w: 0, h: 0 };
+let menuBskyLoginBtn = { x: 0, y: 0, w: 0, h: 0 };
+let menuBskyLogoutBtn = { x: 0, y: 0, w: 0, h: 0 };
+let menuFriendsBtn = { x: 0, y: 0, w: 0, h: 0 };
 
 function drawMenu() {
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
 
-  // Background
   ctx.fillStyle = '#1a1a2e';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -1522,43 +1721,128 @@ function drawMenu() {
   ctx.font = 'bold 72px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('BOXHEAD', cx, cy - 120);
+  ctx.fillText('BOXHEAD', cx, cy - 160);
 
-  // Subtitle
   ctx.fillStyle = '#8888aa';
   ctx.font = '20px sans-serif';
-  ctx.fillText('Survive the horde', cx, cy - 70);
+  ctx.fillText('Survive the horde', cx, cy - 110);
 
-  // Name input field
+  // --- Name input ---
   const fieldW = 260;
-  const fieldH = 44;
+  const fieldH = 38;
   const fieldX = cx - fieldW / 2;
-  const fieldY = cy - 35;
+  const fieldY = cy - 80;
   menuNameBtn = { x: fieldX, y: fieldY, w: fieldW, h: fieldH };
 
-  ctx.fillStyle = nameInputFocused ? '#2a2a4e' : '#16213e';
+  ctx.fillStyle = '#16213e';
   ctx.fillRect(fieldX, fieldY, fieldW, fieldH);
-  ctx.strokeStyle = nameInputFocused ? '#64B5F6' : '#444';
-  ctx.lineWidth = nameInputFocused ? 2 : 1;
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 1;
   ctx.strokeRect(fieldX, fieldY, fieldW, fieldH);
 
   ctx.textAlign = 'left';
-  if (playerName) {
-    ctx.fillStyle = '#fff';
-    ctx.font = '18px sans-serif';
-    ctx.fillText(playerName + (nameInputFocused ? '|' : ''), fieldX + 12, fieldY + fieldH / 2 + 1);
+  ctx.fillStyle = playerName ? '#fff' : '#666';
+  ctx.font = '16px sans-serif';
+  ctx.fillText(playerName || 'Enter name...', fieldX + 10, fieldY + fieldH / 2 + 1);
+
+  // --- Bluesky auth section ---
+  const authY = cy - 30;
+  if (isLoggedIn) {
+    // Logged in state
+    ctx.fillStyle = '#4caf50';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Logged in as @${authHandle}`, cx, authY + 10);
+
+    // Logout button (small)
+    const logW = 80;
+    const logH = 28;
+    const logX = cx - logW / 2;
+    const logY = authY + 20;
+    menuBskyLogoutBtn = { x: logX, y: logY, w: logW, h: logH };
+    ctx.fillStyle = '#333';
+    ctx.fillRect(logX, logY, logW, logH);
+    ctx.strokeStyle = '#555';
+    ctx.strokeRect(logX, logY, logW, logH);
+    ctx.fillStyle = '#aaa';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Logout', cx, logY + logH / 2 + 1);
+
+    // Friends button
+    const fbW = 140;
+    const fbH = 32;
+    const fbX = cx - fbW / 2;
+    const fbY = authY + 56;
+    menuFriendsBtn = { x: fbX, y: fbY, w: fbW, h: fbH };
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(fbX, fbY, fbW, fbH);
+    ctx.strokeStyle = '#2196F3';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(fbX, fbY, fbW, fbH);
+    ctx.fillStyle = '#64B5F6';
+    ctx.font = 'bold 13px sans-serif';
+    const onlineCount = friendsList.filter(f => f.online).length;
+    ctx.fillText(`Friends (${onlineCount}/${friendsList.length})`, cx, fbY + fbH / 2 + 1);
   } else {
-    ctx.fillStyle = '#666';
-    ctx.font = '18px sans-serif';
-    ctx.fillText(nameInputFocused ? '|' : 'Enter name...', fieldX + 12, fieldY + fieldH / 2 + 1);
+    // Login form
+    ctx.fillStyle = '#8888aa';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Sign in with Bluesky (optional)', cx, authY);
+
+    const inputW = 200;
+    const inputH = 30;
+    const inputX = cx - inputW / 2;
+
+    // Handle input
+    const hY = authY + 8;
+    menuBskyHandleBtn = { x: inputX, y: hY, w: inputW, h: inputH };
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(inputX, hY, inputW, inputH);
+    ctx.strokeStyle = '#333';
+    ctx.strokeRect(inputX, hY, inputW, inputH);
+    ctx.fillStyle = bskyHandleEl.value ? '#fff' : '#555';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(bskyHandleEl.value || 'handle.bsky.social', inputX + 8, hY + inputH / 2 + 1);
+
+    // Password input
+    const pY = hY + inputH + 4;
+    menuBskyPassBtn = { x: inputX, y: pY, w: inputW, h: inputH };
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(inputX, pY, inputW, inputH);
+    ctx.strokeStyle = '#333';
+    ctx.strokeRect(inputX, pY, inputW, inputH);
+    ctx.fillStyle = bskyPassEl.value ? '#fff' : '#555';
+    ctx.fillText(bskyPassEl.value ? '•'.repeat(bskyPassEl.value.length) : 'App password', inputX + 8, pY + inputH / 2 + 1);
+
+    // Login button
+    const lbW = 80;
+    const lbX = cx + inputW / 2 + 8;
+    const lbY = hY;
+    menuBskyLoginBtn = { x: lbX, y: lbY, w: lbW, h: inputH * 2 + 4 };
+    ctx.fillStyle = loginLoading ? '#555' : '#1976D2';
+    ctx.fillRect(lbX, lbY, lbW, inputH * 2 + 4);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(loginLoading ? '...' : 'Login', lbX + lbW / 2, lbY + inputH + 2);
+
+    if (loginError) {
+      ctx.fillStyle = '#e53935';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(loginError, cx, pY + inputH + 14);
+    }
   }
 
-  // Play button
+  // --- Play button ---
   ctx.textAlign = 'center';
   const btnW = 240;
   const btnH = 56;
   const btnX = cx - btnW / 2;
-  const btnY = cy + 25;
+  const btnY = cy + 100;
   menuPlayBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
 
   ctx.fillStyle = '#e53935';
@@ -1579,9 +1863,105 @@ function drawMenu() {
   ctx.fillStyle = '#555';
   ctx.font = '14px sans-serif';
   if (isMobile) {
-    ctx.fillText('Left stick to move  |  Right side to aim & shoot', cx, cy + 125);
+    ctx.fillText('Left stick to move  |  Right side to aim & shoot', cx, cy + 200);
   } else {
-    ctx.fillText('WASD to move  |  Click to shoot  |  Space for melee  |  1-4 switch weapons', cx, cy + 125);
+    ctx.fillText('WASD to move  |  Click to shoot  |  Space for melee  |  1-4 switch weapons', cx, cy + 200);
+  }
+
+  // --- Friends panel overlay ---
+  if (friendsOpen && isLoggedIn) {
+    drawFriendsPanel();
+  }
+}
+
+function drawFriendsPanel() {
+  const panelW = 280;
+  const panelH = Math.min(400, 100 + friendsList.length * 30 + 50);
+  const panelX = (canvas.width - panelW) / 2;
+  const panelY = (canvas.height - panelH) / 2;
+
+  // Background
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+  ctx.fillRect(panelX, panelY, panelW, panelH);
+  ctx.strokeStyle = '#2196F3';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+  // Header
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Friends', panelX + panelW / 2, panelY + 20);
+
+  // Close button (top-right)
+  ctx.fillStyle = '#888';
+  ctx.font = '18px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('✕', panelX + panelW - 10, panelY + 20);
+
+  // Friend list
+  let y = panelY + 45;
+  if (friendsList.length === 0) {
+    ctx.fillStyle = '#666';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No friends yet', panelX + panelW / 2, y + 10);
+    y += 30;
+  } else {
+    for (const f of friendsList) {
+      // Online indicator
+      ctx.fillStyle = f.online ? '#4caf50' : '#555';
+      ctx.beginPath();
+      ctx.arc(panelX + 20, y + 6, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Handle
+      ctx.fillStyle = f.online ? '#fff' : '#888';
+      ctx.font = '13px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(`@${f.handle}`, panelX + 32, y + 8);
+
+      // Remove button
+      ctx.fillStyle = '#c62828';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText('✕', panelX + panelW - 15, y + 8);
+
+      y += 28;
+    }
+  }
+
+  // Add friend input
+  y += 8;
+  const addX = panelX + 10;
+  const addW = panelW - 80;
+  const addH = 28;
+  ctx.fillStyle = '#16213e';
+  ctx.fillRect(addX, y, addW, addH);
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(addX, y, addW, addH);
+  ctx.fillStyle = addFriendInput ? '#fff' : '#555';
+  ctx.font = '12px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(addFriendInput || 'handle.bsky.social', addX + 8, y + addH / 2 + 1);
+
+  // Add button
+  const addBtnX = addX + addW + 5;
+  const addBtnW = 55;
+  ctx.fillStyle = '#1976D2';
+  ctx.fillRect(addBtnX, y, addBtnW, addH);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 12px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Add', addBtnX + addBtnW / 2, y + addH / 2 + 1);
+
+  if (addFriendError) {
+    ctx.fillStyle = '#e53935';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(addFriendError, panelX + panelW / 2, y + addH + 14);
   }
 }
 
