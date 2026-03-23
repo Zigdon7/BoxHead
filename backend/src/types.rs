@@ -143,6 +143,8 @@ pub struct ClientInput {
     pub melee: bool,
     #[serde(rename = "selectWeapon")]
     pub select_weapon: u8,
+    #[serde(default)]
+    pub dash: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

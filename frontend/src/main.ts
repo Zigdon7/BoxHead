@@ -1,5 +1,5 @@
 import { Player, Zombie, Bullet, Wall, ClientInput, DeltaState, SnapshotState, InitPayload, DropPickup } from './generated/types';
-import { WEAPON_STATS, PLAYER_SPEED, PLAYER_RADIUS } from './constants';
+import { WEAPON_STATS, PLAYER_SPEED, PLAYER_RADIUS, DASH_SPEED_MULT, DASH_DURATION, DASH_MAX_CHARGES, DASH_RECHARGE_TIME } from './constants';
 
 // Local composite type for rendering
 interface GameState {
@@ -20,6 +20,37 @@ const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
 document.getElementById('scoreDisplay');
 const nameInputEl = document.getElementById('nameInput') as HTMLInputElement;
+const emailInputEl = document.getElementById('emailInput') as HTMLInputElement;
+const emailPassEl = document.getElementById('emailPassInput') as HTMLInputElement;
+const bskyHandleEl = document.getElementById('bskyHandleInput') as HTMLInputElement;
+const bskyPassEl = document.getElementById('bskyPassInput') as HTMLInputElement;
+const addFriendEl = document.getElementById('addFriendInputEl') as HTMLInputElement;
+
+const mainMenuOverlay = document.getElementById('mainMenuOverlay')!;
+const friendsOverlay = document.getElementById('friendsOverlay')!;
+const gameOverOverlay = document.getElementById('gameOverOverlay')!;
+
+const emailLoginBtn = document.getElementById('emailLoginBtn')!;
+const emailRegisterBtn = document.getElementById('emailRegisterBtn')!;
+const bskyLoginBtn = document.getElementById('bskyLoginBtn')!;
+const googleLoginBtn = document.getElementById('googleLoginBtn')!;
+const logoutBtn = document.getElementById('logoutBtn')!;
+const playBtn = document.getElementById('playBtn')!;
+const friendsBtn = document.getElementById('friendsBtn')!;
+const closeFriendsBtn = document.getElementById('closeFriendsBtn')!;
+const addFriendBtn = document.getElementById('addFriendBtn')!;
+const backToMenuBtn = document.getElementById('backToMenuBtn')!;
+
+const authSectionOut = document.getElementById('authSectionOut')!;
+const authSectionIn = document.getElementById('authSectionIn')!;
+const loggedInStatus = document.getElementById('loggedInStatus')!;
+const loginErrorMsg = document.getElementById('loginErrorMsg')!;
+
+const friendsListContainer = document.getElementById('friendsListContainer')!;
+const addFriendErrorMsg = document.getElementById('addFriendErrorMsg')!;
+
+const gameOverWave = document.getElementById('gameOverWave')!;
+const gameOverScore = document.getElementById('gameOverScore')!;
 
 function resizeCanvas() {
   canvas.width = window.innerWidth;
@@ -31,29 +62,76 @@ window.addEventListener('resize', resizeCanvas);
 // --- Screen state ---
 type Screen = 'menu' | 'playing' | 'gameover';
 let currentScreen: Screen = 'menu';
+
+function updateAuthDOM() {
+  if (isLoggedIn) {
+    authSectionOut.classList.add('hidden');
+    authSectionIn.classList.remove('hidden');
+    loggedInStatus.textContent = `Logged in as @${authHandle}`;
+    friendsBtn.textContent = `Friends (${friendsList.filter(f => f.online).length}/${friendsList.length})`;
+  } else {
+    authSectionOut.classList.remove('hidden');
+    authSectionIn.classList.add('hidden');
+  }
+}
+
+function setScreen(scr: Screen) {
+  currentScreen = scr;
+  mainMenuOverlay.classList.toggle('hidden', scr !== 'menu');
+  gameOverOverlay.classList.toggle('hidden', scr !== 'gameover');
+  friendsOverlay.classList.toggle('hidden', true);
+  // Show/hide in-game gear button
+  document.getElementById('gameSettingsBtn')?.classList.toggle('hidden', scr !== 'playing');
+  if (scr === 'menu') updateAuthDOM();
+  if (scr === 'gameover') {
+    gameOverWave.textContent = finalWave.toString();
+    gameOverScore.textContent = Math.floor(finalScore).toString();
+  }
+}
+
 let finalWave = 0;
 let finalScore = 0;
 let playerName = localStorage.getItem('boxhead_name') || '';
-let nameInputFocused = false;
 
-// --- Bluesky auth ---
+// --- Auth ---
 let authToken = localStorage.getItem('boxhead_auth_token') || '';
 let authHandle = localStorage.getItem('boxhead_auth_handle') || '';
-let authDid = localStorage.getItem('boxhead_auth_did') || '';
+let authUserId = localStorage.getItem('boxhead_auth_user_id') || '';
 let isLoggedIn = !!authToken;
-let loginError = '';
-let loginLoading = false;
 
 // --- Friends ---
-interface Friend { handle: string; did: string; online: boolean; }
+interface Friend { handle: string; display_name: string; user_id: string; online: boolean; }
 let friendsList: Friend[] = [];
-let friendsOpen = false;
-let addFriendInput = '';
-let addFriendError = '';
+
+function setAuthState(token: string, handle: string, userId: string, displayName?: string) {
+  authToken = token;
+  authHandle = handle || displayName || '';
+  authUserId = userId;
+  isLoggedIn = true;
+  playerName = authHandle;
+  nameInputEl.value = playerName;
+  localStorage.setItem('boxhead_auth_token', authToken);
+  localStorage.setItem('boxhead_auth_handle', authHandle);
+  localStorage.setItem('boxhead_auth_user_id', authUserId);
+  localStorage.setItem('boxhead_name', playerName);
+  updateAuthDOM();
+  refreshFriends();
+}
+
+function clearAuthState() {
+  authToken = '';
+  authHandle = '';
+  authUserId = '';
+  isLoggedIn = false;
+  friendsList = [];
+  updateAuthDOM();
+  localStorage.removeItem('boxhead_auth_token');
+  localStorage.removeItem('boxhead_auth_handle');
+  localStorage.removeItem('boxhead_auth_user_id');
+}
 
 async function bskyLogin(handle: string, password: string) {
-  loginLoading = true;
-  loginError = '';
+  loginErrorMsg.textContent = '';
   try {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
@@ -62,35 +140,79 @@ async function bskyLogin(handle: string, password: string) {
     });
     const data = await res.json();
     if (data.ok) {
-      authToken = data.token;
-      authHandle = data.handle;
-      authDid = data.did;
-      isLoggedIn = true;
-      playerName = authHandle;
-      nameInputEl.value = playerName;
-      localStorage.setItem('boxhead_auth_token', authToken);
-      localStorage.setItem('boxhead_auth_handle', authHandle);
-      localStorage.setItem('boxhead_auth_did', authDid);
-      localStorage.setItem('boxhead_name', playerName);
-      refreshFriends();
+      setAuthState(data.token, data.handle, data.user_id, data.display_name);
     } else {
-      loginError = data.error || 'Login failed';
+      loginErrorMsg.textContent = data.error || 'Login failed';
     }
   } catch {
-    loginError = 'Network error';
+    loginErrorMsg.textContent = 'Network error';
   }
-  loginLoading = false;
+  bskyLoginBtn.textContent = 'Sign in with Bluesky';
 }
 
-function bskyLogout() {
-  authToken = '';
-  authHandle = '';
-  authDid = '';
-  isLoggedIn = false;
-  friendsList = [];
-  localStorage.removeItem('boxhead_auth_token');
-  localStorage.removeItem('boxhead_auth_handle');
-  localStorage.removeItem('boxhead_auth_did');
+function googleLogin() {
+  // Open Google OAuth in a popup — the callback page will postMessage back
+  const redirectUri = `${window.location.origin}/api/auth/google/callback`;
+  // Client ID is embedded in the URL; the server handles the secret
+  const params = new URLSearchParams({
+    client_id: (window as any).__GOOGLE_CLIENT_ID || '',
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    prompt: 'select_account',
+  });
+  const url = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+  window.open(url, 'google-login', 'width=500,height=600,menubar=no,toolbar=no');
+}
+
+async function emailAuth(endpoint: string) {
+  loginErrorMsg.textContent = '';
+  const email = emailInputEl.value.trim();
+  const password = emailPassEl.value;
+  if (!email || !password) { loginErrorMsg.textContent = 'Email and password required'; return; }
+  try {
+    const res = await fetch(`/api/auth/email/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      setAuthState(data.token, data.handle, data.user_id, data.display_name);
+    } else {
+      loginErrorMsg.textContent = data.error || 'Auth failed';
+    }
+  } catch {
+    loginErrorMsg.textContent = 'Network error';
+  }
+}
+
+// Listen for Google OAuth callback from popup
+window.addEventListener('message', (e) => {
+  if (e.origin !== window.location.origin) return;
+  if (e.data?.type === 'google-auth') {
+    if (e.data.ok) {
+      setAuthState(e.data.token, e.data.handle, e.data.user_id, e.data.display_name);
+    } else {
+      loginErrorMsg.textContent = e.data.error || 'Google login failed';
+    }
+  }
+});
+
+// Fetch config (Google client ID) on load
+fetch('/api/config')
+  .then(r => r.json())
+  .then(data => { (window as any).__GOOGLE_CLIENT_ID = data.google_client_id || ''; })
+  .catch(() => {});
+
+// Validate existing session on page load
+if (isLoggedIn) {
+  fetch(`/api/auth/me?token=${encodeURIComponent(authToken)}`)
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) clearAuthState();
+    })
+    .catch(() => {});
 }
 
 async function refreshFriends() {
@@ -98,12 +220,33 @@ async function refreshFriends() {
   try {
     const res = await fetch(`/api/friends?token=${encodeURIComponent(authToken)}`);
     const data = await res.json();
-    if (data.ok) friendsList = data.friends;
+    if (data.ok) {
+        friendsList = data.friends;
+        updateFriendsDOM();
+        updateAuthDOM();
+    }
   } catch { /* ignore */ }
 }
 
+function updateFriendsDOM() {
+  if (friendsList.length === 0) {
+    friendsListContainer.innerHTML = '<div style="text-align:center; color:#666; padding:10px;">No friends yet</div>';
+    return;
+  }
+  friendsListContainer.innerHTML = friendsList.map(f => `
+    <div class="friend-item">
+      <span>
+        <div class="status-dot ${f.online ? 'online' : ''}"></div>
+        ${f.handle}
+      </span>
+      <button class="btn-icon-red" onclick="window.removeFriendFromDOM('${f.user_id}')">✕</button>
+    </div>
+  `).join('');
+}
+(window as any).removeFriendFromDOM = removeFriend;
+
 async function addFriend(handle: string) {
-  addFriendError = '';
+  addFriendErrorMsg.textContent = '';
   try {
     const res = await fetch('/api/friends/add', {
       method: 'POST',
@@ -112,22 +255,22 @@ async function addFriend(handle: string) {
     });
     const data = await res.json();
     if (data.ok) {
-      addFriendInput = '';
+      addFriendEl.value = '';
       refreshFriends();
     } else {
-      addFriendError = data.error || 'Failed';
+      addFriendErrorMsg.textContent = data.error || 'Failed';
     }
   } catch {
-    addFriendError = 'Network error';
+    addFriendErrorMsg.textContent = 'Network error';
   }
 }
 
-async function removeFriend(did: string) {
+async function removeFriend(userId: string) {
   try {
     await fetch('/api/friends/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: authToken, did }),
+      body: JSON.stringify({ token: authToken, user_id: userId }),
     });
     refreshFriends();
   } catch { /* ignore */ }
@@ -204,8 +347,9 @@ function predictLocalMovement(dt: number) {
     dy /= len;
   }
 
-  predictedX += dx * PLAYER_SPEED * dt;
-  predictedY += dy * PLAYER_SPEED * dt;
+  const speed = dashActiveTimer > 0 ? PLAYER_SPEED * DASH_SPEED_MULT : PLAYER_SPEED;
+  predictedX += dx * speed * dt;
+  predictedY += dy * speed * dt;
 
   // Clamp to map bounds
   predictedX = Math.max(PLAYER_RADIUS, Math.min(staticMapWidth - PLAYER_RADIUS, predictedX));
@@ -228,19 +372,153 @@ function predictLocalMovement(dt: number) {
 const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
 // --- Input element wiring ---
-const bskyHandleEl = document.getElementById('bskyHandleInput') as HTMLInputElement;
-const bskyPassEl = document.getElementById('bskyPassInput') as HTMLInputElement;
-const addFriendEl = document.getElementById('addFriendInputEl') as HTMLInputElement;
 
 nameInputEl.value = playerName;
 nameInputEl.addEventListener('input', () => { playerName = nameInputEl.value; });
-bskyHandleEl.addEventListener('input', () => { loginError = ''; });
-addFriendEl.addEventListener('input', () => { addFriendInput = addFriendEl.value; addFriendError = ''; });
 
-const allInputs = [nameInputEl, bskyHandleEl, bskyPassEl, addFriendEl];
-for (const el of allInputs) {
-  el.addEventListener('focus', () => { nameInputFocused = true; });
-  el.addEventListener('blur', () => { nameInputFocused = false; });
+// Auth tab switching
+document.querySelectorAll('.auth-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const target = (tab as HTMLElement).dataset.tab;
+    document.getElementById('authTabEmail')!.classList.toggle('hidden', target !== 'email');
+    document.getElementById('authTabBsky')!.classList.toggle('hidden', target !== 'bsky');
+    document.getElementById('authTabGoogle')!.classList.toggle('hidden', target !== 'google');
+    loginErrorMsg.textContent = '';
+  });
+});
+
+emailLoginBtn.addEventListener('click', () => emailAuth('login'));
+emailRegisterBtn.addEventListener('click', () => emailAuth('register'));
+bskyLoginBtn.addEventListener('click', () => {
+  if (bskyHandleEl.value && bskyPassEl.value) {
+    bskyLoginBtn.textContent = 'Signing in...';
+    bskyLogin(bskyHandleEl.value, bskyPassEl.value);
+  }
+});
+googleLoginBtn.addEventListener('click', googleLogin);
+logoutBtn.addEventListener('click', clearAuthState);
+playBtn.addEventListener('click', () => {
+  if (playerName.trim()) connectToServer();
+  else nameInputEl.focus();
+});
+friendsBtn.addEventListener('click', () => { friendsOverlay.classList.remove('hidden'); });
+closeFriendsBtn.addEventListener('click', () => { friendsOverlay.classList.add('hidden'); });
+backToMenuBtn.addEventListener('click', () => {
+  if (ws) { ws.close(); ws = null; }
+  setScreen('menu');
+});
+addFriendBtn.addEventListener('click', () => {
+  if (addFriendEl.value.trim()) addFriend(addFriendEl.value.trim());
+});
+
+document.addEventListener('DOMContentLoaded', () => setScreen('menu'));
+
+// ============ Settings UI ============
+const settingsOverlay = document.getElementById('settingsOverlay')!;
+const bindingsGrid = document.getElementById('bindingsGrid')!;
+const doubleTapToggle = document.getElementById('doubleTapDashToggle') as HTMLInputElement;
+const gameSettingsBtn = document.getElementById('gameSettingsBtn')!;
+
+let settingsListening: { action: keyof KeyBindings; btn: HTMLElement } | null = null;
+
+function openSettings() {
+  settingsOverlay.style.display = 'flex';
+  doubleTapToggle.checked = doubleTapDash;
+  renderBindingsGrid();
+}
+
+function closeSettings() {
+  settingsOverlay.style.display = 'none';
+  settingsListening = null;
+}
+
+function renderBindingsGrid() {
+  const sections: { title: string; keys: (keyof KeyBindings)[] }[] = [
+    { title: 'Movement', keys: ['moveUp', 'moveDown', 'moveLeft', 'moveRight'] },
+    { title: 'Combat', keys: ['shoot', 'melee', 'dash'] },
+    { title: 'Weapons', keys: ['weapon1', 'weapon2', 'weapon3', 'weapon4'] },
+  ];
+
+  let html = '';
+  for (const section of sections) {
+    html += `<div class="settings-section-title">${section.title}</div>`;
+    for (const action of section.keys) {
+      const label = BINDING_LABELS[action];
+      const display = keyDisplayName(bindings[action]);
+      html += `<span class="action-label">${label}</span>`;
+      html += `<button class="key-btn" data-action="${action}">${display}</button>`;
+    }
+  }
+  bindingsGrid.innerHTML = html;
+
+  // Attach click handlers
+  bindingsGrid.querySelectorAll('.key-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      // Cancel previous listening
+      if (settingsListening) {
+        settingsListening.btn.classList.remove('listening');
+        settingsListening.btn.textContent = keyDisplayName(bindings[settingsListening.action]);
+      }
+      const action = (btn as HTMLElement).dataset.action as keyof KeyBindings;
+      settingsListening = { action, btn: btn as HTMLElement };
+      btn.classList.add('listening');
+      btn.textContent = 'Press key...';
+    });
+  });
+}
+
+// Capture key/mouse for rebinding
+window.addEventListener('keydown', (e) => {
+  if (!settingsListening) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.code === 'Escape') {
+    // Cancel rebind
+    settingsListening.btn.classList.remove('listening');
+    settingsListening.btn.textContent = keyDisplayName(bindings[settingsListening.action]);
+    settingsListening = null;
+    return;
+  }
+  bindings[settingsListening.action] = e.code;
+  saveBindings(bindings);
+  settingsListening.btn.classList.remove('listening');
+  settingsListening.btn.textContent = keyDisplayName(e.code);
+  settingsListening = null;
+}, true); // capture phase so it fires before the game keydown
+
+window.addEventListener('mousedown', (e) => {
+  if (!settingsListening) return;
+  // Don't capture clicks on the settings panel buttons themselves
+  if ((e.target as HTMLElement).closest('.key-btn') || (e.target as HTMLElement).closest('.btn')) return;
+  e.preventDefault();
+  const code = `Mouse${e.button}`;
+  bindings[settingsListening.action] = code;
+  saveBindings(bindings);
+  settingsListening.btn.classList.remove('listening');
+  settingsListening.btn.textContent = keyDisplayName(code);
+  settingsListening = null;
+}, true);
+
+doubleTapToggle.addEventListener('change', () => {
+  doubleTapDash = doubleTapToggle.checked;
+  localStorage.setItem('boxhead_doubletap_dash', doubleTapDash ? 'true' : 'false');
+});
+
+document.getElementById('menuSettingsBtn')!.addEventListener('click', openSettings);
+gameSettingsBtn.addEventListener('click', openSettings);
+document.getElementById('closeSettingsBtn')!.addEventListener('click', closeSettings);
+document.getElementById('saveSettingsBtn')!.addEventListener('click', closeSettings);
+document.getElementById('resetBindingsBtn')!.addEventListener('click', () => {
+  bindings = { ...DEFAULT_BINDINGS };
+  saveBindings(bindings);
+  renderBindingsGrid();
+});
+
+// Show/hide in-game gear button
+function updateGearButton() {
+  gameSettingsBtn.classList.toggle('hidden', currentScreen !== 'playing');
 }
 
 // Melee visual effect
@@ -399,8 +677,121 @@ function getExtrapolatedBullets(): { pos: { x: number; y: number } }[] {
 
 const input: ClientInput = {
   up: false, down: false, left: false, right: false,
-  mouseX: 0, mouseY: 0, shooting: false, melee: false, selectWeapon: 0
+  mouseX: 0, mouseY: 0, shooting: false, melee: false, selectWeapon: 0, dash: false
 };
+
+// ============ Key Bindings System ============
+
+interface KeyBindings {
+  moveUp: string;
+  moveDown: string;
+  moveLeft: string;
+  moveRight: string;
+  shoot: string;
+  melee: string;
+  dash: string;
+  weapon1: string;
+  weapon2: string;
+  weapon3: string;
+  weapon4: string;
+}
+
+const DEFAULT_BINDINGS: KeyBindings = {
+  moveUp: 'KeyW',
+  moveDown: 'KeyS',
+  moveLeft: 'KeyA',
+  moveRight: 'KeyD',
+  shoot: 'Mouse0',
+  melee: 'Space',
+  dash: 'ShiftLeft',
+  weapon1: 'Digit1',
+  weapon2: 'Digit2',
+  weapon3: 'Digit3',
+  weapon4: 'Digit4',
+};
+
+const BINDING_LABELS: Record<keyof KeyBindings, string> = {
+  moveUp: 'Move Up',
+  moveDown: 'Move Down',
+  moveLeft: 'Move Left',
+  moveRight: 'Move Right',
+  shoot: 'Shoot',
+  melee: 'Melee',
+  dash: 'Dash',
+  weapon1: 'Weapon 1',
+  weapon2: 'Weapon 2',
+  weapon3: 'Weapon 3',
+  weapon4: 'Weapon 4',
+};
+
+function loadBindings(): KeyBindings {
+  try {
+    const saved = localStorage.getItem('boxhead_keybindings');
+    if (saved) return { ...DEFAULT_BINDINGS, ...JSON.parse(saved) };
+  } catch { /* ignore */ }
+  return { ...DEFAULT_BINDINGS };
+}
+
+function saveBindings(b: KeyBindings) {
+  localStorage.setItem('boxhead_keybindings', JSON.stringify(b));
+}
+
+let bindings = loadBindings();
+let doubleTapDash = localStorage.getItem('boxhead_doubletap_dash') !== 'false';
+
+function keyDisplayName(code: string): string {
+  if (code === 'Mouse0') return 'LMB';
+  if (code === 'Mouse1') return 'MMB';
+  if (code === 'Mouse2') return 'RMB';
+  if (code.startsWith('Key')) return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
+  if (code === 'ShiftLeft' || code === 'ShiftRight') return 'Shift';
+  if (code === 'ControlLeft' || code === 'ControlRight') return 'Ctrl';
+  if (code === 'AltLeft' || code === 'AltRight') return 'Alt';
+  if (code === 'Space') return 'Space';
+  if (code === 'ArrowUp') return 'Up';
+  if (code === 'ArrowDown') return 'Down';
+  if (code === 'ArrowLeft') return 'Left';
+  if (code === 'ArrowRight') return 'Right';
+  if (code === 'Tab') return 'Tab';
+  if (code === 'CapsLock') return 'Caps';
+  if (code === 'Backquote') return '`';
+  if (code === 'Minus') return '-';
+  if (code === 'Equal') return '=';
+  if (code === 'BracketLeft') return '[';
+  if (code === 'BracketRight') return ']';
+  if (code === 'Semicolon') return ';';
+  if (code === 'Quote') return "'";
+  if (code === 'Comma') return ',';
+  if (code === 'Period') return '.';
+  if (code === 'Slash') return '/';
+  if (code === 'Backslash') return '\\';
+  return code;
+}
+
+// Reverse lookup: code -> action
+function codeToActions(code: string): (keyof KeyBindings)[] {
+  const result: (keyof KeyBindings)[] = [];
+  for (const [action, bound] of Object.entries(bindings)) {
+    if (bound === code || (code === 'ShiftRight' && bound === 'ShiftLeft') || (code === 'ShiftLeft' && bound === 'ShiftRight')) {
+      result.push(action as keyof KeyBindings);
+    }
+  }
+  return result;
+}
+
+// Pressed keys set (by code)
+const keysDown = new Set<string>();
+
+// Dash state — charge-based (max 3)
+let dashCharges = DASH_MAX_CHARGES;
+let dashRechargeTimer = 0; // time until next charge restored
+let dashPending = false; // one-shot flag — true until sent to server
+let dashActiveTimer = 0; // client-side visual for speed prediction
+
+// Double-tap tracking: keyCode -> last press timestamp
+const doubleTapTimes: Record<string, number> = {};
+const DOUBLE_TAP_WINDOW = 400; // ms
 
 let ws: WebSocket | null = null;
 let inputInterval: ReturnType<typeof setInterval> | null = null;
@@ -419,7 +810,7 @@ function drainDeltaQueue() {
       const me = players[myId];
       finalWave = wave;
       finalScore = me ? me.score : 0;
-      currentScreen = 'gameover';
+      setScreen('gameover');
     }
   }
   pendingDeltas.splice(0, count);
@@ -444,7 +835,7 @@ function resetGameState() {
 
 function connectToServer() {
   resetGameState();
-  currentScreen = 'playing';
+  setScreen('playing');
   localStorage.setItem('boxhead_name', playerName);
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -503,7 +894,7 @@ function connectToServer() {
 
       // If snapshot says game is no longer over (restart happened), go back to playing
       if (!snap.gameOver && currentScreen === 'gameover') {
-        currentScreen = 'playing';
+        setScreen('playing');
       }
 
       pushStateSnapshot();
@@ -515,7 +906,7 @@ function connectToServer() {
   ws.onclose = () => {
     if (inputInterval) { clearInterval(inputInterval); inputInterval = null; }
     if (currentScreen === 'playing') {
-      currentScreen = 'menu';
+      setScreen('menu');
     }
   };
 
@@ -624,34 +1015,107 @@ function applyDelta(delta: DeltaState) {
   }
 }
 
-// --- Input ---
+// --- Input (configurable bindings) ---
+
+function isMoving() {
+  return input.up || input.down || input.left || input.right;
+}
+
+function tryTriggerDash() {
+  if (dashCharges > 0 && dashActiveTimer <= 0) {
+    dashPending = true;
+    dashCharges--;
+    dashActiveTimer = DASH_DURATION;
+    if (dashRechargeTimer <= 0) {
+      dashRechargeTimer = DASH_RECHARGE_TIME;
+    }
+  }
+}
+
+function handleActionDown(code: string) {
+  const actions = codeToActions(code);
+  for (const action of actions) {
+    switch (action) {
+      case 'moveUp': input.up = true; break;
+      case 'moveDown': input.down = true; break;
+      case 'moveLeft': input.left = true; break;
+      case 'moveRight': input.right = true; break;
+      case 'shoot': input.shooting = true; break;
+      case 'melee':
+        input.melee = true;
+        meleeSwingTime = 0.3;
+        { const p = players[myId]; if (p) meleeSwingAngle = p.angle; }
+        break;
+      case 'dash':
+        // Shift+direction: only trigger if moving
+        if (isMoving()) tryTriggerDash();
+        break;
+      case 'weapon1': input.selectWeapon = 1; break;
+      case 'weapon2': input.selectWeapon = 2; break;
+      case 'weapon3': input.selectWeapon = 3; break;
+      case 'weapon4': input.selectWeapon = 4; break;
+    }
+  }
+
+}
+
+function handleActionUp(code: string) {
+  const actions = codeToActions(code);
+  for (const action of actions) {
+    switch (action) {
+      case 'moveUp': input.up = false; break;
+      case 'moveDown': input.down = false; break;
+      case 'moveLeft': input.left = false; break;
+      case 'moveRight': input.right = false; break;
+      case 'shoot': input.shooting = false; break;
+      case 'melee': input.melee = false; break;
+      case 'weapon1': case 'weapon2': case 'weapon3': case 'weapon4':
+        input.selectWeapon = 0; break;
+    }
+  }
+}
+
+// Also trigger dash when you start moving while shift is already held
+function checkDashOnMove() {
+  if (keysDown.has(bindings.dash) && isMoving()) {
+    tryTriggerDash();
+  }
+}
+
 window.addEventListener('keydown', (e) => {
-  if (nameInputFocused) return;
-  if (e.key === 'w' || e.key === 'W') input.up = true;
-  if (e.key === 's' || e.key === 'S') input.down = true;
-  if (e.key === 'a' || e.key === 'A') input.left = true;
-  if (e.key === 'd' || e.key === 'D') input.right = true;
-  if (e.key === ' ' || e.key === 'e' || e.key === 'E') {
-    input.melee = true;
-    meleeSwingTime = 0.3;
-    const p = players[myId];
-    if (p) meleeSwingAngle = p.angle;
+  if (document.activeElement?.tagName === 'INPUT') return;
+  if (settingsListening) return; // settings is capturing this key
+  const code = e.code;
+  const wasDown = keysDown.has(code);
+  if (wasDown) return; // ignore key repeat
+  keysDown.add(code);
+
+  // Double-tap dash: check BEFORE handleActionDown so we detect the re-press
+  if (doubleTapDash && !wasDown) {
+    const dirCodes = [bindings.moveUp, bindings.moveDown, bindings.moveLeft, bindings.moveRight];
+    if (dirCodes.includes(code)) {
+      const now = performance.now();
+      const prev = doubleTapTimes[code] || 0;
+      if (now - prev < DOUBLE_TAP_WINDOW && prev > 0) {
+        tryTriggerDash();
+        doubleTapTimes[code] = 0;
+      } else {
+        doubleTapTimes[code] = now;
+      }
+    }
   }
-  if (e.key >= '1' && e.key <= '4') {
-    input.selectWeapon = parseInt(e.key);
-  }
+
+  handleActionDown(code);
+  // Check if we just started moving while dash key is held
+  const dirActions = codeToActions(code);
+  if (dirActions.some(a => a.startsWith('move'))) checkDashOnMove();
 });
 
 window.addEventListener('keyup', (e) => {
-  if (nameInputFocused) return;
-  if (e.key === 'w' || e.key === 'W') input.up = false;
-  if (e.key === 's' || e.key === 'S') input.down = false;
-  if (e.key === 'a' || e.key === 'A') input.left = false;
-  if (e.key === 'd' || e.key === 'D') input.right = false;
-  if (e.key === ' ' || e.key === 'e' || e.key === 'E') input.melee = false;
-  if (e.key >= '1' && e.key <= '4') {
-    input.selectWeapon = 0;
-  }
+  if (document.activeElement?.tagName === 'INPUT') return;
+  const code = e.code;
+  keysDown.delete(code);
+  handleActionUp(code);
 });
 
 window.addEventListener('mousemove', (e) => {
@@ -659,8 +1123,17 @@ window.addEventListener('mousemove', (e) => {
   screenMouseY = e.clientY;
 });
 
-window.addEventListener('mousedown', () => input.shooting = true);
-window.addEventListener('mouseup', () => input.shooting = false);
+window.addEventListener('mousedown', (e) => {
+  if (settingsListening) return;
+  const code = `Mouse${e.button}`;
+  keysDown.add(code);
+  handleActionDown(code);
+});
+window.addEventListener('mouseup', (e) => {
+  const code = `Mouse${e.button}`;
+  keysDown.delete(code);
+  handleActionUp(code);
+});
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // --- Mobile touch controls ---
@@ -807,6 +1280,12 @@ function maybeSendInput() {
   input.mouseX = Math.round(screenMouseX + camX);
   input.mouseY = Math.round(screenMouseY + camY);
 
+  // Apply one-shot dash
+  if (dashPending) {
+    input.dash = true;
+    dashPending = false;
+  }
+
   const snapshot = JSON.stringify(input);
   const now = performance.now();
 
@@ -815,6 +1294,9 @@ function maybeSendInput() {
     lastSentInput = snapshot;
     lastSendTime = now;
   }
+
+  // Clear one-shot dash after sending
+  input.dash = false;
 }
 
 // --- Legacy state accessor for draw functions ---
@@ -929,51 +1411,96 @@ function drawAmmoPickups() {
 }
 
 function drawDrops(state: GameState) {
+  const now = performance.now();
   for (const d of state.drops) {
     const sx = d.pos.x - camX;
     const sy = d.pos.y - camY;
-    if (sx < -30 || sx > canvas.width + 30 || sy < -30 || sy > canvas.height + 30) continue;
+    if (sx < -40 || sx > canvas.width + 40 || sy < -40 || sy > canvas.height + 40) continue;
 
-    const pulse = 0.7 + 0.3 * Math.sin(performance.now() / 200);
+    const pulse = 0.75 + 0.25 * Math.sin(now / 200);
+    const bob = Math.sin(now / 300) * 3;
+    const dy = sy + bob;
+
+    // Outer glow
+    const glowColors: Record<string, string> = {
+      ammo: 'rgba(255,200,0,0.25)',
+      health: 'rgba(76,175,80,0.3)',
+      weapon: 'rgba(156,39,176,0.3)',
+    };
+    const glowR = 22 + 4 * Math.sin(now / 250);
+    ctx.beginPath();
+    ctx.arc(sx, dy, glowR, 0, Math.PI * 2);
+    ctx.fillStyle = glowColors[d.type] || 'rgba(255,255,255,0.1)';
+    ctx.fill();
+
+    // Inner circle bg
+    const bgColors: Record<string, string> = {
+      ammo: `rgba(50,40,0,${pulse})`,
+      health: `rgba(0,40,10,${pulse})`,
+      weapon: `rgba(40,0,50,${pulse})`,
+    };
+    ctx.beginPath();
+    ctx.arc(sx, dy, 14, 0, Math.PI * 2);
+    ctx.fillStyle = bgColors[d.type] || 'rgba(0,0,0,0.5)';
+    ctx.fill();
+
+    // Border ring
+    const ringColors: Record<string, string> = {
+      ammo: '#ffb400',
+      health: '#4caf50',
+      weapon: '#ce93d8',
+    };
+    ctx.strokeStyle = ringColors[d.type] || '#fff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
 
     if (d.type === 'ammo') {
-      // Yellow ammo box
-      ctx.fillStyle = `rgba(255, 200, 0, ${pulse})`;
-      ctx.fillRect(sx - 10, sy - 7, 20, 14);
-      ctx.strokeStyle = '#aa7700';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(sx - 10, sy - 7, 20, 14);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 8px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('AMMO', sx, sy + 3);
+      // Bullet icon
+      ctx.fillStyle = '#ffb400';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.fillText('\u{1F4A5}', sx, dy); // or a simpler icon
+      // Actually draw bullet shapes
+      ctx.fillStyle = '#ffd54f';
+      ctx.fillRect(sx - 6, dy - 3, 4, 10);
+      ctx.fillRect(sx - 1, dy - 3, 4, 10);
+      ctx.fillRect(sx + 4, dy - 3, 4, 10);
+      ctx.fillStyle = '#ff8f00';
+      ctx.fillRect(sx - 6, dy - 5, 4, 3);
+      ctx.fillRect(sx - 1, dy - 5, 4, 3);
+      ctx.fillRect(sx + 4, dy - 5, 4, 3);
     } else if (d.type === 'health') {
-      // Green cross
-      ctx.fillStyle = `rgba(76, 175, 80, ${pulse})`;
-      ctx.fillRect(sx - 4, sy - 10, 8, 20);
-      ctx.fillRect(sx - 10, sy - 4, 20, 8);
-      ctx.strokeStyle = '#2E7D32';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(sx - 4, sy - 10, 8, 20);
-      ctx.strokeRect(sx - 10, sy - 4, 20, 8);
-    } else if (d.type === 'weapon') {
-      // Purple diamond
-      ctx.fillStyle = `rgba(156, 39, 176, ${pulse})`;
-      ctx.beginPath();
-      ctx.moveTo(sx, sy - 12);
-      ctx.lineTo(sx + 10, sy);
-      ctx.lineTo(sx, sy + 12);
-      ctx.lineTo(sx - 10, sy);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = '#7B1FA2';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
+      // Red cross
       ctx.fillStyle = '#fff';
-      ctx.font = 'bold 7px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('GUN', sx, sy + 3);
+      ctx.fillRect(sx - 2, dy - 8, 5, 16);
+      ctx.fillRect(sx - 8, dy - 2, 16, 5);
+      ctx.fillStyle = '#e53935';
+      ctx.fillRect(sx - 1, dy - 7, 3, 14);
+      ctx.fillRect(sx - 7, dy - 1, 14, 3);
+    } else if (d.type === 'weapon') {
+      // Gun silhouette
+      ctx.fillStyle = '#ce93d8';
+      // Barrel
+      ctx.fillRect(sx - 2, dy - 8, 5, 10);
+      // Body
+      ctx.fillRect(sx - 6, dy - 2, 13, 5);
+      // Grip
+      ctx.fillRect(sx - 4, dy + 3, 4, 6);
+      // Star accent
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 8px sans-serif';
+      ctx.fillText('\u2605', sx + 5, dy - 5);
     }
+
+    // Label below
+    const labelColors: Record<string, string> = { ammo: '#ffd54f', health: '#81c784', weapon: '#ce93d8' };
+    const labelText: Record<string, string> = { ammo: 'AMMO', health: 'HEALTH', weapon: 'WEAPON' };
+    ctx.fillStyle = labelColors[d.type] || '#fff';
+    ctx.font = 'bold 8px monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText(labelText[d.type] || '', sx, dy + 16);
   }
 }
 
@@ -1191,6 +1718,31 @@ function drawPlayers(state: GameState) {
     const sy = p.pos.y - camY;
     if (sx < -50 || sx > canvas.width + 50 || sy < -50 || sy > canvas.height + 50) continue;
 
+    // Dead player: draw ghost marker with revive hint
+    if (p.health <= 0) {
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.globalAlpha = 0.5 + 0.2 * Math.sin(performance.now() / 400);
+      // Skull icon
+      ctx.fillStyle = '#ff5252';
+      ctx.font = 'bold 24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('\u2620', 0, 0);
+      ctx.globalAlpha = 1;
+      // Player name
+      const displayName = p.name || p.id.slice(0, 6);
+      ctx.fillStyle = '#ff8888';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillText(displayName, 0, -24);
+      // "Stand near to revive" hint
+      ctx.fillStyle = '#aaa';
+      ctx.font = '10px sans-serif';
+      ctx.fillText('Stand near to revive', 0, 22);
+      ctx.restore();
+      continue;
+    }
+
     ctx.save();
     ctx.translate(sx, sy);
 
@@ -1345,11 +1897,38 @@ function drawHUD(state: GameState) {
   const ammoText = p.weapon === 'pistol' ? 'Ammo: \u221E' : `Ammo: ${p.ammo}/${p.maxAmmo}`;
   ctx.fillText(ammoText, 20, 52);
   ctx.fillText(`HP: ${p.health}`, 160, 52);
-  if (!isMobile) {
-    ctx.font = '13px monospace';
-    ctx.fillStyle = '#aaa';
-    ctx.fillText(`Melee: Space/E`, 20, 72);
+
+  // Dash stamina bar (3 pips)
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#aaa';
+  ctx.fillText('Dash', 20, 72);
+  const pipW = 28;
+  const pipH = 8;
+  const pipGap = 3;
+  const pipStartX = 62;
+  const pipY = 64;
+  for (let i = 0; i < DASH_MAX_CHARGES; i++) {
+    const px = pipStartX + i * (pipW + pipGap);
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.fillRect(px, pipY, pipW, pipH);
+    if (i < dashCharges) {
+      ctx.fillStyle = '#4caf50';
+      ctx.fillRect(px, pipY, pipW, pipH);
+    } else if (i === dashCharges && dashRechargeTimer > 0) {
+      // Partially filling pip
+      const fill = 1 - (dashRechargeTimer / DASH_RECHARGE_TIME);
+      ctx.fillStyle = '#2e7d32';
+      ctx.fillRect(px, pipY, pipW * fill, pipH);
+    }
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(px, pipY, pipW, pipH);
   }
+
+  // Shift label
+  ctx.fillStyle = '#666';
+  ctx.font = '9px monospace';
+  ctx.fillText('[Shift]', pipStartX + DASH_MAX_CHARGES * (pipW + pipGap) + 2, 72);
 }
 
 function drawWeaponBar(state: GameState) {
@@ -1475,6 +2054,103 @@ function drawScoreboard(state: GameState) {
   }
 }
 
+function drawStatusEffects(state: GameState) {
+  const p = state.players[myId];
+  if (!p) return;
+
+  const panelX = 10;
+  const panelY = canvas.height - 160;
+  const iconSize = 28;
+  const gap = 6;
+
+  interface StatusEntry {
+    icon: string;
+    label: string;
+    color: string;
+    active: boolean;
+    detail: string;
+  }
+
+  const statuses: StatusEntry[] = [];
+
+  // Weapons unlocked
+  const weaponNames = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
+  const weaponIcons = ['\u{1F52B}', '\u{26A1}', '\u{1F4A3}', '\u{1F680}'];
+  const weaponColors = ['#aaa', '#ffd54f', '#ff8a65', '#ef5350'];
+  const slots = p.weaponSlots || [true, false, false, false];
+  for (let i = 1; i < 4; i++) {
+    if (slots[i]) {
+      statuses.push({
+        icon: weaponIcons[i],
+        label: weaponNames[i],
+        color: weaponColors[i],
+        active: p.weapon === ['pistol', 'uzi', 'shotgun', 'rocketLauncher'][i],
+        detail: p.weapon === ['pistol', 'uzi', 'shotgun', 'rocketLauncher'][i] ? 'ACTIVE' : 'Unlocked',
+      });
+    }
+  }
+
+  // Dash charges
+  statuses.push({
+    icon: '\u{1F4A8}',
+    label: 'Dash',
+    color: dashCharges > 0 ? '#4caf50' : '#555',
+    active: dashActiveTimer > 0,
+    detail: `${dashCharges}/${DASH_MAX_CHARGES}`,
+  });
+
+  // Health status
+  if (p.health <= 30) {
+    statuses.push({
+      icon: '\u{1F534}',
+      label: 'Low HP',
+      color: '#e53935',
+      active: true,
+      detail: `${Math.ceil(p.health)} HP`,
+    });
+  }
+
+  if (statuses.length === 0) return;
+
+  // Panel background
+  const panelH = statuses.length * (iconSize + gap) + 8;
+  const panelW = 130;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(panelX, panelY, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+  for (let i = 0; i < statuses.length; i++) {
+    const s = statuses[i];
+    const y = panelY + 6 + i * (iconSize + gap);
+
+    // Icon bg
+    ctx.fillStyle = s.active ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.03)';
+    ctx.fillRect(panelX + 4, y, iconSize, iconSize);
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(panelX + 4, y, iconSize, iconSize);
+
+    // Icon text
+    ctx.fillStyle = s.color;
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(s.icon, panelX + 4 + iconSize / 2, y + iconSize / 2);
+
+    // Label + detail
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ddd';
+    ctx.font = 'bold 10px monospace';
+    ctx.fillText(s.label, panelX + iconSize + 10, y + 2);
+    ctx.fillStyle = s.color;
+    ctx.font = '9px monospace';
+    ctx.fillText(s.detail, panelX + iconSize + 10, y + 15);
+  }
+}
+
 function drawMobileControls() {
   if (!isMobile || currentScreen !== 'playing') return;
 
@@ -1578,441 +2254,6 @@ function drawMobileControls() {
   }
 }
 
-// --- Menu button hit detection ---
-let menuPlayBtn = { x: 0, y: 0, w: 0, h: 0 };
-let gameOverMenuBtn = { x: 0, y: 0, w: 0, h: 0 };
-
-function focusHiddenInput(el: HTMLInputElement) {
-  el.style.pointerEvents = 'auto';
-  el.focus();
-  setTimeout(() => { el.style.pointerEvents = 'none'; }, 100);
-}
-
-function hitTest(mx: number, my: number, r: {x:number;y:number;w:number;h:number}) {
-  return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
-}
-
-function handleMenuClick(mx: number, my: number) {
-  if (currentScreen === 'menu') {
-    // Friends panel interactions (check first since it overlays)
-    if (friendsOpen && isLoggedIn) {
-      const panelW = 280;
-      const panelH = Math.min(400, 100 + friendsList.length * 30 + 50);
-      const panelX = (canvas.width - panelW) / 2;
-      const panelY = (canvas.height - panelH) / 2;
-
-      // Close button
-      if (mx >= panelX + panelW - 30 && mx <= panelX + panelW && my >= panelY && my <= panelY + 35) {
-        friendsOpen = false;
-        return;
-      }
-
-      // Remove friend buttons
-      let y = panelY + 45;
-      for (const f of friendsList) {
-        if (mx >= panelX + panelW - 30 && mx <= panelX + panelW && my >= y - 8 && my <= y + 20) {
-          removeFriend(f.did);
-          return;
-        }
-        y += 28;
-      }
-
-      // Add friend input
-      y += 8;
-      const addX = panelX + 10;
-      const addW = panelW - 80;
-      const addH = 28;
-      if (mx >= addX && mx <= addX + addW && my >= y && my <= y + addH) {
-        focusHiddenInput(addFriendEl);
-        return;
-      }
-
-      // Add friend button
-      const addBtnX = addX + addW + 5;
-      if (mx >= addBtnX && mx <= addBtnX + 55 && my >= y && my <= y + addH) {
-        if (addFriendInput.trim()) addFriend(addFriendInput.trim());
-        return;
-      }
-
-      // Click outside panel closes it
-      if (mx < panelX || mx > panelX + panelW || my < panelY || my > panelY + panelH) {
-        friendsOpen = false;
-      }
-      return;
-    }
-
-    // Name input
-    if (hitTest(mx, my, menuNameBtn)) {
-      focusHiddenInput(nameInputEl);
-      return;
-    }
-
-    // Bluesky handle input
-    if (!isLoggedIn && hitTest(mx, my, menuBskyHandleBtn)) {
-      focusHiddenInput(bskyHandleEl);
-      return;
-    }
-
-    // Bluesky password input
-    if (!isLoggedIn && hitTest(mx, my, menuBskyPassBtn)) {
-      focusHiddenInput(bskyPassEl);
-      return;
-    }
-
-    // Bluesky login button
-    if (!isLoggedIn && hitTest(mx, my, menuBskyLoginBtn) && !loginLoading) {
-      if (bskyHandleEl.value && bskyPassEl.value) {
-        bskyLogin(bskyHandleEl.value, bskyPassEl.value);
-      }
-      return;
-    }
-
-    // Logout button
-    if (isLoggedIn && hitTest(mx, my, menuBskyLogoutBtn)) {
-      bskyLogout();
-      return;
-    }
-
-    // Friends button
-    if (isLoggedIn && hitTest(mx, my, menuFriendsBtn)) {
-      friendsOpen = !friendsOpen;
-      return;
-    }
-
-    // Blur all inputs
-    for (const el of allInputs) el.blur();
-
-    // Play button
-    if (hitTest(mx, my, menuPlayBtn)) {
-      connectToServer();
-    }
-  } else if (currentScreen === 'gameover') {
-    if (hitTest(mx, my, gameOverMenuBtn)) {
-      if (ws) { ws.close(); ws = null; }
-      currentScreen = 'menu';
-    }
-  }
-}
-
-canvas.addEventListener('click', (e) => handleMenuClick(e.clientX, e.clientY));
-canvas.addEventListener('touchstart', (e) => {
-  if (currentScreen === 'menu' || currentScreen === 'gameover') {
-    const t = e.changedTouches[0];
-    handleMenuClick(t.clientX, t.clientY);
-  }
-}, { passive: true });
-
-let menuNameBtn = { x: 0, y: 0, w: 0, h: 0 };
-let menuBskyHandleBtn = { x: 0, y: 0, w: 0, h: 0 };
-let menuBskyPassBtn = { x: 0, y: 0, w: 0, h: 0 };
-let menuBskyLoginBtn = { x: 0, y: 0, w: 0, h: 0 };
-let menuBskyLogoutBtn = { x: 0, y: 0, w: 0, h: 0 };
-let menuFriendsBtn = { x: 0, y: 0, w: 0, h: 0 };
-
-function drawMenu() {
-  const cx = canvas.width / 2;
-  const cy = canvas.height / 2;
-
-  ctx.fillStyle = '#1a1a2e';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  // Title
-  ctx.fillStyle = '#e53935';
-  ctx.font = 'bold 72px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('BOXHEAD', cx, cy - 160);
-
-  ctx.fillStyle = '#8888aa';
-  ctx.font = '20px sans-serif';
-  ctx.fillText('Survive the horde', cx, cy - 110);
-
-  // --- Name input ---
-  const fieldW = 260;
-  const fieldH = 38;
-  const fieldX = cx - fieldW / 2;
-  const fieldY = cy - 80;
-  menuNameBtn = { x: fieldX, y: fieldY, w: fieldW, h: fieldH };
-
-  ctx.fillStyle = '#16213e';
-  ctx.fillRect(fieldX, fieldY, fieldW, fieldH);
-  ctx.strokeStyle = '#444';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(fieldX, fieldY, fieldW, fieldH);
-
-  ctx.textAlign = 'left';
-  ctx.fillStyle = playerName ? '#fff' : '#666';
-  ctx.font = '16px sans-serif';
-  ctx.fillText(playerName || 'Enter name...', fieldX + 10, fieldY + fieldH / 2 + 1);
-
-  // --- Bluesky auth section ---
-  const authY = cy - 30;
-  if (isLoggedIn) {
-    // Logged in state
-    ctx.fillStyle = '#4caf50';
-    ctx.font = '13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`Logged in as @${authHandle}`, cx, authY + 10);
-
-    // Logout button (small)
-    const logW = 80;
-    const logH = 28;
-    const logX = cx - logW / 2;
-    const logY = authY + 20;
-    menuBskyLogoutBtn = { x: logX, y: logY, w: logW, h: logH };
-    ctx.fillStyle = '#333';
-    ctx.fillRect(logX, logY, logW, logH);
-    ctx.strokeStyle = '#555';
-    ctx.strokeRect(logX, logY, logW, logH);
-    ctx.fillStyle = '#aaa';
-    ctx.font = '12px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('Logout', cx, logY + logH / 2 + 1);
-
-    // Friends button
-    const fbW = 140;
-    const fbH = 32;
-    const fbX = cx - fbW / 2;
-    const fbY = authY + 56;
-    menuFriendsBtn = { x: fbX, y: fbY, w: fbW, h: fbH };
-    ctx.fillStyle = '#16213e';
-    ctx.fillRect(fbX, fbY, fbW, fbH);
-    ctx.strokeStyle = '#2196F3';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(fbX, fbY, fbW, fbH);
-    ctx.fillStyle = '#64B5F6';
-    ctx.font = 'bold 13px sans-serif';
-    const onlineCount = friendsList.filter(f => f.online).length;
-    ctx.fillText(`Friends (${onlineCount}/${friendsList.length})`, cx, fbY + fbH / 2 + 1);
-  } else {
-    // Login form
-    ctx.fillStyle = '#8888aa';
-    ctx.font = '12px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('Sign in with Bluesky (optional)', cx, authY);
-
-    const inputW = 200;
-    const inputH = 30;
-    const inputX = cx - inputW / 2;
-
-    // Handle input
-    const hY = authY + 8;
-    menuBskyHandleBtn = { x: inputX, y: hY, w: inputW, h: inputH };
-    ctx.fillStyle = '#16213e';
-    ctx.fillRect(inputX, hY, inputW, inputH);
-    ctx.strokeStyle = '#333';
-    ctx.strokeRect(inputX, hY, inputW, inputH);
-    ctx.fillStyle = bskyHandleEl.value ? '#fff' : '#555';
-    ctx.font = '13px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(bskyHandleEl.value || 'handle.bsky.social', inputX + 8, hY + inputH / 2 + 1);
-
-    // Password input
-    const pY = hY + inputH + 4;
-    menuBskyPassBtn = { x: inputX, y: pY, w: inputW, h: inputH };
-    ctx.fillStyle = '#16213e';
-    ctx.fillRect(inputX, pY, inputW, inputH);
-    ctx.strokeStyle = '#333';
-    ctx.strokeRect(inputX, pY, inputW, inputH);
-    ctx.fillStyle = bskyPassEl.value ? '#fff' : '#555';
-    ctx.fillText(bskyPassEl.value ? '•'.repeat(bskyPassEl.value.length) : 'App password', inputX + 8, pY + inputH / 2 + 1);
-
-    // Login button
-    const lbW = 80;
-    const lbX = cx + inputW / 2 + 8;
-    const lbY = hY;
-    menuBskyLoginBtn = { x: lbX, y: lbY, w: lbW, h: inputH * 2 + 4 };
-    ctx.fillStyle = loginLoading ? '#555' : '#1976D2';
-    ctx.fillRect(lbX, lbY, lbW, inputH * 2 + 4);
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(loginLoading ? '...' : 'Login', lbX + lbW / 2, lbY + inputH + 2);
-
-    if (loginError) {
-      ctx.fillStyle = '#e53935';
-      ctx.font = '11px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(loginError, cx, pY + inputH + 14);
-    }
-  }
-
-  // --- Play button ---
-  ctx.textAlign = 'center';
-  const btnW = 240;
-  const btnH = 56;
-  const btnX = cx - btnW / 2;
-  const btnY = cy + 100;
-  menuPlayBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
-
-  ctx.fillStyle = '#e53935';
-  ctx.beginPath();
-  ctx.moveTo(btnX + 10, btnY);
-  ctx.arcTo(btnX + btnW, btnY, btnX + btnW, btnY + btnH, 10);
-  ctx.arcTo(btnX + btnW, btnY + btnH, btnX, btnY + btnH, 10);
-  ctx.arcTo(btnX, btnY + btnH, btnX, btnY, 10);
-  ctx.arcTo(btnX, btnY, btnX + btnW, btnY, 10);
-  ctx.closePath();
-  ctx.fill();
-
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 24px sans-serif';
-  ctx.fillText('PLAY', cx, btnY + btnH / 2);
-
-  // Controls
-  ctx.fillStyle = '#555';
-  ctx.font = '14px sans-serif';
-  if (isMobile) {
-    ctx.fillText('Left stick to move  |  Right side to aim & shoot', cx, cy + 200);
-  } else {
-    ctx.fillText('WASD to move  |  Click to shoot  |  Space for melee  |  1-4 switch weapons', cx, cy + 200);
-  }
-
-  // --- Friends panel overlay ---
-  if (friendsOpen && isLoggedIn) {
-    drawFriendsPanel();
-  }
-}
-
-function drawFriendsPanel() {
-  const panelW = 280;
-  const panelH = Math.min(400, 100 + friendsList.length * 30 + 50);
-  const panelX = (canvas.width - panelW) / 2;
-  const panelY = (canvas.height - panelH) / 2;
-
-  // Background
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
-  ctx.fillRect(panelX, panelY, panelW, panelH);
-  ctx.strokeStyle = '#2196F3';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(panelX, panelY, panelW, panelH);
-
-  // Header
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 16px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('Friends', panelX + panelW / 2, panelY + 20);
-
-  // Close button (top-right)
-  ctx.fillStyle = '#888';
-  ctx.font = '18px sans-serif';
-  ctx.textAlign = 'right';
-  ctx.fillText('✕', panelX + panelW - 10, panelY + 20);
-
-  // Friend list
-  let y = panelY + 45;
-  if (friendsList.length === 0) {
-    ctx.fillStyle = '#666';
-    ctx.font = '13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('No friends yet', panelX + panelW / 2, y + 10);
-    y += 30;
-  } else {
-    for (const f of friendsList) {
-      // Online indicator
-      ctx.fillStyle = f.online ? '#4caf50' : '#555';
-      ctx.beginPath();
-      ctx.arc(panelX + 20, y + 6, 5, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Handle
-      ctx.fillStyle = f.online ? '#fff' : '#888';
-      ctx.font = '13px sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillText(`@${f.handle}`, panelX + 32, y + 8);
-
-      // Remove button
-      ctx.fillStyle = '#c62828';
-      ctx.font = '11px sans-serif';
-      ctx.textAlign = 'right';
-      ctx.fillText('✕', panelX + panelW - 15, y + 8);
-
-      y += 28;
-    }
-  }
-
-  // Add friend input
-  y += 8;
-  const addX = panelX + 10;
-  const addW = panelW - 80;
-  const addH = 28;
-  ctx.fillStyle = '#16213e';
-  ctx.fillRect(addX, y, addW, addH);
-  ctx.strokeStyle = '#333';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(addX, y, addW, addH);
-  ctx.fillStyle = addFriendInput ? '#fff' : '#555';
-  ctx.font = '12px sans-serif';
-  ctx.textAlign = 'left';
-  ctx.fillText(addFriendInput || 'handle.bsky.social', addX + 8, y + addH / 2 + 1);
-
-  // Add button
-  const addBtnX = addX + addW + 5;
-  const addBtnW = 55;
-  ctx.fillStyle = '#1976D2';
-  ctx.fillRect(addBtnX, y, addBtnW, addH);
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 12px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText('Add', addBtnX + addBtnW / 2, y + addH / 2 + 1);
-
-  if (addFriendError) {
-    ctx.fillStyle = '#e53935';
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(addFriendError, panelX + panelW / 2, y + addH + 14);
-  }
-}
-
-function drawGameOver() {
-  const cx = canvas.width / 2;
-  const cy = canvas.height / 2;
-
-  // Darken game underneath
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-
-  // Title
-  ctx.fillStyle = '#e53935';
-  ctx.font = 'bold 64px sans-serif';
-  ctx.fillText('GAME OVER', cx, cy - 80);
-
-  // Stats
-  ctx.fillStyle = '#fff';
-  ctx.font = '28px sans-serif';
-  ctx.fillText(`Wave: ${finalWave}`, cx, cy - 20);
-  ctx.fillStyle = '#ffb400';
-  ctx.fillText(`Score: ${Math.floor(finalScore)}`, cx, cy + 20);
-
-  // Menu button
-  const btnW = 260;
-  const btnH = 52;
-  const btnX = cx - btnW / 2;
-  const btnY = cy + 60;
-  gameOverMenuBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
-
-  ctx.fillStyle = '#333';
-  ctx.beginPath();
-  ctx.moveTo(btnX + 10, btnY);
-  ctx.arcTo(btnX + btnW, btnY, btnX + btnW, btnY + btnH, 10);
-  ctx.arcTo(btnX + btnW, btnY + btnH, btnX, btnY + btnH, 10);
-  ctx.arcTo(btnX, btnY + btnH, btnX, btnY, 10);
-  ctx.arcTo(btnX, btnY, btnX + btnW, btnY, 10);
-  ctx.closePath();
-  ctx.fill();
-  ctx.strokeStyle = '#888';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 20px sans-serif';
-  ctx.fillText('BACK TO MENU', cx, btnY + btnH / 2);
-}
-
 function draw() {
   const now = performance.now();
   const dt = (now - lastFrameTime) / 1000;
@@ -2024,13 +2265,23 @@ function draw() {
   // Client-side prediction — runs every frame for instant response
   predictLocalMovement(dt);
 
+  // Dash charge recharge
+  dashActiveTimer = Math.max(0, dashActiveTimer - dt);
+  if (dashCharges < DASH_MAX_CHARGES) {
+    dashRechargeTimer -= dt;
+    if (dashRechargeTimer <= 0) {
+      dashCharges++;
+      dashRechargeTimer = dashCharges < DASH_MAX_CHARGES ? DASH_RECHARGE_TIME : 0;
+    }
+  }
+
   ctx.fillStyle = '#2a2a2a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   canvas.style.cursor = currentScreen === 'playing' ? 'crosshair' : 'default';
 
   if (currentScreen === 'menu') {
-    drawMenu();
+    // Handled by HTML overlay
   } else if (currentScreen === 'playing' || currentScreen === 'gameover') {
     const state = buildRenderState();
 
@@ -2052,10 +2303,11 @@ function draw() {
       drawHUD(state);
       drawScoreboard(state);
       if (!isMobile) drawWeaponBar(state);
+      if (!isMobile) drawStatusEffects(state);
       drawMobileControls();
 
       if (currentScreen === 'gameover') {
-        drawGameOver();
+        // Handled by HTML overlay
       }
     } else {
       ctx.fillStyle = '#fff';

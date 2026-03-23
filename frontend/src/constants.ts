@@ -9,3 +9,7 @@ export const WEAPON_STATS: Record<string, { damage: number; name: string; slot: 
 // Shared physics constants (must match backend map.rs)
 export const PLAYER_SPEED = 200.0;
 export const PLAYER_RADIUS = 15.0;
+export const DASH_SPEED_MULT = 3.0;
+export const DASH_DURATION = 0.15;
+export const DASH_MAX_CHARGES = 3;
+export const DASH_RECHARGE_TIME = 2.5;

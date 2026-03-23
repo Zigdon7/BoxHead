@@ -133,6 +133,7 @@ export interface ClientInput {
   shooting: boolean;
   melee: boolean;
   selectWeapon: number;
+  dash: boolean;
   [k: string]: unknown;
 }
 /**

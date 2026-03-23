@@ -276,6 +276,14 @@ pub struct Game {
     wall_grid: SpatialGrid<WallEntry>,
     zombie_grid: SpatialGrid<ZombieRef>,
     player_grid: SpatialGrid<PlayerRef>,
+    // Dash state per player: charges and active burst timer
+    dash_charges: HashMap<String, i32>,
+    dash_recharge: HashMap<String, f64>, // time until next charge restored
+    dash_active: HashMap<String, f64>,
+    // Revive: dead_player_id -> (reviver_id, progress_seconds)
+    revive_progress: HashMap<String, (String, f64)>,
+    // Zombie wall-stuck tracking: zombie_id -> (stuck_timer, steer_angle)
+    zombie_wall_stuck: HashMap<String, (f64, f64)>,
 }
 
 impl Game {
@@ -317,6 +325,11 @@ impl Game {
             wall_grid,
             zombie_grid: SpatialGrid::new(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE),
             player_grid: SpatialGrid::new(MAP_WIDTH, MAP_HEIGHT, WALL_GRID_CELL_SIZE),
+            dash_charges: HashMap::new(),
+            dash_recharge: HashMap::new(),
+            dash_active: HashMap::new(),
+            revive_progress: HashMap::new(),
+            zombie_wall_stuck: HashMap::new(),
         }
     }
 
@@ -333,6 +346,11 @@ impl Game {
         self.melee_cooldowns.clear();
         self.zombie_attack_cooldowns.clear();
         self.bullet_lifetimes.clear();
+        self.dash_charges.clear();
+        self.dash_recharge.clear();
+        self.dash_active.clear();
+        self.revive_progress.clear();
+        self.zombie_wall_stuck.clear();
         self.game_time = 0.0;
         for pickup in &mut self.ammo_pickups {
             pickup.respawn_at = None;
@@ -408,6 +426,40 @@ impl Game {
                 None => continue,
             };
 
+            // Dash logic — charge-based (max 3)
+            {
+                let charges = self.dash_charges.entry(pid.clone()).or_insert(DASH_MAX_CHARGES);
+                let recharge = self.dash_recharge.entry(pid.clone()).or_insert(0.0);
+                let active = self.dash_active.entry(pid.clone()).or_insert(0.0);
+                *active = (*active - dt).max(0.0);
+
+                // Recharge one charge over time
+                if *charges < DASH_MAX_CHARGES {
+                    *recharge -= dt;
+                    if *recharge <= 0.0 {
+                        *charges += 1;
+                        if *charges < DASH_MAX_CHARGES {
+                            *recharge = DASH_RECHARGE_TIME;
+                        } else {
+                            *recharge = 0.0;
+                        }
+                    }
+                }
+
+                if input.dash && *charges > 0 && *active <= 0.0 {
+                    *active = DASH_DURATION;
+                    *charges -= 1;
+                    if *charges < DASH_MAX_CHARGES {
+                        // Start recharge timer if not already running
+                        if *recharge <= 0.0 {
+                            *recharge = DASH_RECHARGE_TIME;
+                        }
+                    }
+                }
+            }
+
+            let is_dashing = self.dash_active.get(pid).copied().unwrap_or(0.0) > 0.0;
+
             // Movement
             let mut dx = 0.0_f64;
             let mut dy = 0.0_f64;
@@ -430,10 +482,12 @@ impl Game {
                 dy /= len;
             }
 
+            let speed = if is_dashing { PLAYER_SPEED * DASH_SPEED_MULT } else { PLAYER_SPEED };
+
             {
                 let p = self.players.get_mut(pid).unwrap();
-                p.pos.x += dx * PLAYER_SPEED * dt;
-                p.pos.y += dy * PLAYER_SPEED * dt;
+                p.pos.x += dx * speed * dt;
+                p.pos.y += dy * speed * dt;
 
                 p.pos.x = p.pos.x.max(PLAYER_RADIUS).min(MAP_WIDTH - PLAYER_RADIUS);
                 p.pos.y = p.pos.y.max(PLAYER_RADIUS).min(MAP_HEIGHT - PLAYER_RADIUS);
@@ -906,40 +960,65 @@ impl Game {
                                 // These types phase/smash through walls
                             }
                             _ => {
-                                // Wall sliding: try to resolve, and if stuck, slide along the wall
                                 let (nx, ny) = resolve_wall_collisions(
                                     z.pos.x, z.pos.y, ZOMBIE_RADIUS, &self.wall_grid,
                                 );
 
-                                // If wall collision pushed us back, try sliding along axes individually
                                 let wall_blocked_x = (nx - z.pos.x).abs() > 0.1;
                                 let wall_blocked_y = (ny - z.pos.y).abs() > 0.1;
+                                let blocked = wall_blocked_x || wall_blocked_y;
 
-                                if wall_blocked_x && wall_blocked_y {
-                                    // Try X-only movement
-                                    let try_x = zx + move_dx * z_speed * dt;
-                                    let (sx, _) = resolve_wall_collisions(
-                                        try_x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS),
-                                        zy, ZOMBIE_RADIUS, &self.wall_grid,
-                                    );
-                                    // Try Y-only movement
-                                    let try_y = zy + move_dy * z_speed * dt;
-                                    let (_, sy) = resolve_wall_collisions(
-                                        zx,
-                                        try_y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS),
-                                        ZOMBIE_RADIUS, &self.wall_grid,
-                                    );
-                                    // Use whichever axis made more progress
-                                    let x_progress = (sx - zx).abs();
-                                    let y_progress = (sy - zy).abs();
-                                    if x_progress > y_progress {
-                                        z.pos.x = sx;
-                                        z.pos.y = zy;
+                                let zid = z.id.clone();
+
+                                if blocked {
+                                    let entry = self.zombie_wall_stuck.entry(zid.clone())
+                                        .or_insert((0.0, 0.0));
+                                    entry.0 += dt;
+
+                                    if entry.0 < 0.3 {
+                                        // Brief pause — zombie bumps into wall
+                                        z.pos.x = nx;
+                                        z.pos.y = ny;
                                     } else {
-                                        z.pos.x = zx;
-                                        z.pos.y = sy;
+                                        // Creep around: pick a steer direction on first stuck frame past delay
+                                        if entry.1 == 0.0 {
+                                            // Choose steer direction based on wall normal
+                                            // Try both perpendicular directions, pick the one closer to target
+                                            let perp1_x = -move_dy;
+                                            let perp1_y = move_dx;
+                                            let perp2_x = move_dy;
+                                            let perp2_y = -move_dx;
+                                            // Dot product with direction to target to pick best side
+                                            let dot1 = perp1_x * (tx - zx) + perp1_y * (ty - zy);
+                                            let dot2 = perp2_x * (tx - zx) + perp2_y * (ty - zy);
+                                            entry.1 = if dot1 >= dot2 { 1.0 } else { -1.0 };
+                                        }
+
+                                        let steer_dir = entry.1;
+                                        // Blend: mostly perpendicular, slightly toward target
+                                        let creep_dx = -move_dy * steer_dir * 0.8 + move_dx * 0.2;
+                                        let creep_dy = move_dx * steer_dir * 0.8 + move_dy * 0.2;
+                                        let creep_len = (creep_dx * creep_dx + creep_dy * creep_dy).sqrt();
+                                        let (cdx, cdy) = if creep_len > 0.0 {
+                                            (creep_dx / creep_len, creep_dy / creep_len)
+                                        } else {
+                                            (0.0, 0.0)
+                                        };
+
+                                        // Move at half speed while creeping
+                                        z.pos.x = zx + cdx * z_speed * 0.5 * dt;
+                                        z.pos.y = zy + cdy * z_speed * 0.5 * dt;
+                                        z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
+                                        z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
+                                        let (cnx, cny) = resolve_wall_collisions(
+                                            z.pos.x, z.pos.y, ZOMBIE_RADIUS, &self.wall_grid,
+                                        );
+                                        z.pos.x = cnx;
+                                        z.pos.y = cny;
                                     }
                                 } else {
+                                    // Not blocked — clear stuck state
+                                    self.zombie_wall_stuck.remove(&zid);
                                     z.pos.x = nx;
                                     z.pos.y = ny;
                                 }
@@ -1078,6 +1157,59 @@ impl Game {
         if self.wave_kills >= self.wave * 10 {
             self.wave += 1;
             self.wave_kills = 0;
+        }
+
+        // Revive: living players near dead players revive them over time
+        {
+            let dead_ids: Vec<String> = self.players.iter()
+                .filter(|(_, p)| p.health <= 0.0)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            let alive_positions: Vec<(String, f64, f64)> = self.players.iter()
+                .filter(|(_, p)| p.health > 0.0)
+                .map(|(id, p)| (id.clone(), p.pos.x, p.pos.y))
+                .collect();
+
+            for dead_id in &dead_ids {
+                let dead_pos = match self.players.get(dead_id) {
+                    Some(p) => (p.pos.x, p.pos.y),
+                    None => continue,
+                };
+
+                // Find closest alive player within revive range
+                let mut reviver: Option<String> = None;
+                for (aid, ax, ay) in &alive_positions {
+                    let dx = ax - dead_pos.0;
+                    let dy = ay - dead_pos.1;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < REVIVE_RANGE {
+                        reviver = Some(aid.clone());
+                        break;
+                    }
+                }
+
+                if let Some(ref reviver_id) = reviver {
+                    let entry = self.revive_progress.entry(dead_id.clone())
+                        .or_insert((reviver_id.clone(), 0.0));
+                    // Reset progress if a different player is reviving
+                    if entry.0 != *reviver_id {
+                        *entry = (reviver_id.clone(), 0.0);
+                    }
+                    entry.1 += dt;
+
+                    if entry.1 >= REVIVE_TIME {
+                        // Revive the player
+                        if let Some(p) = self.players.get_mut(dead_id) {
+                            p.health = REVIVE_HEALTH;
+                        }
+                        self.revive_progress.remove(dead_id);
+                    }
+                } else {
+                    // No one nearby — reset progress
+                    self.revive_progress.remove(dead_id);
+                }
+            }
         }
 
         // Game over check

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Bluesky session from createSession API
@@ -10,108 +10,73 @@ pub struct BskySession {
     pub access_jwt: String,
 }
 
-/// A logged-in user
-#[derive(Clone, Debug, Serialize)]
-pub struct AuthUser {
-    pub did: String,
-    pub handle: String,
-    pub display_name: String,
-}
-
-/// Friend with online status
+/// Friend with online status (returned to frontend)
 #[derive(Serialize)]
 pub struct FriendStatus {
+    pub user_id: String,
+    pub display_name: String,
     pub handle: String,
-    pub did: String,
     pub online: bool,
 }
 
-/// Manages auth sessions and friend lists
+/// Google user info from token exchange
+#[derive(Deserialize, Debug)]
+pub struct GoogleUserInfo {
+    pub sub: String,
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Runtime online-presence tracking only.
+/// All persistence (sessions, friends, accounts) is in db.rs.
 pub struct SocialState {
-    /// game_token -> AuthUser
-    pub sessions: HashMap<String, AuthUser>,
-    /// did -> set of friend DIDs
-    pub friends: HashMap<String, HashSet<String>>,
-    /// did -> handle (reverse lookup cache)
-    pub handle_to_did: HashMap<String, String>,
-    /// player_id (game) -> did
-    pub player_to_did: HashMap<String, String>,
-    /// did -> player_id (reverse)
-    pub did_to_player: HashMap<String, String>,
+    /// player_id (game websocket) -> internal user_id
+    pub player_to_user: HashMap<String, String>,
+    /// user_id -> player_id (reverse, for online status)
+    pub user_to_player: HashMap<String, String>,
 }
 
 impl SocialState {
     pub fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
-            friends: HashMap::new(),
-            handle_to_did: HashMap::new(),
-            player_to_did: HashMap::new(),
-            did_to_player: HashMap::new(),
+            player_to_user: HashMap::new(),
+            user_to_player: HashMap::new(),
         }
     }
 
-    pub fn add_session(&mut self, token: &str, user: AuthUser) {
-        self.handle_to_did.insert(user.handle.clone(), user.did.clone());
-        self.sessions.insert(token.to_string(), user);
-    }
-
-    pub fn get_user(&self, token: &str) -> Option<&AuthUser> {
-        self.sessions.get(token)
-    }
-
-    pub fn link_player(&mut self, player_id: &str, did: &str) {
-        self.player_to_did.insert(player_id.to_string(), did.to_string());
-        self.did_to_player.insert(did.to_string(), player_id.to_string());
+    pub fn link_player(&mut self, player_id: &str, user_id: &str) {
+        self.player_to_user.insert(player_id.to_string(), user_id.to_string());
+        self.user_to_player.insert(user_id.to_string(), player_id.to_string());
     }
 
     pub fn unlink_player(&mut self, player_id: &str) {
-        if let Some(did) = self.player_to_did.remove(player_id) {
-            self.did_to_player.remove(&did);
+        if let Some(user_id) = self.player_to_user.remove(player_id) {
+            self.user_to_player.remove(&user_id);
         }
     }
 
-    pub fn is_online(&self, did: &str) -> bool {
-        self.did_to_player.contains_key(did)
-    }
-
-    pub fn add_friend(&mut self, user_did: &str, friend_did: &str) {
-        self.friends.entry(user_did.to_string()).or_default().insert(friend_did.to_string());
-        // Bidirectional
-        self.friends.entry(friend_did.to_string()).or_default().insert(user_did.to_string());
-    }
-
-    pub fn remove_friend(&mut self, user_did: &str, friend_did: &str) {
-        if let Some(set) = self.friends.get_mut(user_did) {
-            set.remove(friend_did);
-        }
-        if let Some(set) = self.friends.get_mut(friend_did) {
-            set.remove(user_did);
-        }
-    }
-
-    pub fn get_friends(&self, user_did: &str) -> Vec<FriendStatus> {
-        let empty = HashSet::new();
-        let friend_dids = self.friends.get(user_did).unwrap_or(&empty);
-        friend_dids.iter().map(|did| {
-            let handle = self.handle_to_did.iter()
-                .find(|(_, d)| *d == did)
-                .map(|(h, _)| h.clone())
-                .unwrap_or_else(|| did[..16.min(did.len())].to_string());
-            FriendStatus {
-                handle,
-                did: did.clone(),
-                online: self.is_online(did),
-            }
-        }).collect()
+    pub fn is_online(&self, user_id: &str) -> bool {
+        self.user_to_player.contains_key(user_id)
     }
 }
 
-/// Call Bluesky createSession API
+/// Determine the PDS service URL for a given handle.
+/// Handles on zigdon.tech use the self-hosted PDS; everything else uses bsky.social.
+fn pds_url_for_handle(handle: &str) -> &'static str {
+    if handle.ends_with(".oge.social") || handle == "oge.social" {
+        "https://pds.oge.social"
+    } else {
+        "https://bsky.social"
+    }
+}
+
+/// Call AT Proto createSession API against the appropriate PDS
 pub async fn bsky_login(handle: &str, password: &str) -> Result<BskySession, String> {
+    let pds = pds_url_for_handle(handle);
     let client = reqwest::Client::new();
     let res = client
-        .post("https://bsky.social/xrpc/com.atproto.server.createSession")
+        .post(format!("{}/xrpc/com.atproto.server.createSession", pds))
         .json(&serde_json::json!({
             "identifier": handle,
             "password": password,
@@ -131,12 +96,13 @@ pub async fn bsky_login(handle: &str, password: &str) -> Result<BskySession, Str
         .map_err(|e| format!("Failed to parse response: {}", e))
 }
 
-/// Resolve a handle to a DID via Bluesky API
+/// Resolve a handle to a DID via the appropriate PDS
 pub async fn resolve_handle(handle: &str) -> Result<String, String> {
+    let pds = pds_url_for_handle(handle);
     let client = reqwest::Client::new();
     let url = format!(
-        "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={}",
-        handle
+        "{}/xrpc/com.atproto.identity.resolveHandle?handle={}",
+        pds, handle
     );
     let res = client.get(&url).send().await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -153,4 +119,57 @@ pub async fn resolve_handle(handle: &str) -> Result<String, String> {
     let data: ResolveResponse = res.json().await
         .map_err(|e| format!("Failed to parse: {}", e))?;
     Ok(data.did)
+}
+
+/// Exchange Google OAuth authorization code for user info.
+pub async fn google_token_exchange(
+    code: &str,
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+) -> Result<GoogleUserInfo, String> {
+    let client = reqwest::Client::new();
+
+    // Exchange auth code for tokens
+    let token_res = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("code", code),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !token_res.status().is_success() {
+        let body = token_res.text().await.unwrap_or_default();
+        return Err(format!("Google token exchange failed: {}", body));
+    }
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+    }
+
+    let tokens: TokenResponse = token_res.json().await
+        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+    // Use access token to get user info
+    let userinfo_res = client
+        .get("https://www.googleapis.com/oauth2/v3/userinfo")
+        .bearer_auth(&tokens.access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !userinfo_res.status().is_success() {
+        let body = userinfo_res.text().await.unwrap_or_default();
+        return Err(format!("Failed to get Google user info: {}", body));
+    }
+
+    userinfo_res.json::<GoogleUserInfo>().await
+        .map_err(|e| format!("Failed to parse user info: {}", e))
 }

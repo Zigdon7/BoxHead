@@ -4,6 +4,7 @@ mod spatial_grid;
 mod game;
 mod delta;
 mod social;
+mod db;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,7 +24,8 @@ use tokio::sync::mpsc;
 use crate::types::*;
 use crate::game::Game;
 use crate::delta::DeltaTracker;
-use crate::social::{SocialState, AuthUser};
+use crate::social::SocialState;
+use crate::db::Database;
 
 // Bounded channel: capacity = a few ticks of headroom.
 // If a client falls behind, we skip deltas rather than buffer indefinitely.
@@ -37,16 +39,38 @@ struct AppState {
     clients: Mutex<HashMap<String, ClientSender>>,
     pending_snapshots: Mutex<HashSet<String>>,
     social: Mutex<SocialState>,
+    db: Database,
+    google_client_id: String,
+    google_client_secret: String,
 }
 
 #[tokio::main]
 async fn main() {
+    let db = Database::open("boxhead.db")
+        .expect("Failed to open database");
+
+    let google_client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();
+    let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
+
     let state = Arc::new(AppState {
         game: Mutex::new(Game::new()),
         delta_tracker: Mutex::new(DeltaTracker::new()),
         clients: Mutex::new(HashMap::new()),
         pending_snapshots: Mutex::new(HashSet::new()),
         social: Mutex::new(SocialState::new()),
+        db,
+        google_client_id,
+        google_client_secret,
+    });
+
+    // Periodic session cleanup (every hour)
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            cleanup_state.db.delete_expired_sessions();
+        }
     });
 
     // 60 Hz physics + adaptive-rate network broadcast (up to 60 Hz per client)
@@ -68,6 +92,11 @@ async fn main() {
         .route("/admin/restart", post(admin_restart))
         .route("/admin/status", get(admin_status))
         .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/email/register", post(email_register))
+        .route("/api/auth/email/login", post(email_login))
+        .route("/api/auth/google/callback", get(google_callback))
+        .route("/api/auth/me", get(auth_me))
+        .route("/api/config", get(api_config))
         .route("/api/friends", get(friends_list))
         .route("/api/friends/add", post(friends_add))
         .route("/api/friends/remove", post(friends_remove))
@@ -112,12 +141,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
-    // Link player to auth identity if they have a valid token
+    // Link player to auth identity if they have a valid session
     if let Some(ref token) = auth_token {
-        let mut social = state.social.lock().await;
-        if social.get_user(token).is_some() {
-            let did = social.get_user(token).unwrap().did.clone();
-            social.link_player(&player_id, &did);
+        if let Some(user_id) = state.db.validate_session(token) {
+            let mut social = state.social.lock().await;
+            social.link_player(&player_id, &user_id);
         }
     }
 
@@ -389,6 +417,14 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     }))
 }
 
+// --- Config API ---
+
+async fn api_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "google_client_id": state.google_client_id,
+    }))
+}
+
 // --- Auth & Friends API ---
 
 async fn auth_login(
@@ -404,20 +440,28 @@ async fn auth_login(
 
     match social::bsky_login(handle, password).await {
         Ok(session) => {
-            let token = uuid::Uuid::new_v4().to_string();
-            let user = AuthUser {
-                did: session.did.clone(),
-                handle: session.handle.clone(),
-                display_name: session.handle.clone(),
+            // Find or create internal user account linked to this Bluesky DID
+            let user_id = match state.db.find_or_create_user(
+                "bluesky",
+                &session.did,
+                &session.handle,
+                &session.handle,
+            ) {
+                Ok(id) => id,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
             };
-            let mut social = state.social.lock().await;
-            social.add_session(&token, user);
+
+            let token = match state.db.create_session(&user_id) {
+                Ok(t) => t,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
+            };
 
             Json(serde_json::json!({
                 "ok": true,
                 "token": token,
+                "user_id": user_id,
                 "handle": session.handle,
-                "did": session.did,
+                "display_name": session.handle,
             }))
         }
         Err(e) => {
@@ -426,19 +470,211 @@ async fn auth_login(
     }
 }
 
+async fn email_register(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let email = body["email"].as_str().unwrap_or("").trim().to_lowercase();
+    let password = body["password"].as_str().unwrap_or("");
+
+    if email.is_empty() || !email.contains('@') {
+        return Json(serde_json::json!({ "ok": false, "error": "Valid email required" }));
+    }
+    if password.len() < 6 {
+        return Json(serde_json::json!({ "ok": false, "error": "Password must be at least 6 characters" }));
+    }
+
+    match state.db.register_email_user(&email, password) {
+        Ok(user_id) => {
+            let token = match state.db.create_session(&user_id) {
+                Ok(t) => t,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
+            };
+            Json(serde_json::json!({
+                "ok": true,
+                "token": token,
+                "user_id": user_id,
+                "handle": email,
+                "display_name": email,
+            }))
+        }
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+async fn email_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let email = body["email"].as_str().unwrap_or("").trim().to_lowercase();
+    let password = body["password"].as_str().unwrap_or("");
+
+    if email.is_empty() || password.is_empty() {
+        return Json(serde_json::json!({ "ok": false, "error": "Email and password required" }));
+    }
+
+    match state.db.verify_email_login(&email, password) {
+        Ok(user_id) => {
+            let token = match state.db.create_session(&user_id) {
+                Ok(t) => t,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
+            };
+            Json(serde_json::json!({
+                "ok": true,
+                "token": token,
+                "user_id": user_id,
+                "handle": email,
+                "display_name": email,
+            }))
+        }
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+/// Google OAuth callback — receives auth code, exchanges for user info,
+/// creates/finds user, creates session, returns HTML that messages the opener.
+async fn google_callback(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Html<String> {
+    let code = match params.get("code") {
+        Some(c) => c.clone(),
+        None => {
+            return Html("<html><body><script>window.close();</script>Error: no code</body></html>".to_string());
+        }
+    };
+
+    if state.google_client_id.is_empty() || state.google_client_secret.is_empty() {
+        return Html("<html><body><script>window.close();</script>Error: Google OAuth not configured</body></html>".to_string());
+    }
+
+    // Build redirect_uri from the request (same as what the frontend used)
+    let redirect_uri = params.get("redirect_uri").cloned()
+        .unwrap_or_else(|| format!("{}/api/auth/google/callback",
+            std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3001".to_string())
+        ));
+
+    let result = social::google_token_exchange(
+        &code,
+        &state.google_client_id,
+        &state.google_client_secret,
+        &redirect_uri,
+    ).await;
+
+    match result {
+        Ok(info) => {
+            let display_name = if info.name.is_empty() { info.email.clone() } else { info.name.clone() };
+            let user_id = match state.db.find_or_create_user(
+                "google",
+                &info.sub,
+                &info.email,
+                &display_name,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    return Html(format!("<html><body><script>window.close();</script>Error: {}</body></html>", e));
+                }
+            };
+
+            let token = match state.db.create_session(&user_id) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Html(format!("<html><body><script>window.close();</script>Error: {}</body></html>", e));
+                }
+            };
+
+            // Return HTML that posts the result back to the opener window and closes
+            Html(format!(r#"<!DOCTYPE html>
+<html><body>
+<p>Signed in! This window will close automatically.</p>
+<script>
+if (window.opener) {{
+    window.opener.postMessage({{
+        type: 'google-auth',
+        ok: true,
+        token: '{}',
+        user_id: '{}',
+        handle: '{}',
+        display_name: '{}'
+    }}, window.location.origin);
+}}
+setTimeout(() => window.close(), 1000);
+</script>
+</body></html>"#,
+                token,
+                user_id,
+                info.email.replace('\'', "\\'"),
+                display_name.replace('\'', "\\'"),
+            ))
+        }
+        Err(e) => {
+            Html(format!(r#"<!DOCTYPE html>
+<html><body>
+<p>Login failed: {}</p>
+<script>
+if (window.opener) {{
+    window.opener.postMessage({{ type: 'google-auth', ok: false, error: '{}' }}, window.location.origin);
+}}
+setTimeout(() => window.close(), 3000);
+</script>
+</body></html>"#,
+                e,
+                e.replace('\'', "\\'"),
+            ))
+        }
+    }
+}
+
+/// Get current user info from session token
+async fn auth_me(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let token = params.get("token").map(|s| s.as_str()).unwrap_or("");
+
+    let user_id = match state.db.validate_session(token) {
+        Some(id) => id,
+        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
+    };
+
+    let user = match state.db.get_user(&user_id) {
+        Some(u) => u,
+        None => return Json(serde_json::json!({ "ok": false, "error": "User not found" })),
+    };
+
+    let handle = state.db.get_user_handle(&user_id).unwrap_or_default();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "user_id": user.id,
+        "display_name": user.display_name,
+        "handle": handle,
+    }))
+}
+
 async fn friends_list(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
     let token = params.get("token").map(|s| s.as_str()).unwrap_or("");
-    let social = state.social.lock().await;
 
-    let user = match social.get_user(token) {
-        Some(u) => u.clone(),
+    let user_id = match state.db.validate_session(token) {
+        Some(id) => id,
         None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
     };
 
-    let friends = social.get_friends(&user.did);
+    let friend_rows = state.db.get_friends(&user_id);
+    let social = state.social.lock().await;
+
+    let friends: Vec<social::FriendStatus> = friend_rows.into_iter().map(|f| {
+        social::FriendStatus {
+            user_id: f.user_id.clone(),
+            display_name: f.display_name.clone(),
+            handle: f.provider_handle.unwrap_or_else(|| f.display_name.clone()),
+            online: social.is_online(&f.user_id),
+        }
+    }).collect();
+
     Json(serde_json::json!({ "ok": true, "friends": friends }))
 }
 
@@ -453,21 +689,37 @@ async fn friends_add(
         return Json(serde_json::json!({ "ok": false, "error": "Friend handle required" }));
     }
 
-    let user_did = {
-        let social = state.social.lock().await;
-        match social.get_user(token) {
-            Some(u) => u.did.clone(),
-            None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
-        }
+    let user_id = match state.db.validate_session(token) {
+        Some(id) => id,
+        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
     };
 
-    // Resolve friend handle to DID
+    // Try to resolve as a Bluesky handle first
     match social::resolve_handle(friend_handle).await {
         Ok(friend_did) => {
-            let mut social = state.social.lock().await;
-            social.handle_to_did.insert(friend_handle.to_string(), friend_did.clone());
-            social.add_friend(&user_did, &friend_did);
-            Json(serde_json::json!({ "ok": true, "did": friend_did, "handle": friend_handle }))
+            // Find or create a user for this Bluesky account
+            let friend_user_id = match state.db.find_or_create_user(
+                "bluesky",
+                &friend_did,
+                friend_handle,
+                friend_handle,
+            ) {
+                Ok(id) => id,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
+            };
+
+            if friend_user_id == user_id {
+                return Json(serde_json::json!({ "ok": false, "error": "Cannot add yourself" }));
+            }
+
+            match state.db.add_friend(&user_id, &friend_user_id) {
+                Ok(_) => Json(serde_json::json!({
+                    "ok": true,
+                    "user_id": friend_user_id,
+                    "handle": friend_handle,
+                })),
+                Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+            }
         }
         Err(e) => {
             Json(serde_json::json!({ "ok": false, "error": e }))
@@ -480,14 +732,15 @@ async fn friends_remove(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let token = body["token"].as_str().unwrap_or("");
-    let friend_did = body["did"].as_str().unwrap_or("");
+    let friend_user_id = body["user_id"].as_str().unwrap_or("");
 
-    let mut social = state.social.lock().await;
-    let user = match social.get_user(token) {
-        Some(u) => u.clone(),
+    let user_id = match state.db.validate_session(token) {
+        Some(id) => id,
         None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
     };
 
-    social.remove_friend(&user.did, friend_did);
-    Json(serde_json::json!({ "ok": true }))
+    match state.db.remove_friend(&user_id, friend_user_id) {
+        Ok(_) => Json(serde_json::json!({ "ok": true })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+    }
 }

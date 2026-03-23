@@ -37,6 +37,17 @@ pub const AMMO_PICKUP_RADIUS: f64 = 18.0;
 pub const AMMO_PICKUP_AMOUNT: i32 = 15;
 pub const AMMO_RESPAWN_TIME: f64 = 15.0;
 
+// Dash
+pub const DASH_SPEED_MULT: f64 = 3.0;
+pub const DASH_DURATION: f64 = 0.15;
+pub const DASH_MAX_CHARGES: i32 = 3;
+pub const DASH_RECHARGE_TIME: f64 = 2.5; // seconds per charge
+
+// Revive
+pub const REVIVE_RANGE: f64 = 50.0;
+pub const REVIVE_TIME: f64 = 3.0;
+pub const REVIVE_HEALTH: f64 = 50.0;
+
 // Drop pickups
 pub const DROP_PICKUP_RADIUS: f64 = 18.0;
 pub const DROP_DESPAWN_TIME: f64 = 10.0;
