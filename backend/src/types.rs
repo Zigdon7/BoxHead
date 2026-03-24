@@ -171,6 +171,9 @@ pub struct InitPayload {
     pub map_height: f64,
     #[serde(rename = "ammoSpawnPoints")]
     pub ammo_spawn_points: Vec<AmmoSpawnPoint>,
+    #[serde(rename = "gameOver")]
+    pub game_over: bool,
+    pub wave: u32,
 }
 
 #[derive(Serialize, Clone, Debug)]

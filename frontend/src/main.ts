@@ -858,6 +858,15 @@ function connectToServer() {
       for (let i = 0; i < staticAmmoSpawns.length; i++) {
         ammoAvailability.set(`ammo_${i}`, true);
       }
+      // If the server already has a game-over in progress, show it immediately
+      // (player joined an ended session — no need to wait for snapshot/delta).
+      if (init.gameOver) {
+        gameOver = true;
+        wave = init.wave;
+        finalWave = wave;
+        finalScore = 0;
+        setScreen('gameover');
+      }
     } else if (data.type === 'snapshot') {
       const snap = data as SnapshotState;
       players = snap.players;
@@ -892,8 +901,14 @@ function connectToServer() {
         }
       }
 
-      // If snapshot says game is no longer over (restart happened), go back to playing
-      if (!snap.gameOver && currentScreen === 'gameover') {
+      // Sync screen state with server-authoritative gameOver flag
+      if (snap.gameOver && currentScreen === 'playing') {
+        const me = players[myId];
+        finalWave = wave;
+        finalScore = me ? Math.floor(me.score) : 0;
+        setScreen('gameover');
+      } else if (!snap.gameOver && currentScreen === 'gameover') {
+        // Restart happened — go back to playing
         setScreen('playing');
       }
 
@@ -905,6 +920,10 @@ function connectToServer() {
 
   ws.onclose = () => {
     if (inputInterval) { clearInterval(inputInterval); inputInterval = null; }
+    // Only revert to menu if we weren't already showing the game-over screen.
+    // If the server closed the connection because the game ended (or because the
+    // player joined a game that was already over), we stay on the gameover screen
+    // so the player sees their final stats.
     if (currentScreen === 'playing') {
       setScreen('menu');
     }

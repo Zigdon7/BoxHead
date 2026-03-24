@@ -147,6 +147,8 @@ export interface InitPayload {
   mapWidth: number;
   mapHeight: number;
   ammoSpawnPoints: AmmoSpawnPoint[];
+  gameOver: boolean;
+  wave: number;
   [k: string]: unknown;
 }
 /**

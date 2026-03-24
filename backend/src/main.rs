@@ -152,12 +152,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Bounded channel — drops deltas for slow clients instead of buffering
     let (tx, mut rx) = mpsc::channel::<String>(CLIENT_CHANNEL_CAPACITY);
 
-    // Add player to game
+    // Add player to game (only if game is not over)
+    let joined_game;
     {
         let mut game = state.game.lock().await;
-        game.add_player(&player_id, &player_name);
+        let game_over = game.is_game_over();
+        let wave = game.wave();
 
-        // Send init payload
+        if !game_over {
+            game.add_player(&player_id, &player_name);
+            joined_game = true;
+        } else {
+            joined_game = false;
+        }
+
+        // Send init payload — always includes current game_over / wave so the
+        // client can immediately show the right screen without waiting for a snapshot.
         let init = InitPayload {
             msg_type: "init".to_string(),
             id: player_id.clone(),
@@ -165,9 +175,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             map_width: game.map_dimensions().0,
             map_height: game.map_dimensions().1,
             ammo_spawn_points: game.ammo_spawn_points(),
+            game_over,
+            wave,
         };
         let init_str = serde_json::to_string(&init).unwrap();
         let _ = ws_sender.send(Message::Text(init_str.into())).await;
+    }
+
+    // If the game is over, don't register this socket as a game client — we
+    // already told them the state.  They'll reconnect when the game restarts.
+    if !joined_game {
+        return;
     }
 
     // Register client sender
