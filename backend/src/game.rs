@@ -489,6 +489,12 @@ impl Game {
                 p.pos.x += dx * speed * dt;
                 p.pos.y += dy * speed * dt;
 
+                // Try wrapping through tunnels first
+                let (wx, wy) = wrap_position(p.pos.x, p.pos.y, PLAYER_RADIUS);
+                p.pos.x = wx;
+                p.pos.y = wy;
+
+                // Then clamp to map bounds (only matters if not in a tunnel)
                 p.pos.x = p.pos.x.max(PLAYER_RADIUS).min(MAP_WIDTH - PLAYER_RADIUS);
                 p.pos.y = p.pos.y.max(PLAYER_RADIUS).min(MAP_HEIGHT - PLAYER_RADIUS);
 
@@ -729,10 +735,16 @@ impl Game {
                         return false;
                     }
                 }
-                if b.pos.x < 0.0
-                    || b.pos.x > MAP_WIDTH
-                    || b.pos.y < 0.0
-                    || b.pos.y > MAP_HEIGHT
+                // Wrap bullets through tunnels
+                let (bwx, bwy) = wrap_position(b.pos.x, b.pos.y, BULLET_RADIUS);
+                b.pos.x = bwx;
+                b.pos.y = bwy;
+
+                // Only remove if out of bounds AND not in a tunnel (wrapping didn't help)
+                if b.pos.x < -BULLET_RADIUS
+                    || b.pos.x > MAP_WIDTH + BULLET_RADIUS
+                    || b.pos.y < -BULLET_RADIUS
+                    || b.pos.y > MAP_HEIGHT + BULLET_RADIUS
                 {
                     lifetimes.remove(&b.id);
                     if b.damage >= 100.0 {
@@ -951,6 +963,11 @@ impl Game {
                         z.pos.x += move_dx * z_speed * dt;
                         z.pos.y += move_dy * z_speed * dt;
 
+                        // Wrap through tunnels
+                        let (zwx, zwy) = wrap_position(z.pos.x, z.pos.y, ZOMBIE_RADIUS);
+                        z.pos.x = zwx;
+                        z.pos.y = zwy;
+
                         z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
                         z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
 
@@ -1008,6 +1025,9 @@ impl Game {
                                         // Move at half speed while creeping
                                         z.pos.x = zx + cdx * z_speed * 0.5 * dt;
                                         z.pos.y = zy + cdy * z_speed * 0.5 * dt;
+                                        let (cwx, cwy) = wrap_position(z.pos.x, z.pos.y, ZOMBIE_RADIUS);
+                                        z.pos.x = cwx;
+                                        z.pos.y = cwy;
                                         z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
                                         z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
                                         let (cnx, cny) = resolve_wall_collisions(

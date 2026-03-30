@@ -37,6 +37,9 @@ pub const AMMO_PICKUP_RADIUS: f64 = 18.0;
 pub const AMMO_PICKUP_AMOUNT: i32 = 15;
 pub const AMMO_RESPAWN_TIME: f64 = 15.0;
 
+// Edge tunnels (Pac-Man style teleport)
+pub const TUNNEL_WIDTH: f64 = 200.0; // width of the opening on each edge
+
 // Dash
 pub const DASH_SPEED_MULT: f64 = 3.0;
 pub const DASH_DURATION: f64 = 0.15;
@@ -79,12 +82,24 @@ impl Wall {
 pub fn generate_walls() -> Vec<Wall> {
     let w = WALL_THICKNESS;
 
+    // Tunnel midpoints
+    let h_mid = MAP_WIDTH / 2.0;   // horizontal midpoint
+    let v_mid = MAP_HEIGHT / 2.0;  // vertical midpoint
+    let half_t = TUNNEL_WIDTH / 2.0;
+
     vec![
-        // Boundary walls
-        Wall::new(0.0, 0.0, MAP_WIDTH, w),
-        Wall::new(0.0, MAP_HEIGHT - w, MAP_WIDTH, w),
-        Wall::new(0.0, 0.0, w, MAP_HEIGHT),
-        Wall::new(MAP_WIDTH - w, 0.0, w, MAP_HEIGHT),
+        // Top boundary — gap in center
+        Wall::new(0.0, 0.0, h_mid - half_t, w),
+        Wall::new(h_mid + half_t, 0.0, h_mid - half_t, w),
+        // Bottom boundary — gap in center
+        Wall::new(0.0, MAP_HEIGHT - w, h_mid - half_t, w),
+        Wall::new(h_mid + half_t, MAP_HEIGHT - w, h_mid - half_t, w),
+        // Left boundary — gap in center
+        Wall::new(0.0, 0.0, w, v_mid - half_t),
+        Wall::new(0.0, v_mid + half_t, w, v_mid - half_t),
+        // Right boundary — gap in center
+        Wall::new(MAP_WIDTH - w, 0.0, w, v_mid - half_t),
+        Wall::new(MAP_WIDTH - w, v_mid + half_t, w, v_mid - half_t),
         // Central cross with gaps
         Wall::new(300.0, 880.0, 500.0, w),
         Wall::new(1000.0, 880.0, 400.0, w),
@@ -129,6 +144,40 @@ pub fn generate_walls() -> Vec<Wall> {
         Wall::new(2200.0, 700.0, 150.0, w),
         Wall::new(2200.0, 1100.0, 150.0, w),
     ]
+}
+
+/// Check if a position is within a tunnel opening on the map edge,
+/// and if it has crossed the edge, wrap it to the opposite side.
+/// Returns the (possibly wrapped) position.
+pub fn wrap_position(x: f64, y: f64, radius: f64) -> (f64, f64) {
+    let h_mid = MAP_WIDTH / 2.0;
+    let v_mid = MAP_HEIGHT / 2.0;
+    let half_t = TUNNEL_WIDTH / 2.0;
+
+    let mut nx = x;
+    let mut ny = y;
+
+    // Check horizontal tunnels (left/right edges)
+    let in_h_tunnel = y > v_mid - half_t && y < v_mid + half_t;
+    if in_h_tunnel {
+        if nx < -radius {
+            nx = MAP_WIDTH + nx; // wrap from left to right
+        } else if nx > MAP_WIDTH + radius {
+            nx = nx - MAP_WIDTH; // wrap from right to left
+        }
+    }
+
+    // Check vertical tunnels (top/bottom edges)
+    let in_v_tunnel = nx > h_mid - half_t && nx < h_mid + half_t;
+    if in_v_tunnel {
+        if ny < -radius {
+            ny = MAP_HEIGHT + ny; // wrap from top to bottom
+        } else if ny > MAP_HEIGHT + radius {
+            ny = ny - MAP_HEIGHT; // wrap from bottom to top
+        }
+    }
+
+    (nx, ny)
 }
 
 pub fn spawn_zones() -> Vec<(f64, f64)> {

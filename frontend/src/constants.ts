@@ -7,6 +7,9 @@ export const WEAPON_STATS: Record<string, { damage: number; name: string; slot: 
 };
 
 // Shared physics constants (must match backend map.rs)
+export const MAP_WIDTH = 2400.0;
+export const MAP_HEIGHT = 1800.0;
+export const TUNNEL_WIDTH = 200.0;
 export const PLAYER_SPEED = 200.0;
 export const PLAYER_RADIUS = 15.0;
 export const DASH_SPEED_MULT = 3.0;

@@ -1,5 +1,5 @@
 import { Player, Zombie, Bullet, Wall, ClientInput, DeltaState, SnapshotState, InitPayload, DropPickup } from './generated/types';
-import { WEAPON_STATS, PLAYER_SPEED, PLAYER_RADIUS, DASH_SPEED_MULT, DASH_DURATION, DASH_MAX_CHARGES, DASH_RECHARGE_TIME } from './constants';
+import { WEAPON_STATS, MAP_WIDTH, MAP_HEIGHT, TUNNEL_WIDTH, PLAYER_SPEED, PLAYER_RADIUS, DASH_SPEED_MULT, DASH_DURATION, DASH_MAX_CHARGES, DASH_RECHARGE_TIME } from './constants';
 
 // Local composite type for rendering
 interface GameState {
@@ -1380,6 +1380,81 @@ function drawGrid() {
   }
 }
 
+function drawTunnels() {
+  const pulse = 0.4 + 0.3 * Math.sin(performance.now() / 500);
+  const tw = TUNNEL_WIDTH;
+  const hMid = MAP_WIDTH / 2;
+  const vMid = MAP_HEIGHT / 2;
+  const arrowSize = 12;
+
+  // Helper to draw a tunnel opening with arrows
+  function drawTunnelOpening(
+    x: number, y: number, w: number, h: number,
+    arrowDir: 'up' | 'down' | 'left' | 'right'
+  ) {
+    const sx = x - camX;
+    const sy = y - camY;
+    if (sx + w < -20 || sx > canvas.width + 20 || sy + h < -20 || sy > canvas.height + 20) return;
+
+    // Glowing opening
+    ctx.fillStyle = `rgba(0, 200, 255, ${pulse * 0.15})`;
+    ctx.fillRect(sx, sy, w, h);
+
+    // Border glow lines
+    ctx.strokeStyle = `rgba(0, 200, 255, ${pulse * 0.6})`;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 4]);
+    ctx.strokeRect(sx + 1, sy + 1, w - 2, h - 2);
+    ctx.setLineDash([]);
+
+    // Directional arrows
+    ctx.fillStyle = `rgba(0, 200, 255, ${pulse * 0.8})`;
+    const cx = sx + w / 2;
+    const cy = sy + h / 2;
+
+    const drawArrow = (ax: number, ay: number) => {
+      ctx.beginPath();
+      if (arrowDir === 'up') {
+        ctx.moveTo(ax, ay - arrowSize);
+        ctx.lineTo(ax - arrowSize / 2, ay);
+        ctx.lineTo(ax + arrowSize / 2, ay);
+      } else if (arrowDir === 'down') {
+        ctx.moveTo(ax, ay + arrowSize);
+        ctx.lineTo(ax - arrowSize / 2, ay);
+        ctx.lineTo(ax + arrowSize / 2, ay);
+      } else if (arrowDir === 'left') {
+        ctx.moveTo(ax - arrowSize, ay);
+        ctx.lineTo(ax, ay - arrowSize / 2);
+        ctx.lineTo(ax, ay + arrowSize / 2);
+      } else {
+        ctx.moveTo(ax + arrowSize, ay);
+        ctx.lineTo(ax, ay - arrowSize / 2);
+        ctx.lineTo(ax, ay + arrowSize / 2);
+      }
+      ctx.fill();
+    };
+
+    if (arrowDir === 'left' || arrowDir === 'right') {
+      drawArrow(cx, cy - 30);
+      drawArrow(cx, cy);
+      drawArrow(cx, cy + 30);
+    } else {
+      drawArrow(cx - 30, cy);
+      drawArrow(cx, cy);
+      drawArrow(cx + 30, cy);
+    }
+  }
+
+  // Top tunnel
+  drawTunnelOpening(hMid - tw / 2, 0, tw, 20, 'up');
+  // Bottom tunnel
+  drawTunnelOpening(hMid - tw / 2, MAP_HEIGHT - 20, tw, 20, 'down');
+  // Left tunnel
+  drawTunnelOpening(0, vMid - tw / 2, 20, tw, 'left');
+  // Right tunnel
+  drawTunnelOpening(MAP_WIDTH - 20, vMid - tw / 2, 20, tw, 'right');
+}
+
 function drawWalls() {
   for (const w of staticWalls) {
     const sx = w.x - camX;
@@ -2311,6 +2386,7 @@ function draw() {
       ctx.fillRect(-camX, -camY, staticMapWidth, staticMapHeight);
 
       if (!isMobile) drawGrid();
+      drawTunnels();
       drawWalls();
       drawAmmoPickups();
       drawDrops(state);
