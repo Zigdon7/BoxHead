@@ -5,3 +5,4 @@ dist/
 backend/target/
 frontend/node_modules/
 frontend/dist/
+boxhead.db

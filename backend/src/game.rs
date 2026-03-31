@@ -713,10 +713,13 @@ impl Game {
             }
         }
 
-        // Update bullet positions
+        // Update bullet positions + wrap through tunnels
         for bullet in &mut self.bullets {
             bullet.pos.x += bullet.vel.x * dt;
             bullet.pos.y += bullet.vel.y * dt;
+            let (bwx, bwy) = wrap_position(bullet.pos.x, bullet.pos.y, BULLET_RADIUS);
+            bullet.pos.x = bwx;
+            bullet.pos.y = bwy;
         }
 
         // Filter bullets (OOB / lifetime / wall) — rockets explode on wall hit
@@ -735,12 +738,7 @@ impl Game {
                         return false;
                     }
                 }
-                // Wrap bullets through tunnels
-                let (bwx, bwy) = wrap_position(b.pos.x, b.pos.y, BULLET_RADIUS);
-                b.pos.x = bwx;
-                b.pos.y = bwy;
-
-                // Only remove if out of bounds AND not in a tunnel (wrapping didn't help)
+                // Remove if out of bounds (wrapping already applied above)
                 if b.pos.x < -BULLET_RADIUS
                     || b.pos.x > MAP_WIDTH + BULLET_RADIUS
                     || b.pos.y < -BULLET_RADIUS
