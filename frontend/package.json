@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
-    "generate:types": "json-schema-to-typescript ../schema/types.json -o src/generated/types.ts --unreachableDefinitions"
+    "generate:types": "json2ts ../schema/types.json -o src/generated/types.ts --unreachableDefinitions"
   },
   "devDependencies": {
     "typescript": "^5.4.5",

@@ -114,6 +114,17 @@ pub enum ZombieType {
     Vampire,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DamageHit {
+    pub source: ZombieType,
+    pub enemy_id: String,
+    pub damage: f64,
+    pub health_after: f64,
+    pub distance: f64,
+    pub time: f64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Player {
@@ -144,6 +155,8 @@ pub struct Player {
     pub damage_level: u32,
     #[serde(rename = "meleeLevel")]
     pub melee_level: u32,
+    #[serde(default)]
+    pub damage_log: Vec<DamageHit>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -310,6 +323,9 @@ pub struct PlayerDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "meleeLevel")]
     pub melee_level: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "damageLog")]
+    pub damage_log: Option<Vec<DamageHit>>,
 }
 
 #[derive(Serialize, Clone, Debug)]

@@ -466,6 +466,7 @@ impl Game {
             tactical_items: [2, 2, 1],
             damage_level: 0,
             melee_level: 0,
+            damage_log: Vec::new(),
         };
         self.players.insert(id.to_string(), player);
     }
@@ -1229,7 +1230,7 @@ impl Game {
         let mut zombie_kill_indices: Vec<usize> = Vec::new();
         let mut bullet_kill_indices: Vec<usize> = Vec::new();
         let mut kill_awards: Vec<(String, f64)> = Vec::new();
-        let mut damage_to_players: Vec<(String, f64)> = Vec::new();
+        let mut damage_to_players: Vec<(String, DamageHit)> = Vec::new();
 
         if !player_positions.is_empty() {
             for zi in (0..self.zombies.len()).rev() {
@@ -1450,7 +1451,14 @@ impl Game {
                                         _ => ZOMBIE_ATTACK_COOLDOWN,
                                     };
                                     *cd = attack_speed;
-                                    damage_to_players.push((target_id.clone(), attack_damage));
+                                    damage_to_players.push((target_id.clone(), DamageHit {
+                                        source: z.zombie_type.clone(),
+                                        enemy_id: z.id.clone(),
+                                        damage: attack_damage,
+                                        health_after: 0.0,
+                                        distance: dist_to_target,
+                                        time: self.game_time,
+                                    }));
 
                                     if z.zombie_type == ZombieType::Vampire {
                                         let z_mut = &mut self.zombies[zi];
@@ -1594,9 +1602,15 @@ impl Game {
         }
 
         // Apply damage to players
-        for (pid, dmg) in &damage_to_players {
-            if let Some(p) = self.players.get_mut(pid) {
-                p.health = (p.health - dmg).max(0.0);
+        for (pid, hit) in damage_to_players {
+            if let Some(p) = self.players.get_mut(&pid) {
+                if p.health <= 0.0 { continue; }
+                p.health = (p.health - hit.damage).max(0.0);
+                let mut hit = hit;
+                hit.health_after = p.health;
+                p.damage_log.retain(|previous| hit.time - previous.time <= 15.0);
+                p.damage_log.push(hit);
+                if p.damage_log.len() > 32 { p.damage_log.remove(0); }
             }
         }
 
@@ -1699,6 +1713,7 @@ impl Game {
                     if entry.1 >= REVIVE_TIME {
                         if let Some(p) = self.players.get_mut(dead_id) {
                             p.health = REVIVE_HEALTH;
+                            p.damage_log.clear();
                         }
                         self.revive_progress.remove(dead_id);
                     }
@@ -1775,5 +1790,47 @@ impl Game {
 
     pub fn is_game_over(&self) -> bool {
         self.game_over
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+
+    #[test]
+    fn brute_death_records_melee_source_and_final_blow() {
+        let mut game = Game::new();
+        game.add_player("test", "Tester");
+        game.players.get_mut("test").unwrap().health = 30.0;
+        let pos = game.players["test"].pos.clone();
+        game.zombies.push(Zombie {
+            id: "test-brute".into(), zombie_type: ZombieType::Brute,
+            pos: Vector2 { x: pos.x + 20.0, y: pos.y },
+            health: 1000.0, max_health: 1000.0, speed: 0.0,
+        });
+        game.update(0.016);
+        let player = &game.players["test"];
+        assert_eq!(player.health, 0.0);
+        let hit = player.damage_log.last().expect("death must have a damage record");
+        assert_eq!(hit.source, ZombieType::Brute);
+        assert_eq!(hit.enemy_id, "test-brute");
+        assert_eq!(hit.damage, 40.0);
+        assert_eq!(hit.health_after, 0.0);
+        assert!(hit.distance < ZOMBIE_ATTACK_RANGE);
+    }
+
+    #[test]
+    fn distant_brutes_cannot_deal_damage() {
+        let mut game = Game::new();
+        game.add_player("test", "Tester");
+        let pos = game.players["test"].pos.clone();
+        game.zombies.push(Zombie {
+            id: "test-brute".into(), zombie_type: ZombieType::Brute,
+            pos: Vector2 { x: pos.x + 200.0, y: pos.y },
+            health: 1000.0, max_health: 1000.0, speed: 0.0,
+        });
+        game.update(0.016);
+        assert_eq!(game.players["test"].health, 100.0);
+        assert!(game.players["test"].damage_log.is_empty());
     }
 }

@@ -81,6 +81,7 @@ impl DeltaTracker {
                     tactical_items: Some(p.tactical_items),
                     damage_level: Some(p.damage_level),
                     melee_level: Some(p.melee_level),
+                    damage_log: Some(p.damage_log.clone()),
                 })
             }).collect();
 
@@ -143,7 +144,7 @@ impl DeltaTracker {
                     name: None, pos: None, angle: None, score: None, credits: None, health: None,
                     max_health: None, ammo: None, max_ammo: None, weapon: None, weapon_slots: None,
                     combo: None, combo_timer: None, max_combo: None, kills: None,
-                    tactical_items: None, damage_level: None, melee_level: None,
+                    tactical_items: None, damage_level: None, melee_level: None, damage_log: None,
                 };
                 let mut changed = false;
 
@@ -158,6 +159,7 @@ impl DeltaTracker {
                     pd.angle = Some((curr.angle * 100.0).round() / 100.0);
                     changed = true;
                 }
+                if curr.damage_log != prev_p.damage_log { pd.damage_log = Some(curr.damage_log.clone()); changed = true; }
                 if curr.health != prev_p.health { pd.health = Some(curr.health); changed = true; }
                 if curr.max_health != prev_p.max_health { pd.max_health = Some(curr.max_health); changed = true; }
                 if curr.score != prev_p.score { pd.score = Some(curr.score); changed = true; }
@@ -202,6 +204,7 @@ impl DeltaTracker {
                     tactical_items: Some(curr.tactical_items),
                     damage_level: Some(curr.damage_level),
                     melee_level: Some(curr.melee_level),
+                    damage_log: Some(curr.damage_log.clone()),
                 });
             }
         }
@@ -225,7 +228,9 @@ impl DeltaTracker {
                 let mut zd = ZombieDelta { id: z.id.clone(), pos: None, health: None };
                 let mut changed = false;
 
-                if (z.pos.x - prev_z.pos.x).abs() > 0.5 || (z.pos.y - prev_z.pos.y).abs() > 0.5 {
+                // Compare wire coordinates: sub-half-pixel movement must still cross
+                // pixel boundaries, even though the baseline is saved every tick.
+                if z.pos.x.round() != prev_z.pos.x.round() || z.pos.y.round() != prev_z.pos.y.round() {
                     zd.pos = Some(Vector2 { x: z.pos.x.round(), y: z.pos.y.round() });
                     changed = true;
                 }
@@ -414,5 +419,36 @@ impl DeltaTracker {
             ammo_availability: ammo_availability.clone(),
             game_over,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_diagonal_brutes_stay_in_sync() {
+        let mut tracker = DeltaTracker::new();
+        let mut zombie = Zombie {
+            id: "brute".into(), zombie_type: ZombieType::Brute,
+            pos: Vector2 { x: 100.0, y: 100.0 }, health: 100.0,
+            max_health: 100.0, speed: 20.0,
+        };
+        let mut client_pos = zombie.pos.clone();
+        for _ in 0..120 {
+            let delta = tracker.compute_delta(
+                &HashMap::new(), &[zombie.clone()], &[], &[], &[],
+                1, 0, 10, 0.0, &HashMap::new(), false,
+            );
+            if let Some(updates) = delta.zombies_updated {
+                for update in updates {
+                    if let Some(pos) = update.pos { client_pos = pos; }
+                }
+            }
+            assert!((client_pos.x - zombie.pos.x).abs() <= 0.51);
+            assert!((client_pos.y - zombie.pos.y).abs() <= 0.51);
+            zombie.pos.x += 0.22;
+            zombie.pos.y += 0.22;
+        }
     }
 }

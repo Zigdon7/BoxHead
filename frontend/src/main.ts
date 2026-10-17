@@ -1324,7 +1324,7 @@ function connectToServer() {
       }
       if (init.gameOver) {
         gameOver = true;
-        wave = init.wave;
+        wave = init.wave ?? 1;
         finalWave = wave;
         finalScore = 0;
         setScreen('gameover');
@@ -1412,6 +1412,7 @@ function applyDelta(delta: DeltaState) {
       const diff = delta.players[id];
       const existing = players[id];
       if (existing) {
+        if (diff.damageLog !== undefined) existing.damageLog = diff.damageLog;
         if (diff.name !== undefined) existing.name = diff.name;
         if (diff.pos) {
           existing.pos = diff.pos;
@@ -3655,12 +3656,55 @@ function drawMobileControls() {
   ctx.fillText('▶▶', weapX, weapY + 9);
 }
 
+const deathRecap = document.createElement('section');
+deathRecap.id = 'deathRecap';
+deathRecap.style.cssText = 'background:rgba(24,12,16,.96);border:1px solid #a94442;border-radius:10px;padding:16px;color:#eee;font:13px monospace;width:min(440px,90vw);box-sizing:border-box;max-height:32vh;overflow:auto;';
+let recapKey = '';
+function updateDeathRecap() {
+  const player = players[myId];
+  const visible = player && player.health <= 0 && (currentScreen === 'playing' || currentScreen === 'gameover');
+  deathRecap.hidden = !visible;
+  if (!visible) { recapKey = ''; return; }
+  const over = currentScreen === 'gameover';
+  const parent = over ? gameOverOverlay.querySelector('.menu-panel')! : document.body;
+  if (deathRecap.parentElement !== parent) {
+    if (over) parent.insertBefore(deathRecap, parent.lastElementChild);
+    else parent.appendChild(deathRecap);
+  }
+  deathRecap.style.width = over ? '100%' : 'min(440px,90vw)';
+  deathRecap.style.position = over ? 'static' : 'fixed';
+  deathRecap.style.left = over ? '' : '50%';
+  deathRecap.style.top = over ? '' : '20px';
+  deathRecap.style.transform = over ? '' : 'translateX(-50%)';
+  deathRecap.style.zIndex = '20';
+  const hits = player.damageLog || [];
+  const key = JSON.stringify(hits);
+  if (key === recapKey) return;
+  recapKey = key;
+  deathRecap.replaceChildren();
+  const title = document.createElement('strong');
+  const last = hits[hits.length - 1];
+  const label = (type: string) => type.charAt(0).toUpperCase() + type.slice(1);
+  title.textContent = last ? `DOWNED BY ${label(last.source).toUpperCase()} — melee` : 'DEATH BREAKDOWN';
+  deathRecap.append(title);
+  const summary = document.createElement('p');
+  summary.textContent = last ? 'Recent hits (up to 15 seconds before death). Distances are server-side pixels.' : 'No damage history recorded for this life.';
+  deathRecap.append(summary);
+  for (const hit of [...hits].reverse()) {
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:5px 0;border-top:1px solid #ffffff20';
+    row.textContent = `${last ? (last.time - hit.time).toFixed(1) : '0.0'}s before · ${label(hit.source)} · ${hit.damage} damage · ${Math.round(hit.distance)}px · ${Math.round(hit.healthAfter)} HP left`;
+    deathRecap.append(row);
+  }
+}
+
 function draw() {
   const now = performance.now();
   const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
   lastFrameTime = now;
 
   drainDeltaQueue();
+  updateDeathRecap();
   predictLocalMovement(dt);
 
   dashActiveTimer = Math.max(0, dashActiveTimer - dt);

@@ -55,6 +55,37 @@
       "type": "string",
       "enum": ["zombie", "devil", "crawler", "brute", "vampire"]
     },
+    "DamageHit": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/ZombieType"
+        },
+        "enemyId": {
+          "type": "string"
+        },
+        "damage": {
+          "type": "number"
+        },
+        "healthAfter": {
+          "type": "number"
+        },
+        "distance": {
+          "type": "number"
+        },
+        "time": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "source",
+        "enemyId",
+        "damage",
+        "healthAfter",
+        "distance",
+        "time"
+      ]
+    },
     "Player": {
       "type": "object",
       "properties": {
@@ -76,7 +107,8 @@
         "kills": { "type": "number" },
         "tacticalItems": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
         "damageLevel": { "type": "number" },
-        "meleeLevel": { "type": "number" }
+        "meleeLevel": { "type": "number" },
+        "damageLog": { "type": "array", "items": { "$ref": "#/$defs/DamageHit" } }
       },
       "required": ["id", "name", "pos", "angle", "score", "credits", "health", "maxHealth", "ammo", "maxAmmo", "weapon", "weaponSlots", "combo", "comboTimer", "maxCombo", "kills", "tacticalItems", "damageLevel", "meleeLevel"]
     },
@@ -207,7 +239,8 @@
         "kills": { "type": "number" },
         "tacticalItems": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
         "damageLevel": { "type": "number" },
-        "meleeLevel": { "type": "number" }
+        "meleeLevel": { "type": "number" },
+        "damageLog": { "type": "array", "items": { "$ref": "#/$defs/DamageHit" } }
       },
       "required": ["id"]
     },
