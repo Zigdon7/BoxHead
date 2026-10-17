@@ -6,3 +6,5 @@ backend/target/
 frontend/node_modules/
 frontend/dist/
 *.db
+frontend/dist-worldmap/
+backend/target-worldmap/

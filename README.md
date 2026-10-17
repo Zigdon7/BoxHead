@@ -42,3 +42,7 @@ A modern multiplayer rebuild of the classic game **BoxHead**, featuring a 60 Hz 
 - **About:** `/about.html` · **Learn to Play:** `/learn.html`. Both are linked from the main menu; the in-game **Field Guide** opens in a new tab without leaving the squad.
 - The illustrated guide covers all five enemy types, weapons, deployables, pickups and armory upgrades, with a wave-based enemy stat preview. Enemy, firearm, pickup and deployable illustrations share rendering code with the game.
 - Reading a guide or opening the armory does not automatically pause the round. Ask the host to pause first if needed.
+
+## Progression World Map (feature branch)
+
+The main/game-over menus now offer an illustrated checkpoint map with ten-wave sectors, clear-based route unlocks and saved per-wave records. Visited waves no longer grant automatic skips. Existing checkpoint access is migrated intact. See [Progression rules and preview setup](docs/PROGRESSION.md).

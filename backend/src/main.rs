@@ -149,7 +149,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let profile_id = profile_id
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let unlocked_wave = state.db.highest_wave(&profile_id);
+    let unlocked_wave = state.db.unlocked_wave(&profile_id);
 
     // Link player to auth identity if they have a valid session
     if let Some(ref token) = auth_token {
@@ -311,11 +311,33 @@ async fn tick(state: &AppState) {
     let ammo_availability: HashMap<String, bool> = ammo_avail_vec.iter()
         .map(|a| (a.id.clone(), a.available)).collect();
     let game_over = game.is_game_over();
+    let wave_clears = game.take_wave_clears();
     drop(game);
 
+    let mut progress_updates = HashMap::new();
     // Persist only when a connected browser reaches a new wave, not every tick.
     {
         let mut profiles = state.wave_profiles.lock().await;
+        // Multiple tabs with the same profile count as one wave clear, not extra runs.
+        let mut awards: HashMap<(String, u32), (f64, u32)> = HashMap::new();
+        for clear in wave_clears {
+            if let Some((profile, _)) = profiles.get(&clear.player_id) {
+                let best = awards.entry((profile.clone(), clear.wave)).or_insert((0.0, 0));
+                best.0 = best.0.max(clear.score);
+                best.1 = best.1.max(clear.kills);
+            }
+        }
+        for ((profile, wave), (score, kills)) in awards {
+            match state.db.record_clear(&profile, wave, score, kills) {
+                Ok(()) => {
+                    let progress = serde_json::json!({ "type": "progress", "progress": state.db.progress(&profile) }).to_string();
+                    for (player_id, (connected_profile, _)) in profiles.iter() {
+                        if *connected_profile == profile { progress_updates.insert(player_id.clone(), progress.clone()); }
+                    }
+                }
+                Err(error) => eprintln!("Could not save wave clear: {}", error),
+            }
+        }
         for (profile, recorded_wave) in profiles.values_mut() {
             if wave > *recorded_wave {
                 state.db.record_wave(profile, wave);
@@ -386,6 +408,7 @@ async fn tick(state: &AppState) {
     // --- Adaptive broadcast: try_send skips slow clients ---
     let clients = state.clients.lock().await;
     for (id, tx) in clients.iter() {
+        if let Some(progress) = progress_updates.get(id) { let _ = tx.send(progress.clone()).await; }
         if room_changed || snapshot_ids.contains(id) {
             // Host/pause changes must not be lost like disposable physics deltas.
             let _ = tx.send(room_status.clone()).await;
@@ -480,7 +503,7 @@ async fn admin_restart(
     let requested = params.get("startingWave").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
     let unlocked = params.get("profileId")
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-        .map(|id| state.db.highest_wave(id)).unwrap_or(1);
+        .map(|id| state.db.unlocked_wave(id)).unwrap_or(1);
     let mut game = state.game.lock().await;
     // The menu's replay control cannot reset somebody else's active round.
     if params.contains_key("profileId") && !game.is_game_over() {
@@ -535,10 +558,9 @@ async fn wave_progress(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let highest = params.get("profileId")
-        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-        .map(|id| state.db.highest_wave(id)).unwrap_or(1);
-    Json(serde_json::json!({ "highestWave": highest }))
+    let profile = params.get("profileId")
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok()).map(String::as_str).unwrap_or("");
+    Json(serde_json::to_value(state.db.progress(profile)).unwrap())
 }
 
 async fn api_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

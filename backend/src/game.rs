@@ -307,11 +307,21 @@ fn award_kill_to_player(p: &mut Player, base_score: f64) {
 
 // ---------- Game ----------
 
+#[derive(Debug)]
+pub struct WaveClear {
+    pub player_id: String,
+    pub wave: u32,
+    pub score: f64,
+    pub kills: u32,
+}
+
 pub struct Game {
     players: HashMap<String, Player>,
     player_names: HashMap<String, String>,
     join_order: Vec<String>,
     paused: bool,
+    wave_entries: HashMap<String, (f64, u32)>,
+    pending_wave_clears: Vec<WaveClear>,
     inputs: HashMap<String, ClientInput>,
     zombies: Vec<Zombie>,
     bullets: Vec<Bullet>,
@@ -368,6 +378,8 @@ impl Game {
             player_names: HashMap::new(),
             join_order: Vec::new(),
             paused: false,
+            wave_entries: HashMap::new(),
+            pending_wave_clears: Vec::new(),
             inputs: HashMap::new(),
             zombies: Vec::new(),
             bullets: Vec::new(),
@@ -448,6 +460,8 @@ impl Game {
         self.revive_progress.clear();
         self.zombie_wall_stuck.clear();
         self.game_time = 0.0;
+        self.wave_entries.clear();
+        self.pending_wave_clears.clear();
         for pickup in &mut self.ammo_pickups {
             pickup.respawn_at = None;
         }
@@ -487,6 +501,10 @@ impl Game {
             melee_level: 0,
             damage_log: Vec::new(),
         };
+        // Join before any wave kills to qualify; mid-wave joins wait for the next wave.
+        if self.wave_kills == 0 && self.wave_break_timer <= 0.0 {
+            self.wave_entries.insert(id.to_string(), (player.score, player.kills));
+        }
         self.players.insert(id.to_string(), player);
     }
 
@@ -497,6 +515,7 @@ impl Game {
         }
         self.join_order.retain(|player| player != id);
         self.players.remove(id);
+        self.wave_entries.remove(id);
         self.player_names.remove(id);
         self.inputs.remove(id);
         self.shoot_cooldowns.remove(id);
@@ -504,6 +523,15 @@ impl Game {
         self.place_cooldowns.remove(id);
         self.upgrade_cooldowns.remove(id);
         self.dash_iframes.remove(id);
+    }
+
+    fn start_wave_tracking(&mut self) {
+        self.wave_entries = self.players.iter().map(|(id, player)|
+            (id.clone(), (player.score, player.kills))).collect();
+    }
+
+    pub fn take_wave_clears(&mut self) -> Vec<WaveClear> {
+        std::mem::take(&mut self.pending_wave_clears)
     }
 
     pub fn host_id(&self) -> Option<&str> { self.join_order.first().map(String::as_str) }
@@ -539,6 +567,7 @@ impl Game {
                 self.wave += 1;
                 self.wave_kills = 0;
                 self.zombie_spawn_timer = 0.2;
+                self.start_wave_tracking();
             }
         }
 
@@ -1690,6 +1719,17 @@ impl Game {
         let target = self.wave_target();
         if self.wave_kills >= target && self.wave_break_timer <= 0.0 {
             self.wave_break_timer = WAVE_BREAK_DURATION;
+            if self.players.values().any(|player| player.health > 0.0) {
+                for (id, (score_at_start, kills_at_start)) in &self.wave_entries {
+                    if let Some(player) = self.players.get(id) {
+                        self.pending_wave_clears.push(WaveClear {
+                            player_id: id.clone(), wave: self.wave,
+                            score: (player.score - score_at_start).max(0.0),
+                            kills: player.kills.saturating_sub(*kills_at_start),
+                        });
+                    }
+                }
+            }
             // Clear remaining zombies on wave completion and grant wave clear bonus
             for z in &self.zombies {
                 if let Some(d) = roll_drop(&z.zombie_type, z.pos.x, z.pos.y, self.game_time) {
@@ -1993,5 +2033,141 @@ mod host_pause_tests {
         game.set_paused("host", true);
         game.add_player("new", "New");
         assert!(game.is_paused()); assert_eq!(game.host_id(), Some("host"));
+    }
+}
+
+#[cfg(test)]
+mod wave_clear_credit_tests {
+    use super::*;
+
+    fn finish_wave(game: &mut Game) {
+        game.wave_kills = game.wave_target();
+        game.update(0.0);
+    }
+
+    #[test]
+    fn only_full_wave_participants_get_clear_credit() {
+        let mut game = Game::new(); game.add_player("host", "Host");
+        game.wave_kills = 1;
+        game.add_player("late", "Late");
+        game.players.get_mut("host").unwrap().score = 120.0;
+        game.players.get_mut("host").unwrap().kills = 3;
+        finish_wave(&mut game);
+        let clears = game.take_wave_clears();
+        assert_eq!(clears.len(), 1);
+        assert_eq!(clears[0].player_id, "host");
+        assert_eq!(clears[0].wave, 1);
+        assert_eq!(clears[0].score, 120.0);
+        assert_eq!(clears[0].kills, 3);
+        game.update(0.0);
+        assert!(game.take_wave_clears().is_empty());
+        game.wave_break_timer = 0.01; game.update(0.02);
+        assert!(game.wave_entries.contains_key("late"));
+        game.players.get_mut("host").unwrap().score += 25.0;
+        finish_wave(&mut game);
+        let clears = game.take_wave_clears();
+        assert_eq!(clears.len(), 2);
+        assert_eq!(clears.iter().find(|clear| clear.player_id == "host").unwrap().score, 25.0);
+    }
+
+    #[test]
+    fn joining_before_first_kill_qualifies_but_leaving_does_not() {
+        let mut game = Game::new();
+        for id in ["host", "squadmate", "leaver"] { game.add_player(id, id); }
+        game.remove_player("leaver"); finish_wave(&mut game);
+        let clears = game.take_wave_clears();
+        assert_eq!(clears.len(), 2);
+        assert!(!clears.iter().any(|clear| clear.player_id == "leaver"));
+    }
+
+    #[test]
+    fn downed_teammates_share_clear_but_a_total_wipe_does_not() {
+        let mut game = Game::new();
+        game.add_player("alive", "Alive"); game.add_player("down", "Down");
+        game.players.get_mut("down").unwrap().health = 0.0;
+        finish_wave(&mut game);
+        assert_eq!(game.take_wave_clears().len(), 2);
+        game.reset();
+        for player in game.players.values_mut() { player.health = 0.0; }
+        finish_wave(&mut game);
+        assert!(game.take_wave_clears().is_empty());
+    }
+
+    #[test]
+    fn restart_clears_pending_awards_and_reinitializes_wave_entries() {
+        let mut game = Game::new(); game.add_player("host", "Host");
+        finish_wave(&mut game);
+        game.reset_at_wave(4, 4);
+        assert!(game.take_wave_clears().is_empty());
+        assert!(game.wave_entries.contains_key("host"));
+        finish_wave(&mut game);
+        assert_eq!(game.take_wave_clears()[0].wave, 4);
+    }
+}
+
+#[cfg(test)]
+mod progression_tick_tests {
+    use super::*;
+
+    fn state(game: Game, profiles: HashMap<String, (String, u32)>) -> crate::AppState {
+        crate::AppState {
+            game: tokio::sync::Mutex::new(game),
+            delta_tracker: tokio::sync::Mutex::new(crate::delta::DeltaTracker::new()),
+            clients: tokio::sync::Mutex::new(HashMap::new()),
+            pending_snapshots: tokio::sync::Mutex::new(HashSet::new()),
+            wave_profiles: tokio::sync::Mutex::new(profiles),
+            last_room_status: tokio::sync::Mutex::new(String::new()),
+            social: tokio::sync::Mutex::new(crate::social::SocialState::new()),
+            db: crate::db::Database::open(":memory:").unwrap(),
+            google_client_id: String::new(), google_client_secret: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn authoritative_clear_persists_and_notifies_only_eligible_profile() {
+        let mut game = Game::new(); game.add_player("host", "Host");
+        game.wave_kills = 1; game.add_player("late", "Late");
+        game.wave_kills = game.wave_target();
+        let state = state(game, HashMap::from([
+            ("host".into(), ("host-browser".into(), 1)),
+            ("late".into(), ("late-browser".into(), 1)),
+        ]));
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::channel(4);
+        let (late_tx, mut late_rx) = tokio::sync::mpsc::channel(4);
+        state.clients.lock().await.extend([("host".into(), host_tx), ("late".into(), late_tx)]);
+        crate::tick(&state).await;
+        assert_eq!(state.db.unlocked_wave("host-browser"), 2);
+        assert_eq!(state.db.unlocked_wave("late-browser"), 1);
+        let mut received_progress = false;
+        while let Ok(message) = host_rx.try_recv() {
+            let data: serde_json::Value = serde_json::from_str(&message).unwrap();
+            if data["type"] == "progress" {
+                assert_eq!(data["progress"]["unlockedWave"], 2); received_progress = true;
+            }
+        }
+        assert!(received_progress);
+        while let Ok(message) = late_rx.try_recv() {
+            let data: serde_json::Value = serde_json::from_str(&message).unwrap();
+            assert_ne!(data["type"], "progress");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_tabs_count_one_clear_per_profile() {
+        let mut game = Game::new(); game.add_player("one", "One"); game.add_player("two", "Two");
+        game.players.get_mut("one").unwrap().score = 100.0;
+        game.players.get_mut("two").unwrap().score = 200.0;
+        game.wave_kills = game.wave_target();
+        let state = state(game, HashMap::from([
+            ("one".into(), ("same-browser".into(), 1)),
+            ("two".into(), ("same-browser".into(), 1)),
+        ]));
+        let (one_tx, _one_rx) = tokio::sync::mpsc::channel(4);
+        let (two_tx, _two_rx) = tokio::sync::mpsc::channel(4);
+        state.clients.lock().await.extend([("one".into(), one_tx), ("two".into(), two_tx)]);
+        crate::tick(&state).await;
+        let progress = state.db.progress("same-browser");
+        assert_eq!(progress.levels[0].clears, 1);
+        assert_eq!(progress.levels[0].best_score, 200.0);
     }
 }

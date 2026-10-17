@@ -1,3 +1,4 @@
+import { WorldMap, EMPTY_PROGRESS, type ProgressData } from './world-map';
 import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite } from './sprites';
 import {
   Player,
@@ -302,41 +303,58 @@ function newWaveProfile(): string {
 }
 const waveProfile = localStorage.getItem('boxhead_wave_profile') || newWaveProfile();
 localStorage.setItem('boxhead_wave_profile', waveProfile);
-let highestWave = Math.max(1, Number(localStorage.getItem('boxhead_highest_wave')) || 1);
+let campaignProgress: ProgressData = { ...EMPTY_PROGRESS, levels: [] };
+let highestUnlockedWave = 1;
 let startingWave = 1;
 const waveSelects = [...document.querySelectorAll<HTMLSelectElement>('[data-wave-select]')];
+const worldMap = new WorldMap(selected => { startingWave = selected; renderWaveOptions(); });
 function renderWaveOptions() {
   for (const select of waveSelects) {
     select.replaceChildren();
-    for (let value = 1; value <= highestWave; value++) {
+    for (let value = 1; value <= highestUnlockedWave; value++) {
       const option = document.createElement('option');
       option.value = String(value);
-      option.textContent = `Wave ${value}${value === highestWave && value > 1 ? ' (highest)' : ''}`;
+      const cleared = campaignProgress.levels.some(level => level.wave === value);
+      option.textContent = `Wave ${value}${cleared ? ' ✓' : value === highestUnlockedWave ? ' (checkpoint)' : ''}`;
       select.append(option);
     }
     select.value = String(startingWave);
   }
   document.querySelectorAll('[data-wave-status]').forEach(el => {
-    el.textContent = `Highest reached: ${highestWave} · Saved for this browser`;
+    el.textContent = `${campaignProgress.levels.length} waves cleared · Highest reached ${campaignProgress.highestWave} · Checkpoint ${highestUnlockedWave}`;
   });
+  worldMap.update(campaignProgress);
+}
+function applyCampaignProgress(progress: ProgressData) {
+  if (!Number.isInteger(progress.unlockedWave) || progress.unlockedWave < 1 || !Array.isArray(progress.levels)) return;
+  const previous = highestUnlockedWave;
+  campaignProgress = progress;
+  highestUnlockedWave = progress.unlockedWave;
+  startingWave = Math.min(startingWave, highestUnlockedWave);
+  renderWaveOptions();
+  if (highestUnlockedWave > previous && currentScreen === 'playing') {
+    pushFeedEvent(`Checkpoint ${highestUnlockedWave} unlocked!`, '#a9e3b7');
+  }
 }
 function rememberWave(reached: number) {
-  if (!Number.isInteger(reached) || reached <= highestWave) return;
-  highestWave = reached;
-  localStorage.setItem('boxhead_highest_wave', String(highestWave));
+  // Visited waves are a statistic, never permission to skip an unfinished route.
+  if (!Number.isInteger(reached) || reached <= campaignProgress.highestWave) return;
+  campaignProgress.highestWave = reached;
   renderWaveOptions();
 }
 for (const select of waveSelects) select.addEventListener('change', () => {
-  startingWave = Math.max(1, Math.min(highestWave, Number(select.value) || 1));
+  startingWave = Math.max(1, Math.min(highestUnlockedWave, Number(select.value) || 1));
   for (const other of waveSelects) other.value = String(startingWave);
 });
 async function refreshWaveProgress() {
   try {
     const response = await fetch(`/api/progress?profileId=${encodeURIComponent(waveProfile)}`);
     if (!response.ok) return;
-    const progress = await response.json();
-    rememberWave(progress.highestWave);
-  } catch { /* Keep the last saved options when offline. */ }
+    applyCampaignProgress(await response.json());
+  } catch { /* Keep the last server-confirmed options when offline. */ }
+}
+for (const button of document.querySelectorAll('[data-open-world-map]')) {
+  button.addEventListener('click', async () => { await refreshWaveProgress(); worldMap.open(startingWave); });
 }
 renderWaveOptions();
 void refreshWaveProgress();
@@ -380,6 +398,7 @@ function setScreen(scr: Screen) {
   renderRoomControls();
   if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); }
   if (scr === 'gameover') {
+    void refreshWaveProgress();
     gameOverWave.textContent = finalWave.toString();
     gameOverScore.textContent = Math.floor(finalScore).toString();
     gameOverKills.textContent = finalKills.toString();
@@ -1393,7 +1412,9 @@ function connectToServer() {
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data) as { type: string };
 
-    if (data.type === 'room') {
+    if (data.type === 'progress') {
+      applyCampaignProgress((data as { type: string; progress: ProgressData }).progress);
+    } else if (data.type === 'room') {
       const room = data as { type: string; hostId: string | null; paused: boolean };
       roomHostId = room.hostId;
       if (serverPaused !== room.paused) {
