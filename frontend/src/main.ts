@@ -291,6 +291,55 @@ function updateAuthDOM() {
   }
 }
 
+// A stable browser profile lets the server persist and enforce wave unlocks.
+function newWaveProfile(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+const waveProfile = localStorage.getItem('boxhead_wave_profile') || newWaveProfile();
+localStorage.setItem('boxhead_wave_profile', waveProfile);
+let highestWave = Math.max(1, Number(localStorage.getItem('boxhead_highest_wave')) || 1);
+let startingWave = 1;
+const waveSelects = [...document.querySelectorAll<HTMLSelectElement>('[data-wave-select]')];
+function renderWaveOptions() {
+  for (const select of waveSelects) {
+    select.replaceChildren();
+    for (let value = 1; value <= highestWave; value++) {
+      const option = document.createElement('option');
+      option.value = String(value);
+      option.textContent = `Wave ${value}${value === highestWave && value > 1 ? ' (highest)' : ''}`;
+      select.append(option);
+    }
+    select.value = String(startingWave);
+  }
+  document.querySelectorAll('[data-wave-status]').forEach(el => {
+    el.textContent = `Highest reached: ${highestWave} · Saved for this browser`;
+  });
+}
+function rememberWave(reached: number) {
+  if (!Number.isInteger(reached) || reached <= highestWave) return;
+  highestWave = reached;
+  localStorage.setItem('boxhead_highest_wave', String(highestWave));
+  renderWaveOptions();
+}
+for (const select of waveSelects) select.addEventListener('change', () => {
+  startingWave = Math.max(1, Math.min(highestWave, Number(select.value) || 1));
+  for (const other of waveSelects) other.value = String(startingWave);
+});
+async function refreshWaveProgress() {
+  try {
+    const response = await fetch(`/api/progress?profileId=${encodeURIComponent(waveProfile)}`);
+    if (!response.ok) return;
+    const progress = await response.json();
+    rememberWave(progress.highestWave);
+  } catch { /* Keep the last saved options when offline. */ }
+}
+renderWaveOptions();
+void refreshWaveProgress();
+
 function setScreen(scr: Screen) {
   currentScreen = scr;
   mainMenuOverlay.classList.toggle('hidden', scr !== 'menu');
@@ -302,7 +351,7 @@ function setScreen(scr: Screen) {
   }
   friendsOverlay.classList.toggle('hidden', true);
   document.getElementById('gameSettingsBtn')?.classList.toggle('hidden', scr !== 'playing');
-  if (scr === 'menu') updateAuthDOM();
+  if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); }
   if (scr === 'gameover') {
     gameOverWave.textContent = finalWave.toString();
     gameOverScore.textContent = Math.floor(finalScore).toString();
@@ -627,7 +676,10 @@ playBtn.addEventListener('click', () => {
 });
 playAgainBtn.addEventListener('click', async () => {
   try {
-    await fetch('/admin/restart', { method: 'POST' });
+    const params = new URLSearchParams({ profileId: waveProfile, startingWave: String(startingWave) });
+    const response = await fetch(`/admin/restart?${params}`, { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok || !result.ok) return;
   } catch { /* ignore */ }
   if (ws) { ws.close(); ws = null; }
   connectToServer();
@@ -1306,7 +1358,7 @@ function connectToServer() {
   ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined }));
+    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined, profileId: waveProfile, startingWave }));
   };
 
   ws.onmessage = (event) => {
@@ -1359,6 +1411,7 @@ function connectToServer() {
         }
       }
       wave = snap.wave;
+      rememberWave(wave);
       waveKills = snap.waveKills ?? 0;
       waveTarget = snap.waveTarget ?? wave * 12;
       waveBreakTimer = snap.waveBreakTimer ?? 0;
@@ -1393,7 +1446,9 @@ function connectToServer() {
     }
   };
 
+  const connection = ws;
   ws.onclose = () => {
+    if (ws !== connection) return;
     if (inputInterval) { clearInterval(inputInterval); inputInterval = null; }
     if (currentScreen === 'playing') {
       toggleArmory(false);
@@ -1672,6 +1727,7 @@ function applyDelta(delta: DeltaState) {
       pushFeedEvent(`Wave ${delta.wave} Started!`, '#ff5252');
     }
     wave = delta.wave;
+    rememberWave(wave);
   }
   if (delta.waveKills !== undefined) waveKills = delta.waveKills;
   if (delta.waveTarget !== undefined) waveTarget = delta.waveTarget;

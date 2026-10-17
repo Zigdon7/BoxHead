@@ -407,6 +407,18 @@ impl Game {
         self.wave_break_timer
     }
 
+    /// Only an empty room can select a new round; late joiners keep its wave.
+    pub fn start_empty_round(&mut self, requested: u32, unlocked: u32) -> bool {
+        if !self.players.is_empty() { return false; }
+        self.reset_at_wave(requested, unlocked);
+        true
+    }
+
+    pub fn reset_at_wave(&mut self, requested: u32, unlocked: u32) {
+        self.reset();
+        self.wave = requested.max(1).min(unlocked.max(1));
+    }
+
     /// Reset the game world but keep connected players (respawn them).
     pub fn reset(&mut self) {
         self.zombies.clear();
@@ -1832,5 +1844,50 @@ mod damage_tests {
         game.update(0.016);
         assert_eq!(game.players["test"].health, 100.0);
         assert!(game.players["test"].damage_log.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod starting_wave_tests {
+    use super::*;
+
+    #[test]
+    fn empty_round_starts_at_selected_unlocked_wave() {
+        let mut game = Game::new();
+        assert!(game.start_empty_round(7, 9));
+        assert_eq!(game.wave(), 7);
+        assert_eq!(game.wave_target(), 84);
+        assert_eq!(game.wave_kills(), 0);
+        assert!(!game.is_game_over());
+    }
+
+    #[test]
+    fn requested_wave_cannot_exceed_record_or_go_below_one() {
+        let mut game = Game::new();
+        game.start_empty_round(100, 4);
+        assert_eq!(game.wave(), 4);
+        game.start_empty_round(0, 4);
+        assert_eq!(game.wave(), 1);
+    }
+
+    #[test]
+    fn joining_player_cannot_change_an_active_round() {
+        let mut game = Game::new();
+        game.start_empty_round(5, 5);
+        game.add_player("host", "Host");
+        assert!(!game.start_empty_round(20, 20));
+        assert_eq!(game.wave(), 5);
+        assert_eq!(game.players()["host"].health, 100.0);
+    }
+
+    #[test]
+    fn replay_at_selected_wave_respawns_players_and_clears_recap() {
+        let mut game = Game::new();
+        game.add_player("host", "Host");
+        game.players.get_mut("host").unwrap().health = 0.0;
+        game.reset_at_wave(8, 8);
+        assert_eq!(game.wave(), 8);
+        assert_eq!(game.players()["host"].health, 100.0);
+        assert!(game.players()["host"].damage_log.is_empty());
     }
 }

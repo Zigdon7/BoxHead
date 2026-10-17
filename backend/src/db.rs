@@ -22,6 +22,11 @@ impl Database {
             .map_err(|e| format!("Failed to open database: {}", e))?;
 
         conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS wave_progress (
+                profile_id TEXT PRIMARY KEY,
+                highest_wave INTEGER NOT NULL DEFAULT 1
+            );
+
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -59,6 +64,21 @@ impl Database {
         ").map_err(|e| format!("Failed to create schema: {}", e))?;
 
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    pub fn highest_wave(&self, profile_id: &str) -> u32 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT highest_wave FROM wave_progress WHERE profile_id = ?1",
+            params![profile_id], |row| row.get(0)).unwrap_or(1)
+    }
+
+    pub fn record_wave(&self, profile_id: &str, wave: u32) {
+        let conn = self.conn.lock().unwrap();
+        if let Err(error) = conn.execute(
+            "INSERT INTO wave_progress (profile_id, highest_wave) VALUES (?1, ?2)
+             ON CONFLICT(profile_id) DO UPDATE SET highest_wave = MAX(highest_wave, excluded.highest_wave)",
+            params![profile_id, wave],
+        ) { eprintln!("Could not save wave progress: {}", error); }
     }
 
     /// Find existing user by provider+provider_id, or create a new one.
@@ -277,5 +297,35 @@ impl Database {
     pub fn delete_expired_sessions(&self) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM sessions WHERE expires_at <= datetime('now')", []);
+    }
+}
+
+#[cfg(test)]
+mod wave_progress_tests {
+    use super::*;
+
+    #[test]
+    fn wave_unlocks_are_monotonic_and_profile_specific() {
+        let db = Database::open(":memory:").unwrap();
+        assert_eq!(db.highest_wave("new-browser"), 1);
+        db.record_wave("first", 8);
+        db.record_wave("first", 3);
+        db.record_wave("second", 4);
+        assert_eq!(db.highest_wave("first"), 8);
+        assert_eq!(db.highest_wave("second"), 4);
+    }
+
+    #[test]
+    fn wave_unlocks_survive_database_reopen() {
+        let path = std::env::temp_dir().join(format!("boxhead-progress-test-{}.db", uuid::Uuid::new_v4()));
+        {
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            db.record_wave("browser", 6);
+        }
+        {
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            assert_eq!(db.highest_wave("browser"), 6);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

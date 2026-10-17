@@ -40,7 +40,7 @@
       background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 18px;
       padding: 36px; box-shadow: 0 20px 50px rgba(0,0,0,0.7), 0 0 30px rgba(229, 57, 53, 0.12), inset 0 1px 1px rgba(255,255,255,0.08);
       display: flex; flex-direction: column; align-items: center; gap: 20px;
-      width: 92%; max-width: 440px;
+      width: 92%; max-width: 440px; max-height: calc(100dvh - 24px); overflow-y: auto;
       animation: floatUp 0.5s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
@@ -401,6 +401,13 @@
         <input id="nameInput" type="text" maxlength="16" placeholder="Enter callsign..." />
       </div>
 
+      <div class="input-group" style="width:100%">
+        <label>Starting Wave <select data-wave-select aria-label="Starting wave" style="margin-left:10px;background:#241a1c;color:#fff;border:1px solid #654;padding:8px;border-radius:6px"><option value="1">Wave 1</option></select></label>
+        <small data-wave-status style="display:block;margin-top:8px;color:#aaa">Highest reached: 1 · Saved for this browser</small>
+      </div>
+
+      <small style="color:#aaa">New rounds only. Joining a squad keeps its current wave.</small>
+
       <!-- Logged Out Auth Box -->
       <div id="authSectionOut" class="auth-box">
         <p class="title">Account Sync (Optional)</p>
@@ -496,6 +503,10 @@
         </div>
       </div>
 
+      <div class="input-group" style="width:100%">
+        <label>Starting Wave <select data-wave-select aria-label="Starting wave" style="margin-left:10px;background:#241a1c;color:#fff;border:1px solid #654;padding:8px;border-radius:6px"><option value="1">Wave 1</option></select></label>
+        <small data-wave-status style="display:block;margin-top:8px;color:#aaa">Highest reached: 1 · Saved for this browser</small>
+      </div>
       <div style="display:flex; flex-direction:column; gap:10px; width:100%;">
         <button id="playAgainBtn" class="btn btn-play">PLAY AGAIN</button>
         <button id="backToMenuBtn" class="btn btn-dark">Back to Menu</button>

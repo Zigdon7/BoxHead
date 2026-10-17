@@ -404,4 +404,8 @@ pub struct ClientMessage {
     pub input: Option<ClientInput>,
     pub name: Option<String>,
     pub token: Option<String>,
+    #[serde(rename = "profileId")]
+    pub profile_id: Option<String>,
+    #[serde(rename = "startingWave")]
+    pub starting_wave: Option<u32>,
 }

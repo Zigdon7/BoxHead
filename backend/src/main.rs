@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use axum::{
     Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State,
+    extract::{State, Query},
     response::{IntoResponse, Html},
     routing::{get, post},
     Json,
@@ -38,6 +38,7 @@ struct AppState {
     delta_tracker: Mutex<DeltaTracker>,
     clients: Mutex<HashMap<String, ClientSender>>,
     pending_snapshots: Mutex<HashSet<String>>,
+    wave_profiles: Mutex<HashMap<String, (String, u32)>>,
     social: Mutex<SocialState>,
     db: Database,
     google_client_id: String,
@@ -57,6 +58,7 @@ async fn main() {
         delta_tracker: Mutex::new(DeltaTracker::new()),
         clients: Mutex::new(HashMap::new()),
         pending_snapshots: Mutex::new(HashSet::new()),
+        wave_profiles: Mutex::new(HashMap::new()),
         social: Mutex::new(SocialState::new()),
         db,
         google_client_id,
@@ -97,6 +99,7 @@ async fn main() {
         .route("/api/auth/google/callback", get(google_callback))
         .route("/api/auth/me", get(auth_me))
         .route("/api/config", get(api_config))
+        .route("/api/progress", get(wave_progress))
         .route("/api/friends", get(friends_list))
         .route("/api/friends/add", post(friends_add))
         .route("/api/friends/remove", post(friends_remove))
@@ -123,7 +126,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Wait for join message with player name and optional auth token
-    let (player_name, auth_token) = loop {
+    let (player_name, auth_token, profile_id, starting_wave) = loop {
         match ws_receiver.next().await {
             Some(Ok(Message::Text(text))) => {
                 let text_str: &str = &text;
@@ -132,7 +135,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         let name = msg.name.unwrap_or_default();
                         let name = name.trim().chars().take(16).collect::<String>();
                         let name = if name.is_empty() { format!("Player_{}", &player_id[..4]) } else { name };
-                        break (name, msg.token);
+                        break (name, msg.token, msg.profile_id, msg.starting_wave.unwrap_or(1));
                     }
                 }
             }
@@ -140,6 +143,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             _ => return,
         }
     };
+
+    let profile_id = profile_id
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let unlocked_wave = state.db.highest_wave(&profile_id);
 
     // Link player to auth identity if they have a valid session
     if let Some(ref token) = auth_token {
@@ -152,13 +160,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Bounded channel — drops deltas for slow clients instead of buffering
     let (tx, mut rx) = mpsc::channel::<String>(CLIENT_CHANNEL_CAPACITY);
 
-    // Add player to game (if game is over and no one else is connected, auto-reset!)
+    // The first player chooses the new round; late joiners keep its current wave.
     let joined_game;
     {
-        let clients_empty = state.clients.lock().await.is_empty();
         let mut game = state.game.lock().await;
-        if game.is_game_over() && clients_empty {
-            game.reset();
+        if game.start_empty_round(starting_wave, unlocked_wave) {
             let mut dt = state.delta_tracker.lock().await;
             *dt = DeltaTracker::new();
         }
@@ -167,6 +173,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
         if !game_over {
             game.add_player(&player_id, &player_name);
+            state.db.record_wave(&profile_id, wave);
+            state.wave_profiles.lock().await.insert(player_id.clone(), (profile_id.clone(), wave));
             joined_game = true;
         } else {
             joined_game = false;
@@ -244,6 +252,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Cleanup
+    state.wave_profiles.lock().await.remove(&pid_cleanup);
     {
         let mut game = state.game.lock().await;
         game.remove_player(&pid_cleanup);
@@ -293,6 +302,17 @@ async fn tick(state: &AppState) {
         .map(|a| (a.id.clone(), a.available)).collect();
     let game_over = game.is_game_over();
     drop(game);
+
+    // Persist only when a connected browser reaches a new wave, not every tick.
+    {
+        let mut profiles = state.wave_profiles.lock().await;
+        for (profile, recorded_wave) in profiles.values_mut() {
+            if wave > *recorded_wave {
+                state.db.record_wave(profile, wave);
+                *recorded_wave = wave;
+            }
+        }
+    }
 
     // --- Delta computation ---
     let mut dt = state.delta_tracker.lock().await;
@@ -428,9 +448,20 @@ setInterval(refreshStatus, 2000);
 </body></html>"#)
 }
 
-async fn admin_restart(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn admin_restart(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let requested = params.get("startingWave").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+    let unlocked = params.get("profileId")
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .map(|id| state.db.highest_wave(id)).unwrap_or(1);
     let mut game = state.game.lock().await;
-    game.reset();
+    // The menu's replay control cannot reset somebody else's active round.
+    if params.contains_key("profileId") && !game.is_game_over() {
+        return Json(serde_json::json!({ "ok": false, "error": "Round is still active" }));
+    }
+    game.reset_at_wave(requested, unlocked);
     drop(game);
 
     let mut dt = state.delta_tracker.lock().await;
@@ -470,6 +501,16 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 }
 
 // --- Config API ---
+
+async fn wave_progress(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let highest = params.get("profileId")
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .map(|id| state.db.highest_wave(id)).unwrap_or(1);
+    Json(serde_json::json!({ "highestWave": highest }))
+}
 
 async fn api_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
