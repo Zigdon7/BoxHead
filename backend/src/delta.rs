@@ -5,8 +5,12 @@ struct PrevState {
     players: HashMap<String, Player>,
     zombie_map: HashMap<String, Zombie>,
     bullet_set: HashSet<String>,
+    placeable_map: HashMap<String, Placeable>,
     drop_set: HashSet<String>,
     wave: u32,
+    wave_kills: u32,
+    wave_target: u32,
+    wave_break_timer: f64,
     ammo_availability: HashMap<String, bool>,
     game_over: bool,
 }
@@ -25,20 +29,37 @@ impl DeltaTracker {
         self.tick
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_delta(
         &mut self,
         players: &HashMap<String, Player>,
         zombies: &[Zombie],
         bullets: &[Bullet],
+        placeables: &[Placeable],
         drops: &[DropPickup],
         wave: u32,
+        wave_kills: u32,
+        wave_target: u32,
+        wave_break_timer: f64,
         ammo_availability: &HashMap<String, bool>,
         game_over: bool,
     ) -> DeltaState {
         self.tick += 1;
 
         if self.prev.is_none() {
-            self.save_state(players, zombies, bullets, drops, wave, ammo_availability, game_over);
+            self.save_state(
+                players,
+                zombies,
+                bullets,
+                placeables,
+                drops,
+                wave,
+                wave_kills,
+                wave_target,
+                wave_break_timer,
+                ammo_availability,
+                game_over,
+            );
             let player_deltas: HashMap<String, PlayerDelta> = players.iter().map(|(id, p)| {
                 (id.clone(), PlayerDelta {
                     id: p.id.clone(),
@@ -46,11 +67,20 @@ impl DeltaTracker {
                     pos: Some(p.pos.clone()),
                     angle: Some(p.angle),
                     score: Some(p.score),
+                    credits: Some(p.credits),
                     health: Some(p.health),
+                    max_health: Some(p.max_health),
                     ammo: Some(p.ammo),
                     max_ammo: Some(p.max_ammo),
                     weapon: Some(p.weapon.clone()),
                     weapon_slots: Some(p.weapon_slots),
+                    combo: Some(p.combo),
+                    combo_timer: Some(p.combo_timer),
+                    max_combo: Some(p.max_combo),
+                    kills: Some(p.kills),
+                    tactical_items: Some(p.tactical_items),
+                    damage_level: Some(p.damage_level),
+                    melee_level: Some(p.melee_level),
                 })
             }).collect();
 
@@ -64,9 +94,15 @@ impl DeltaTracker {
                 zombies_removed: None,
                 bullets_new: Some(bullets.to_vec()),
                 bullets_removed: None,
+                placeables_new: if placeables.is_empty() { None } else { Some(placeables.to_vec()) },
+                placeables_updated: None,
+                placeables_removed: None,
                 drops_new: if drops.is_empty() { None } else { Some(drops.to_vec()) },
                 drops_removed: None,
                 wave: Some(wave),
+                wave_kills: Some(wave_kills),
+                wave_target: Some(wave_target),
+                wave_break_timer: Some(wave_break_timer),
                 ammo_pickups: None,
                 game_over: Some(game_over),
             };
@@ -83,9 +119,15 @@ impl DeltaTracker {
             zombies_removed: None,
             bullets_new: None,
             bullets_removed: None,
+            placeables_new: None,
+            placeables_updated: None,
+            placeables_removed: None,
             drops_new: None,
             drops_removed: None,
             wave: None,
+            wave_kills: None,
+            wave_target: None,
+            wave_break_timer: None,
             ammo_pickups: None,
             game_over: None,
         };
@@ -98,8 +140,10 @@ impl DeltaTracker {
             if let Some(prev_p) = prev.players.get(id) {
                 let mut pd = PlayerDelta {
                     id: id.clone(),
-                    name: None, pos: None, angle: None, score: None, health: None,
-                    ammo: None, max_ammo: None, weapon: None, weapon_slots: None,
+                    name: None, pos: None, angle: None, score: None, credits: None, health: None,
+                    max_health: None, ammo: None, max_ammo: None, weapon: None, weapon_slots: None,
+                    combo: None, combo_timer: None, max_combo: None, kills: None,
+                    tactical_items: None, damage_level: None, melee_level: None,
                 };
                 let mut changed = false;
 
@@ -115,10 +159,23 @@ impl DeltaTracker {
                     changed = true;
                 }
                 if curr.health != prev_p.health { pd.health = Some(curr.health); changed = true; }
+                if curr.max_health != prev_p.max_health { pd.max_health = Some(curr.max_health); changed = true; }
                 if curr.score != prev_p.score { pd.score = Some(curr.score); changed = true; }
+                if curr.credits != prev_p.credits { pd.credits = Some(curr.credits); changed = true; }
                 if curr.ammo != prev_p.ammo { pd.ammo = Some(curr.ammo); changed = true; }
+                if curr.max_ammo != prev_p.max_ammo { pd.max_ammo = Some(curr.max_ammo); changed = true; }
                 if curr.weapon != prev_p.weapon { pd.weapon = Some(curr.weapon.clone()); changed = true; }
                 if curr.weapon_slots != prev_p.weapon_slots { pd.weapon_slots = Some(curr.weapon_slots); changed = true; }
+                if curr.combo != prev_p.combo { pd.combo = Some(curr.combo); changed = true; }
+                if (curr.combo_timer - prev_p.combo_timer).abs() > 0.05 {
+                    pd.combo_timer = Some((curr.combo_timer * 10.0).round() / 10.0);
+                    changed = true;
+                }
+                if curr.max_combo != prev_p.max_combo { pd.max_combo = Some(curr.max_combo); changed = true; }
+                if curr.kills != prev_p.kills { pd.kills = Some(curr.kills); changed = true; }
+                if curr.tactical_items != prev_p.tactical_items { pd.tactical_items = Some(curr.tactical_items); changed = true; }
+                if curr.damage_level != prev_p.damage_level { pd.damage_level = Some(curr.damage_level); changed = true; }
+                if curr.melee_level != prev_p.melee_level { pd.melee_level = Some(curr.melee_level); changed = true; }
 
                 if changed {
                     player_changes.insert(id.clone(), pd);
@@ -131,11 +188,20 @@ impl DeltaTracker {
                     pos: Some(curr.pos.clone()),
                     angle: Some(curr.angle),
                     score: Some(curr.score),
+                    credits: Some(curr.credits),
                     health: Some(curr.health),
+                    max_health: Some(curr.max_health),
                     ammo: Some(curr.ammo),
                     max_ammo: Some(curr.max_ammo),
                     weapon: Some(curr.weapon.clone()),
                     weapon_slots: Some(curr.weapon_slots),
+                    combo: Some(curr.combo),
+                    combo_timer: Some(curr.combo_timer),
+                    max_combo: Some(curr.max_combo),
+                    kills: Some(curr.kills),
+                    tactical_items: Some(curr.tactical_items),
+                    damage_level: Some(curr.damage_level),
+                    melee_level: Some(curr.melee_level),
                 });
             }
         }
@@ -196,6 +262,34 @@ impl DeltaTracker {
         if !bullets_new.is_empty() { delta.bullets_new = Some(bullets_new); }
         if !bullets_removed.is_empty() { delta.bullets_removed = Some(bullets_removed); }
 
+        // Placeables
+        let mut placeables_new: Vec<Placeable> = Vec::new();
+        let mut placeables_updated: Vec<PlaceableDelta> = Vec::new();
+        let mut placeables_removed: Vec<String> = Vec::new();
+        let mut curr_placeable_ids: HashSet<String> = HashSet::new();
+
+        for p in placeables {
+            curr_placeable_ids.insert(p.id.clone());
+            if let Some(prev_pl) = prev.placeable_map.get(&p.id) {
+                if p.health != prev_pl.health {
+                    placeables_updated.push(PlaceableDelta {
+                        id: p.id.clone(),
+                        health: Some(p.health),
+                    });
+                }
+            } else {
+                placeables_new.push(p.clone());
+            }
+        }
+        for id in prev.placeable_map.keys() {
+            if !curr_placeable_ids.contains(id) {
+                placeables_removed.push(id.clone());
+            }
+        }
+        if !placeables_new.is_empty() { delta.placeables_new = Some(placeables_new); }
+        if !placeables_updated.is_empty() { delta.placeables_updated = Some(placeables_updated); }
+        if !placeables_removed.is_empty() { delta.placeables_removed = Some(placeables_removed); }
+
         // Drops
         let curr_drop_ids: HashSet<String> = drops.iter().map(|d| d.id.clone()).collect();
         let mut drops_new: Vec<DropPickup> = Vec::new();
@@ -214,8 +308,13 @@ impl DeltaTracker {
         if !drops_new.is_empty() { delta.drops_new = Some(drops_new); }
         if !drops_removed.is_empty() { delta.drops_removed = Some(drops_removed); }
 
-        // Wave
+        // Wave & progress
         if wave != prev.wave { delta.wave = Some(wave); }
+        if wave_kills != prev.wave_kills { delta.wave_kills = Some(wave_kills); }
+        if wave_target != prev.wave_target { delta.wave_target = Some(wave_target); }
+        if (wave_break_timer - prev.wave_break_timer).abs() > 0.05 {
+            delta.wave_break_timer = Some((wave_break_timer * 10.0).round() / 10.0);
+        }
 
         // Ammo
         let mut ammo_changes: Vec<AmmoPickupState> = Vec::new();
@@ -229,17 +328,34 @@ impl DeltaTracker {
         // Game over
         if game_over != prev.game_over { delta.game_over = Some(game_over); }
 
-        self.save_state(players, zombies, bullets, drops, wave, ammo_availability, game_over);
+        self.save_state(
+            players,
+            zombies,
+            bullets,
+            placeables,
+            drops,
+            wave,
+            wave_kills,
+            wave_target,
+            wave_break_timer,
+            ammo_availability,
+            game_over,
+        );
         delta
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_snapshot(
         &self,
         players: &HashMap<String, Player>,
         zombies: &[Zombie],
         bullets: &[Bullet],
+        placeables: &[Placeable],
         drops: &[DropPickup],
         wave: u32,
+        wave_kills: u32,
+        wave_target: u32,
+        wave_break_timer: f64,
         ammo_availability: &HashMap<String, bool>,
         game_over: bool,
     ) -> SnapshotState {
@@ -249,7 +365,11 @@ impl DeltaTracker {
             players: players.clone(),
             zombies: zombies.to_vec(),
             bullets: bullets.to_vec(),
+            placeables: placeables.to_vec(),
             wave,
+            wave_kills,
+            wave_target,
+            wave_break_timer: (wave_break_timer * 10.0).round() / 10.0,
             ammo_pickups: ammo_availability.iter().map(|(id, avail)| {
                 AmmoPickupState { id: id.clone(), available: *avail }
             }).collect(),
@@ -258,13 +378,18 @@ impl DeltaTracker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_state(
         &mut self,
         players: &HashMap<String, Player>,
         zombies: &[Zombie],
         bullets: &[Bullet],
+        placeables: &[Placeable],
         drops: &[DropPickup],
         wave: u32,
+        wave_kills: u32,
+        wave_target: u32,
+        wave_break_timer: f64,
         ammo_availability: &HashMap<String, bool>,
         game_over: bool,
     ) {
@@ -272,12 +397,20 @@ impl DeltaTracker {
         for z in zombies {
             zombie_map.insert(z.id.clone(), z.clone());
         }
+        let mut placeable_map = HashMap::new();
+        for p in placeables {
+            placeable_map.insert(p.id.clone(), p.clone());
+        }
         self.prev = Some(PrevState {
             players: players.clone(),
             zombie_map,
             bullet_set: bullets.iter().map(|b| b.id.clone()).collect(),
+            placeable_map,
             drop_set: drops.iter().map(|d| d.id.clone()).collect(),
             wave,
+            wave_kills,
+            wave_target,
+            wave_break_timer,
             ammo_availability: ammo_availability.clone(),
             game_over,
         });

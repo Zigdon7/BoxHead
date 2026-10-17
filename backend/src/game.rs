@@ -10,9 +10,6 @@ use crate::types::*;
 
 // ---------- Spatial-grid helper structs ----------
 
-/// Wall entry inserted into multiple grid cells. Carries its insertion
-/// position (`cell_x`, `cell_y`) separately from its actual rect so that
-/// `SpatialGrid::insert` places it in the correct cell.
 #[derive(Clone, Debug)]
 struct WallEntry {
     x: f64,
@@ -66,6 +63,17 @@ struct AmmoPickupInternal {
     respawn_at: Option<f64>,
 }
 
+// ---------- Explosion event ----------
+
+#[derive(Clone, Debug)]
+struct ExplosionEvent {
+    x: f64,
+    y: f64,
+    radius: f64,
+    damage: f64,
+    owner_id: String,
+}
+
 // ---------- Collision helpers ----------
 
 const WALL_GRID_CELL_SIZE: f64 = 200.0;
@@ -99,7 +107,6 @@ fn resolve_circle_rect(
         let ny = dy / dist;
         (px + nx * overlap, py + ny * overlap)
     } else if dist == 0.0 {
-        // Center is inside the rect - push out along minimum overlap axis
         let left = px - rx;
         let right = (rx + rw) - px;
         let top = py - ry;
@@ -128,7 +135,6 @@ fn resolve_wall_collisions(
     let query_radius = radius + WALL_GRID_CELL_SIZE;
     let nearby = wall_grid.query(px, py, query_radius);
 
-    // Dedup walls by their rect (same wall may appear in multiple cells)
     let mut seen = HashSet::new();
     let mut walls: Vec<&WallEntry> = Vec::new();
     for w in &nearby {
@@ -212,7 +218,7 @@ fn zombie_score(zombie_type: &ZombieType) -> f64 {
         ZombieType::Brute => 75.0,
         ZombieType::Devil => 50.0,
         ZombieType::Crawler => 25.0,
-        ZombieType::Zombie => 10.0,
+        ZombieType::Zombie => 15.0,
     }
 }
 
@@ -232,25 +238,71 @@ fn roll_drop(zombie_type: &ZombieType, x: f64, y: f64, game_time: f64) -> Option
     let mut rng = rand::rng();
     let roll: f64 = rng.random();
 
-    let (ammo_chance, health_chance, weapon_chance) = match zombie_type {
-        ZombieType::Zombie => (0.20, 0.05, 0.02),
-        ZombieType::Devil => (0.30, 0.10, 0.05),
-        ZombieType::Crawler => (0.15, 0.05, 0.03),
-        ZombieType::Brute => (0.40, 0.15, 0.10),
-        ZombieType::Vampire => (0.25, 0.20, 0.08),
+    let (ammo_chance, health_chance, weapon_chance, tactical_chance) = match zombie_type {
+        ZombieType::Zombie => (0.18, 0.05, 0.02, 0.05),
+        ZombieType::Devil => (0.25, 0.10, 0.05, 0.08),
+        ZombieType::Crawler => (0.15, 0.05, 0.03, 0.05),
+        ZombieType::Brute => (0.35, 0.15, 0.12, 0.15),
+        ZombieType::Vampire => (0.25, 0.18, 0.08, 0.12),
     };
 
-    let drop_type = if roll < ammo_chance { Some(DropType::Ammo) }
-        else if roll < ammo_chance + health_chance { Some(DropType::Health) }
-        else if roll < ammo_chance + health_chance + weapon_chance { Some(DropType::Weapon) }
-        else { None };
+    let drop_type = if roll < ammo_chance {
+        Some(DropType::Ammo)
+    } else if roll < ammo_chance + health_chance {
+        Some(DropType::Health)
+    } else if roll < ammo_chance + health_chance + weapon_chance {
+        Some(DropType::Weapon)
+    } else if roll < ammo_chance + health_chance + weapon_chance + tactical_chance {
+        Some(DropType::Tactical)
+    } else {
+        None
+    };
 
     drop_type.map(|dt| DropInternal {
         id: uuid::Uuid::new_v4().to_string(),
         drop_type: dt,
-        x, y,
+        x,
+        y,
         despawn_at: game_time + DROP_DESPAWN_TIME,
     })
+}
+
+fn award_kill_to_player(p: &mut Player, base_score: f64) {
+    p.kills += 1;
+    p.combo += 1;
+    p.combo_timer = COMBO_DURATION;
+    if p.combo > p.max_combo {
+        p.max_combo = p.combo;
+    }
+
+    let mult = (1.0 + (p.combo.saturating_sub(1) as f64) * 0.2).min(5.0);
+    p.score += (base_score * mult).round();
+    p.credits += (base_score * 0.85 * mult).round().max(12.0);
+
+    // Combo milestone rewards
+    if p.combo % 5 == 0 {
+        p.ammo = (p.ammo + 15.0).min(p.max_ammo);
+        p.tactical_items[0] = (p.tactical_items[0] + 1).min(99);
+        p.credits += 35.0;
+    }
+    if p.combo % 10 == 0 {
+        p.tactical_items[2] = (p.tactical_items[2] + 1).min(99);
+        p.health = (p.health + 15.0).min(p.max_health);
+        p.credits += 60.0;
+        // Unlock next locked weapon if any
+        for slot in 1..4 {
+            if !p.weapon_slots[slot] {
+                p.weapon_slots[slot] = true;
+                break;
+            }
+        }
+    }
+    if p.combo % 15 == 0 {
+        p.tactical_items[1] = (p.tactical_items[1] + 2).min(99);
+        p.max_ammo += 10.0;
+        p.ammo = (p.ammo + 10.0).min(p.max_ammo);
+        p.credits += 100.0;
+    }
 }
 
 // ---------- Game ----------
@@ -261,13 +313,17 @@ pub struct Game {
     inputs: HashMap<String, ClientInput>,
     zombies: Vec<Zombie>,
     bullets: Vec<Bullet>,
+    placeables: Vec<Placeable>,
     drops: Vec<DropInternal>,
     wave: u32,
     game_over: bool,
     zombie_spawn_timer: f64,
     wave_kills: u32,
+    wave_break_timer: f64,
     shoot_cooldowns: HashMap<String, f64>,
     melee_cooldowns: HashMap<String, f64>,
+    place_cooldowns: HashMap<String, f64>,
+    upgrade_cooldowns: HashMap<String, f64>,
     zombie_attack_cooldowns: HashMap<String, f64>,
     bullet_lifetimes: HashMap<String, f64>,
     game_time: f64,
@@ -276,10 +332,11 @@ pub struct Game {
     wall_grid: SpatialGrid<WallEntry>,
     zombie_grid: SpatialGrid<ZombieRef>,
     player_grid: SpatialGrid<PlayerRef>,
-    // Dash state per player: charges and active burst timer
+    // Dash state per player: charges, recharge, active burst timer, and i-frames
     dash_charges: HashMap<String, i32>,
-    dash_recharge: HashMap<String, f64>, // time until next charge restored
+    dash_recharge: HashMap<String, f64>,
     dash_active: HashMap<String, f64>,
+    dash_iframes: HashMap<String, f64>,
     // Revive: dead_player_id -> (reviver_id, progress_seconds)
     revive_progress: HashMap<String, (String, f64)>,
     // Zombie wall-stuck tracking: zombie_id -> (stuck_timer, steer_angle)
@@ -310,13 +367,17 @@ impl Game {
             inputs: HashMap::new(),
             zombies: Vec::new(),
             bullets: Vec::new(),
+            placeables: Vec::new(),
             drops: Vec::new(),
             wave: 1,
             game_over: false,
             zombie_spawn_timer: 0.0,
             wave_kills: 0,
+            wave_break_timer: 0.0,
             shoot_cooldowns: HashMap::new(),
             melee_cooldowns: HashMap::new(),
+            place_cooldowns: HashMap::new(),
+            upgrade_cooldowns: HashMap::new(),
             zombie_attack_cooldowns: HashMap::new(),
             bullet_lifetimes: HashMap::new(),
             game_time: 0.0,
@@ -328,27 +389,45 @@ impl Game {
             dash_charges: HashMap::new(),
             dash_recharge: HashMap::new(),
             dash_active: HashMap::new(),
+            dash_iframes: HashMap::new(),
             revive_progress: HashMap::new(),
             zombie_wall_stuck: HashMap::new(),
         }
+    }
+
+    pub fn wave_target(&self) -> u32 {
+        self.wave * 12
+    }
+
+    pub fn wave_kills(&self) -> u32 {
+        self.wave_kills
+    }
+
+    pub fn wave_break_timer(&self) -> f64 {
+        self.wave_break_timer
     }
 
     /// Reset the game world but keep connected players (respawn them).
     pub fn reset(&mut self) {
         self.zombies.clear();
         self.bullets.clear();
+        self.placeables.clear();
         self.drops.clear();
         self.wave = 1;
         self.game_over = false;
         self.zombie_spawn_timer = 0.0;
         self.wave_kills = 0;
+        self.wave_break_timer = 0.0;
         self.shoot_cooldowns.clear();
         self.melee_cooldowns.clear();
+        self.place_cooldowns.clear();
+        self.upgrade_cooldowns.clear();
         self.zombie_attack_cooldowns.clear();
         self.bullet_lifetimes.clear();
         self.dash_charges.clear();
         self.dash_recharge.clear();
         self.dash_active.clear();
+        self.dash_iframes.clear();
         self.revive_progress.clear();
         self.zombie_wall_stuck.clear();
         self.game_time = 0.0;
@@ -373,11 +452,20 @@ impl Game {
             pos: Vector2 { x: MAP_WIDTH / 2.0, y: MAP_HEIGHT / 2.0 },
             angle: 0.0,
             score: 0.0,
+            credits: 100.0,
             health: 100.0,
-            ammo: 30.0,
-            max_ammo: 30.0,
+            max_health: 100.0,
+            ammo: 40.0,
+            max_ammo: 40.0,
             weapon: Weapon::Pistol,
             weapon_slots: [true, false, false, false],
+            combo: 0,
+            combo_timer: 0.0,
+            max_combo: 0,
+            kills: 0,
+            tactical_items: [2, 2, 1],
+            damage_level: 0,
+            melee_level: 0,
         };
         self.players.insert(id.to_string(), player);
     }
@@ -388,6 +476,9 @@ impl Game {
         self.inputs.remove(id);
         self.shoot_cooldowns.remove(id);
         self.melee_cooldowns.remove(id);
+        self.place_cooldowns.remove(id);
+        self.upgrade_cooldowns.remove(id);
+        self.dash_iframes.remove(id);
     }
 
     pub fn handle_input(&mut self, id: &str, input: ClientInput) {
@@ -401,6 +492,17 @@ impl Game {
 
         self.game_time += dt;
 
+        // Wave break countdown
+        let in_wave_break = self.wave_break_timer > 0.0;
+        if in_wave_break {
+            self.wave_break_timer = (self.wave_break_timer - dt).max(0.0);
+            if self.wave_break_timer <= 0.0 {
+                self.wave += 1;
+                self.wave_kills = 0;
+                self.zombie_spawn_timer = 0.2;
+            }
+        }
+
         // Rebuild player grid
         self.player_grid.clear();
         for (id, p) in &self.players {
@@ -413,6 +515,18 @@ impl Game {
             }
         }
 
+        // Rebuild zombie grid before player combat actions
+        self.zombie_grid.clear();
+        for (i, z) in self.zombies.iter().enumerate() {
+            self.zombie_grid.insert(ZombieRef {
+                index: i,
+                x: z.pos.x,
+                y: z.pos.y,
+            });
+        }
+
+        let mut explosions: Vec<ExplosionEvent> = Vec::new();
+
         // Update players
         let player_ids: Vec<String> = self.players.keys().cloned().collect();
 
@@ -421,19 +535,33 @@ impl Game {
                 continue;
             }
 
+            // Update player combo timer (freeze combo decay during wave break!)
+            if !in_wave_break {
+                if let Some(p) = self.players.get_mut(pid) {
+                    if p.combo > 0 {
+                        p.combo_timer = (p.combo_timer - dt).max(0.0);
+                        if p.combo_timer <= 0.0 {
+                            p.combo = 0;
+                        }
+                    }
+                }
+            }
+
             let input = match self.inputs.get(pid) {
                 Some(i) => i.clone(),
                 None => continue,
             };
 
-            // Dash logic — charge-based (max 3)
+            // Dash logic — charge-based (max 3) with i-frames and shockwave
+            let mut just_dashed = false;
             {
                 let charges = self.dash_charges.entry(pid.clone()).or_insert(DASH_MAX_CHARGES);
                 let recharge = self.dash_recharge.entry(pid.clone()).or_insert(0.0);
                 let active = self.dash_active.entry(pid.clone()).or_insert(0.0);
+                let iframes = self.dash_iframes.entry(pid.clone()).or_insert(0.0);
                 *active = (*active - dt).max(0.0);
+                *iframes = (*iframes - dt).max(0.0);
 
-                // Recharge one charge over time
                 if *charges < DASH_MAX_CHARGES {
                     *recharge -= dt;
                     if *recharge <= 0.0 {
@@ -448,11 +576,27 @@ impl Game {
 
                 if input.dash && *charges > 0 && *active <= 0.0 {
                     *active = DASH_DURATION;
+                    *iframes = DASH_DURATION + DASH_IFRAME_GRACE;
                     *charges -= 1;
-                    if *charges < DASH_MAX_CHARGES {
-                        // Start recharge timer if not already running
-                        if *recharge <= 0.0 {
-                            *recharge = DASH_RECHARGE_TIME;
+                    just_dashed = true;
+                    if *charges < DASH_MAX_CHARGES && *recharge <= 0.0 {
+                        *recharge = DASH_RECHARGE_TIME;
+                    }
+                }
+            }
+
+            // Dash shockwave pushes back nearby zombies
+            if just_dashed {
+                if let Some(p) = self.players.get(pid) {
+                    let px = p.pos.x;
+                    let py = p.pos.y;
+                    for z in &mut self.zombies {
+                        let dx = z.pos.x - px;
+                        let dy = z.pos.y - py;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        if dist > 0.0 && dist < 55.0 {
+                            z.pos.x = (z.pos.x + (dx / dist) * 35.0).max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
+                            z.pos.y = (z.pos.y + (dy / dist) * 35.0).max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
                         }
                     }
                 }
@@ -482,12 +626,19 @@ impl Game {
                 dy /= len;
             }
 
-            let speed = if is_dashing { PLAYER_SPEED * DASH_SPEED_MULT } else { PLAYER_SPEED };
+            let has_overdrive = self.players.get(pid).map_or(false, |p| p.combo >= 10);
+            let base_speed = if has_overdrive { PLAYER_SPEED * 1.15 } else { PLAYER_SPEED };
+            let speed = if is_dashing { base_speed * DASH_SPEED_MULT } else { base_speed };
 
             {
                 let p = self.players.get_mut(pid).unwrap();
                 p.pos.x += dx * speed * dt;
                 p.pos.y += dy * speed * dt;
+
+                // Try wrapping through tunnels first
+                let (wx, wy) = wrap_position(p.pos.x, p.pos.y, PLAYER_RADIUS);
+                p.pos.x = wx;
+                p.pos.y = wy;
 
                 p.pos.x = p.pos.x.max(PLAYER_RADIUS).min(MAP_WIDTH - PLAYER_RADIUS);
                 p.pos.y = p.pos.y.max(PLAYER_RADIUS).min(MAP_HEIGHT - PLAYER_RADIUS);
@@ -512,23 +663,177 @@ impl Game {
             // Decrement cooldowns
             *self.shoot_cooldowns.entry(pid.clone()).or_insert(0.0) -= dt;
             *self.melee_cooldowns.entry(pid.clone()).or_insert(0.0) -= dt;
+            *self.place_cooldowns.entry(pid.clone()).or_insert(0.0) -= dt;
+            *self.upgrade_cooldowns.entry(pid.clone()).or_insert(0.0) -= dt;
 
-            // Melee attack
+            // Tactical item placement (1 = Barrel, 2 = Barricade, 3 = Claymore Mine)
+            let place_cd = *self.place_cooldowns.get(pid).unwrap_or(&0.0);
+            if input.place_item >= 1 && input.place_item <= 3 && place_cd <= 0.0 {
+                let item_idx = (input.place_item - 1) as usize;
+                let can_place = self.players.get(pid).map_or(false, |p| p.tactical_items[item_idx] > 0);
+                if can_place {
+                    self.place_cooldowns.insert(pid.clone(), 0.35);
+                    let p = self.players.get_mut(pid).unwrap();
+                    p.tactical_items[item_idx] -= 1;
+
+                    let (item_type, hp, offset, radius) = match item_idx {
+                        0 => (PlaceableType::Barrel, BARREL_HP, 42.0, BARREL_RADIUS),
+                        1 => (PlaceableType::Barricade, BARRICADE_HP, 42.0, BARRICADE_RADIUS),
+                        _ => (PlaceableType::Mine, MINE_HP, 28.0, MINE_RADIUS),
+                    };
+
+                    let mut ix = (p.pos.x + p.angle.cos() * offset).max(radius).min(MAP_WIDTH - radius);
+                    let mut iy = (p.pos.y + p.angle.sin() * offset).max(radius).min(MAP_HEIGHT - radius);
+                    let (nx, ny) = resolve_wall_collisions(ix, iy, radius, &self.wall_grid);
+                    ix = nx;
+                    iy = ny;
+
+                    self.placeables.push(Placeable {
+                        id: Uuid::new_v4().to_string(),
+                        item_type,
+                        pos: Vector2 { x: ix, y: iy },
+                        health: hp,
+                        max_health: hp,
+                        owner_id: pid.clone(),
+                    });
+                }
+            }
+
+            // Armory / Shop Upgrades (spends credits, never reduces score!)
+            // 1 = Firearm Power, 2 = Nano-Armor, 3 = Expanded Mag, 4 = Tactical Pack, 5 = Melee Blade, 6 = Unlock Weapon
+            let upg_cd = *self.upgrade_cooldowns.get(pid).unwrap_or(&0.0);
+            if input.buy_upgrade >= 1 && input.buy_upgrade <= 6 && upg_cd <= 0.0 {
+                if let Some(p) = self.players.get_mut(pid) {
+                    let bought = match input.buy_upgrade {
+                        1 => {
+                            let cost = 200.0 + (p.damage_level as f64) * 150.0;
+                            if p.credits >= cost && p.damage_level < 10 {
+                                p.credits -= cost;
+                                p.damage_level += 1;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        2 => {
+                            let cost = 150.0;
+                            if p.credits >= cost {
+                                p.credits -= cost;
+                                p.max_health = (p.max_health + 25.0).min(350.0);
+                                p.health = (p.health + 60.0).min(p.max_health);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        3 => {
+                            let cost = 125.0;
+                            if p.credits >= cost {
+                                p.credits -= cost;
+                                p.max_ammo = (p.max_ammo + 25.0).min(300.0);
+                                p.ammo = p.max_ammo;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        4 => {
+                            let cost = 140.0;
+                            if p.credits >= cost {
+                                p.credits -= cost;
+                                p.tactical_items[0] = (p.tactical_items[0] + 2).min(99);
+                                p.tactical_items[1] = (p.tactical_items[1] + 2).min(99);
+                                p.tactical_items[2] = (p.tactical_items[2] + 2).min(99);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        5 => {
+                            let cost = 150.0 + (p.melee_level as f64) * 125.0;
+                            if p.credits >= cost && p.melee_level < 10 {
+                                p.credits -= cost;
+                                p.melee_level += 1;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        6 => {
+                            let cost = 250.0;
+                            let next_locked = (1..4).find(|&s| !p.weapon_slots[s]);
+                            if let Some(slot) = next_locked {
+                                if p.credits >= cost {
+                                    p.credits -= cost;
+                                    p.weapon_slots[slot] = true;
+                                    if let Some(w) = Weapon::from_slot(slot) {
+                                        p.weapon = w;
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if bought {
+                        self.upgrade_cooldowns.insert(pid.clone(), 0.25);
+                    }
+                }
+            }
+
+            // Melee attack (Katana / Tactical Blade Cleave)
             let melee_cd = *self.melee_cooldowns.get(pid).unwrap();
             if input.melee && melee_cd <= 0.0 {
-                self.melee_cooldowns.insert(pid.clone(), MELEE_COOLDOWN);
-
                 let p = self.players.get(pid).unwrap();
+                let cd_mult = if p.combo >= 10 { 0.78 } else { 1.0 };
+                self.melee_cooldowns.insert(pid.clone(), MELEE_COOLDOWN * cd_mult);
+
                 let px = p.pos.x;
                 let py = p.pos.y;
                 let p_angle = p.angle;
+                let melee_lvl = p.melee_level as f64;
+                let effective_range = MELEE_RANGE * (1.0 + melee_lvl * 0.10);
+                let melee_dmg_mult = (1.0 + melee_lvl * 0.35) * (1.0 + (p.damage_level as f64) * 0.15);
+                let crit_chance = (CRIT_BASE_CHANCE + (p.damage_level as f64) * 0.04 + melee_lvl * 0.03).min(0.70);
 
-                let nearby = self.zombie_grid.query(px, py, MELEE_RANGE);
+                // Melee can also trigger barrels
+                for pl in &mut self.placeables {
+                    if pl.item_type == PlaceableType::Barrel {
+                        let bdx = pl.pos.x - px;
+                        let bdy = pl.pos.y - py;
+                        let dist = (bdx * bdx + bdy * bdy).sqrt();
+                        if dist <= effective_range + BARREL_RADIUS {
+                            let angle_to_b = bdy.atan2(bdx);
+                            let mut angle_diff = (angle_to_b - p_angle).abs();
+                            if angle_diff > PI {
+                                angle_diff = 2.0 * PI - angle_diff;
+                            }
+                            if angle_diff <= MELEE_ARC / 2.0 {
+                                pl.health = 0.0;
+                                explosions.push(ExplosionEvent {
+                                    x: pl.pos.x,
+                                    y: pl.pos.y,
+                                    radius: BARREL_EXPLOSION_RADIUS,
+                                    damage: BARREL_DAMAGE,
+                                    owner_id: pid.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let nearby = self.zombie_grid.query(px, py, effective_range);
                 let mut indices: Vec<usize> = nearby.iter().map(|zr| zr.index).collect();
                 indices.sort_unstable();
                 indices.dedup();
 
+                let mut rng = rand::rng();
                 let mut kills = 0u32;
+                let lifesteal_per_kill = 5.0 + melee_lvl * 3.0;
                 for &zi in &indices {
                     if zi >= self.zombies.len() {
                         continue;
@@ -537,7 +842,7 @@ impl Game {
                     let zdx = z.pos.x - px;
                     let zdy = z.pos.y - py;
                     let dist = (zdx * zdx + zdy * zdy).sqrt();
-                    if dist > MELEE_RANGE {
+                    if dist > effective_range {
                         continue;
                     }
 
@@ -550,13 +855,15 @@ impl Game {
                         continue;
                     }
 
-                    self.zombies[zi].health -= MELEE_DAMAGE;
+                    let is_crit = rng.random::<f64>() < crit_chance;
+                    let final_dmg = MELEE_DAMAGE * melee_dmg_mult * if is_crit { CRIT_DAMAGE_MULT } else { 1.0 };
+                    self.zombies[zi].health -= final_dmg;
 
                     if dist > 0.0 {
                         let knx = zdx / dist;
                         let kny = zdy / dist;
-                        self.zombies[zi].pos.x += knx * 30.0;
-                        self.zombies[zi].pos.y += kny * 30.0;
+                        self.zombies[zi].pos.x = (self.zombies[zi].pos.x + knx * 48.0).max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
+                        self.zombies[zi].pos.y = (self.zombies[zi].pos.y + kny * 48.0).max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
                     }
 
                     if self.zombies[zi].health <= 0.0 {
@@ -565,7 +872,8 @@ impl Game {
                             self.drops.push(d);
                         }
                         if let Some(p) = self.players.get_mut(pid) {
-                            p.score += score;
+                            award_kill_to_player(p, score);
+                            p.health = (p.health + lifesteal_per_kill).min(p.max_health);
                         }
                         kills += 1;
                     }
@@ -582,17 +890,22 @@ impl Game {
                 let is_pistol = p.weapon == Weapon::Pistol;
                 if is_pistol || p.ammo > 0.0 {
                     let weapon = p.weapon.clone();
-                    self.shoot_cooldowns.insert(pid.clone(), weapon.cooldown());
+                    let cd_mult = if p.combo >= 10 { 0.75 } else { 1.0 };
+                    self.shoot_cooldowns.insert(pid.clone(), weapon.cooldown() * cd_mult);
 
                     let angle = p.angle;
                     let px = p.pos.x;
                     let py = p.pos.y;
-                    let damage = weapon.damage();
+                    let dmg_mult = 1.0 + (p.damage_level as f64) * 0.20;
+                    let crit_chance = (CRIT_BASE_CHANCE + (p.damage_level as f64) * 0.04).min(0.60);
+                    let base_damage = weapon.damage() * dmg_mult;
                     let owner_id = pid.clone();
 
                     if !is_pistol {
                         self.players.get_mut(pid).unwrap().ammo -= 1.0;
                     }
+
+                    let mut rng = rand::rng();
 
                     match weapon {
                         Weapon::Shotgun => {
@@ -600,6 +913,8 @@ impl Game {
                             for i in 0..5 {
                                 let a = angle - spread * 2.0 + spread * i as f64;
                                 let bid = Uuid::new_v4().to_string();
+                                let is_crit = rng.random::<f64>() < crit_chance;
+                                let pellet_dmg = (base_damage / 5.0) * if is_crit { CRIT_DAMAGE_MULT } else { 1.0 };
                                 self.bullet_lifetimes.insert(bid.clone(), BULLET_LIFETIME);
                                 self.bullets.push(Bullet {
                                     id: bid,
@@ -612,12 +927,16 @@ impl Game {
                                         y: a.sin() * BULLET_SPEED,
                                     },
                                     owner_id: owner_id.clone(),
-                                    damage: damage / 5.0,
+                                    damage: (pellet_dmg * 10.0).round() / 10.0,
+                                    is_crit,
+                                    is_rocket: false,
                                 });
                             }
                         }
                         Weapon::RocketLauncher => {
                             let bid = Uuid::new_v4().to_string();
+                            let is_crit = rng.random::<f64>() < crit_chance;
+                            let r_dmg = base_damage * if is_crit { CRIT_DAMAGE_MULT } else { 1.0 };
                             self.bullet_lifetimes.insert(bid.clone(), BULLET_LIFETIME);
                             self.bullets.push(Bullet {
                                 id: bid,
@@ -630,11 +949,15 @@ impl Game {
                                     y: angle.sin() * ROCKET_SPEED,
                                 },
                                 owner_id,
-                                damage: ROCKET_DAMAGE,
+                                damage: r_dmg.round(),
+                                is_crit,
+                                is_rocket: true,
                             });
                         }
                         _ => {
                             let bid = Uuid::new_v4().to_string();
+                            let is_crit = rng.random::<f64>() < crit_chance;
+                            let b_dmg = base_damage * if is_crit { CRIT_DAMAGE_MULT } else { 1.0 };
                             self.bullet_lifetimes.insert(bid.clone(), BULLET_LIFETIME);
                             self.bullets.push(Bullet {
                                 id: bid,
@@ -647,7 +970,9 @@ impl Game {
                                     y: angle.sin() * BULLET_SPEED,
                                 },
                                 owner_id,
-                                damage,
+                                damage: (b_dmg * 10.0).round() / 10.0,
+                                is_crit,
+                                is_rocket: false,
                             });
                         }
                     }
@@ -673,21 +998,26 @@ impl Game {
             let mut rng = rand::rng();
             let mut drops_to_remove = Vec::new();
             for (di, drop) in self.drops.iter().enumerate() {
-                if drop.despawn_at <= self.game_time { continue; } // already expired
+                if drop.despawn_at <= self.game_time { continue; }
                 let dist = f64::hypot(p.pos.x - drop.x, p.pos.y - drop.y);
                 if dist < PLAYER_RADIUS + DROP_PICKUP_RADIUS {
                     match drop.drop_type {
                         DropType::Ammo => { p.ammo = (p.ammo + DROP_AMMO_AMOUNT).min(p.max_ammo); }
-                        DropType::Health => { p.health = (p.health + DROP_HEALTH_AMOUNT).min(100.0); }
+                        DropType::Health => { p.health = (p.health + DROP_HEALTH_AMOUNT).min(p.max_health); }
                         DropType::Weapon => {
-                            // Unlock a random locked weapon slot
                             let locked: Vec<usize> = (1..4).filter(|&s| !p.weapon_slots[s]).collect();
                             if locked.is_empty() {
-                                p.ammo = (p.ammo + DROP_AMMO_AMOUNT).min(p.max_ammo); // fallback to ammo
+                                p.ammo = (p.ammo + DROP_AMMO_AMOUNT).min(p.max_ammo);
+                                p.score += 50.0;
+                                p.credits += 60.0;
                             } else {
                                 let idx = locked[rng.random_range(0..locked.len())];
                                 p.weapon_slots[idx] = true;
                             }
+                        }
+                        DropType::Tactical => {
+                            let idx = rng.random_range(0..3);
+                            p.tactical_items[idx] = (p.tactical_items[idx] + 1).min(99);
                         }
                     }
                     drops_to_remove.push(di);
@@ -707,134 +1037,185 @@ impl Game {
             }
         }
 
-        // Update bullet positions
+        // Update bullet positions + wrap through tunnels
         for bullet in &mut self.bullets {
             bullet.pos.x += bullet.vel.x * dt;
             bullet.pos.y += bullet.vel.y * dt;
+            let (bwx, bwy) = wrap_position(bullet.pos.x, bullet.pos.y, BULLET_RADIUS);
+            bullet.pos.x = bwx;
+            bullet.pos.y = bwy;
         }
 
-        // Filter bullets (OOB / lifetime / wall) — rockets explode on wall hit
+        // Filter bullets (OOB / lifetime / wall / barrel hit)
         {
-            let mut rocket_explosions: Vec<(f64, f64)> = Vec::new();
             let wall_grid = &self.wall_grid;
             let lifetimes = &mut self.bullet_lifetimes;
+            let placeables = &mut self.placeables;
             self.bullets.retain(|b| {
                 if let Some(lt) = lifetimes.get_mut(&b.id) {
                     *lt -= dt;
                     if *lt <= 0.0 {
                         lifetimes.remove(&b.id);
-                        if b.damage >= 100.0 {
-                            rocket_explosions.push((b.pos.x, b.pos.y));
+                        if b.is_rocket {
+                            explosions.push(ExplosionEvent {
+                                x: b.pos.x,
+                                y: b.pos.y,
+                                radius: ROCKET_EXPLOSION_RADIUS,
+                                damage: b.damage,
+                                owner_id: b.owner_id.clone(),
+                            });
                         }
                         return false;
                     }
                 }
-                if b.pos.x < 0.0
-                    || b.pos.x > MAP_WIDTH
-                    || b.pos.y < 0.0
-                    || b.pos.y > MAP_HEIGHT
+                if b.pos.x < -BULLET_RADIUS
+                    || b.pos.x > MAP_WIDTH + BULLET_RADIUS
+                    || b.pos.y < -BULLET_RADIUS
+                    || b.pos.y > MAP_HEIGHT + BULLET_RADIUS
                 {
                     lifetimes.remove(&b.id);
-                    if b.damage >= 100.0 {
-                        rocket_explosions.push((b.pos.x, b.pos.y));
+                    if b.is_rocket {
+                        explosions.push(ExplosionEvent {
+                            x: b.pos.x,
+                            y: b.pos.y,
+                            radius: ROCKET_EXPLOSION_RADIUS,
+                            damage: b.damage,
+                            owner_id: b.owner_id.clone(),
+                        });
                     }
                     return false;
                 }
                 if bullet_hits_wall(b.pos.x, b.pos.y, wall_grid) {
                     lifetimes.remove(&b.id);
-                    if b.damage >= 100.0 {
-                        rocket_explosions.push((b.pos.x, b.pos.y));
+                    if b.is_rocket {
+                        explosions.push(ExplosionEvent {
+                            x: b.pos.x,
+                            y: b.pos.y,
+                            radius: ROCKET_EXPLOSION_RADIUS,
+                            damage: b.damage,
+                            owner_id: b.owner_id.clone(),
+                        });
                     }
                     return false;
                 }
+                // Check if bullet hits an explosive barrel
+                for pl in placeables.iter_mut() {
+                    if pl.item_type == PlaceableType::Barrel && pl.health > 0.0 {
+                        let dist = f64::hypot(b.pos.x - pl.pos.x, b.pos.y - pl.pos.y);
+                        if dist < BARREL_RADIUS + BULLET_RADIUS {
+                            pl.health -= b.damage;
+                            lifetimes.remove(&b.id);
+                            if b.is_rocket {
+                                explosions.push(ExplosionEvent {
+                                    x: b.pos.x,
+                                    y: b.pos.y,
+                                    radius: ROCKET_EXPLOSION_RADIUS,
+                                    damage: b.damage,
+                                    owner_id: b.owner_id.clone(),
+                                });
+                            }
+                            if pl.health <= 0.0 {
+                                explosions.push(ExplosionEvent {
+                                    x: pl.pos.x,
+                                    y: pl.pos.y,
+                                    radius: BARREL_EXPLOSION_RADIUS,
+                                    damage: BARREL_DAMAGE,
+                                    owner_id: b.owner_id.clone(),
+                                });
+                            }
+                            return false;
+                        }
+                    }
+                }
                 true
             });
+        }
 
-            // Apply rocket AoE damage from wall/OOB explosions
-            for (ex, ey) in &rocket_explosions {
-                for z in &mut self.zombies {
-                    let dist = f64::hypot(z.pos.x - ex, z.pos.y - ey);
-                    if dist < ROCKET_EXPLOSION_RADIUS {
-                        z.health -= ROCKET_DAMAGE;
-                    }
+        // Spawn zombies (only when not in wave break)
+        if !in_wave_break {
+            self.zombie_spawn_timer -= dt;
+            if self.zombie_spawn_timer <= 0.0 {
+                self.zombie_spawn_timer = 0.55 / (1.0 + (self.wave as f64 - 1.0) * 0.18);
+
+                let living_players = self
+                    .players
+                    .values()
+                    .filter(|p| p.health > 0.0)
+                    .count() as i32;
+
+                let max_zombies = (MAX_ZOMBIES_BASE + MAX_ZOMBIES_PER_PLAYER * living_players)
+                    .min(MAX_ZOMBIES_HARD_CAP) as usize;
+
+                if self.zombies.len() < max_zombies && living_players > 0 {
+                    let mut rng = rand::rng();
+                    let zones = spawn_zones();
+                    let idx = rng.random_range(0..zones.len());
+                    let (sx, sy) = zones[idx];
+
+                    let r: f64 = rng.random();
+                    let wave = self.wave;
+
+                    let (zombie_type, hp, speed) = if wave >= 5 && r < 0.07 {
+                        (
+                            ZombieType::Vampire,
+                            80.0 + wave as f64 * 15.0,
+                            64.0 + (wave as f64 * 2.4).min(34.0),
+                        )
+                    } else if wave >= 4 && r < 0.16 {
+                        (
+                            ZombieType::Brute,
+                            150.0 + wave as f64 * 30.0,
+                            24.0 + (wave as f64 * 1.4).min(20.0),
+                        )
+                    } else if wave >= 3 && r < 0.30 {
+                        (
+                            ZombieType::Crawler,
+                            10.0 + wave as f64 * 5.0,
+                            78.0 + (wave as f64 * 2.6).min(36.0),
+                        )
+                    } else if wave >= 2 && r < 0.42 {
+                        (
+                            ZombieType::Devil,
+                            50.0 + wave as f64 * 20.0,
+                            54.0 + (wave as f64 * 2.4).min(34.0),
+                        )
+                    } else {
+                        (
+                            ZombieType::Zombie,
+                            20.0 + wave as f64 * 10.0,
+                            38.0 + (wave as f64 * 2.2).min(30.0),
+                        )
+                    };
+
+                    self.zombies.push(Zombie {
+                        id: Uuid::new_v4().to_string(),
+                        zombie_type,
+                        pos: Vector2 { x: sx, y: sy },
+                        health: hp,
+                        max_health: hp,
+                        speed,
+                    });
                 }
             }
         }
 
-        // Spawn zombies
-        self.zombie_spawn_timer -= dt;
-        if self.zombie_spawn_timer <= 0.0 {
-            self.zombie_spawn_timer = 0.5 / (1.0 + (self.wave as f64 - 1.0) * 0.2);
-
-            let living_players = self
-                .players
-                .values()
-                .filter(|p| p.health > 0.0)
-                .count() as i32;
-
-            let max_zombies = (MAX_ZOMBIES_BASE + MAX_ZOMBIES_PER_PLAYER * living_players)
-                .min(MAX_ZOMBIES_HARD_CAP) as usize;
-
-            if self.zombies.len() < max_zombies && living_players > 0 {
-                let mut rng = rand::rng();
-                let zones = spawn_zones();
-                let idx = rng.random_range(0..zones.len());
-                let (sx, sy) = zones[idx];
-
-                let r: f64 = rng.random();
-                let wave = self.wave;
-
-                let (zombie_type, hp, speed) = if wave >= 5 && r < 0.05 {
-                    (
-                        ZombieType::Vampire,
-                        80.0 + wave as f64 * 15.0,
-                        90.0 + wave as f64 * 5.0,
-                    )
-                } else if wave >= 4 && r < 0.15 {
-                    (
-                        ZombieType::Brute,
-                        150.0 + wave as f64 * 30.0,
-                        30.0 + wave as f64 * 2.0,
-                    )
-                } else if wave >= 3 && r < 0.30 {
-                    (
-                        ZombieType::Crawler,
-                        10.0 + wave as f64 * 5.0,
-                        120.0 + wave as f64 * 5.0,
-                    )
-                } else if wave >= 2 && r < 0.40 {
-                    (
-                        ZombieType::Devil,
-                        50.0 + wave as f64 * 20.0,
-                        80.0 + wave as f64 * 5.0,
-                    )
-                } else {
-                    (
-                        ZombieType::Zombie,
-                        20.0 + wave as f64 * 10.0,
-                        50.0 + wave as f64 * 5.0,
-                    )
-                };
-
-                self.zombies.push(Zombie {
-                    id: Uuid::new_v4().to_string(),
-                    zombie_type,
-                    pos: Vector2 { x: sx, y: sy },
-                    health: hp,
-                    max_health: hp,
-                    speed,
+        // Check Claymore Mine proximity triggers against zombies
+        for pl in &mut self.placeables {
+            if pl.item_type == PlaceableType::Mine && pl.health > 0.0 {
+                let triggered = self.zombies.iter().any(|z| {
+                    z.health > 0.0 && f64::hypot(z.pos.x - pl.pos.x, z.pos.y - pl.pos.y) < MINE_TRIGGER_RADIUS
                 });
+                if triggered {
+                    pl.health = 0.0;
+                    explosions.push(ExplosionEvent {
+                        x: pl.pos.x,
+                        y: pl.pos.y,
+                        radius: MINE_EXPLOSION_RADIUS,
+                        damage: MINE_DAMAGE,
+                        owner_id: pl.owner_id.clone(),
+                    });
+                }
             }
-        }
-
-        // Rebuild zombie grid
-        self.zombie_grid.clear();
-        for (i, z) in self.zombies.iter().enumerate() {
-            self.zombie_grid.insert(ZombieRef {
-                index: i,
-                x: z.pos.x,
-                y: z.pos.y,
-            });
         }
 
         // Update zombies
@@ -845,19 +1226,19 @@ impl Game {
             .map(|p| (p.id.clone(), p.pos.x, p.pos.y))
             .collect();
 
-        if !player_positions.is_empty() {
-            let mut zombie_kill_indices: Vec<usize> = Vec::new();
-            let mut bullet_kill_indices: Vec<usize> = Vec::new();
-            let mut score_awards: Vec<(String, f64)> = Vec::new();
-            let mut damage_to_players: Vec<(String, f64)> = Vec::new();
+        let mut zombie_kill_indices: Vec<usize> = Vec::new();
+        let mut bullet_kill_indices: Vec<usize> = Vec::new();
+        let mut kill_awards: Vec<(String, f64)> = Vec::new();
+        let mut damage_to_players: Vec<(String, f64)> = Vec::new();
 
+        if !player_positions.is_empty() {
             for zi in (0..self.zombies.len()).rev() {
                 let z = &self.zombies[zi];
                 let zx = z.pos.x;
                 let zy = z.pos.y;
                 let z_speed = z.speed;
 
-                // Find nearest player (spatial query first, then fallback)
+                // Find nearest player
                 let mut nearest_id: Option<String> = None;
                 let mut nearest_dist = f64::MAX;
 
@@ -900,12 +1281,10 @@ impl Game {
                         let z_type = z.zombie_type.clone();
                         let zid_hash = z.id.as_bytes().iter().fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
 
-                        // Per-type movement AI
                         let (mut move_dx, mut move_dy) = (tdx / tdist, tdy / tdist);
 
                         match z_type {
                             ZombieType::Crawler => {
-                                // Skitter: zigzag toward player
                                 let phase = (self.game_time * 8.0 + zid_hash as f64 * 0.1).sin() * 0.7;
                                 let perp_x = -move_dy;
                                 let perp_y = move_dx;
@@ -915,18 +1294,15 @@ impl Game {
                                 if len > 0.0 { move_dx /= len; move_dy /= len; }
                             }
                             ZombieType::Devil => {
-                                // Hellion: periodic charge bursts (2x speed for 0.3s every 2s)
                                 let cycle = (self.game_time + zid_hash as f64 * 0.3) % 2.0;
                                 if cycle < 0.3 {
-                                    let burst = 2.0;
+                                    let burst = 1.55;
                                     move_dx *= burst;
                                     move_dy *= burst;
                                 }
                             }
                             ZombieType::Vampire => {
-                                // Shade: flank — approach at an angle, circle when close
                                 if tdist < 200.0 {
-                                    // Circle the player
                                     let circle_dir = if zid_hash % 2 == 0 { 1.0 } else { -1.0 };
                                     let perp_x = -move_dy * circle_dir;
                                     let perp_y = move_dx * circle_dir;
@@ -935,7 +1311,6 @@ impl Game {
                                     let len = (move_dx * move_dx + move_dy * move_dy).sqrt();
                                     if len > 0.0 { move_dx /= len; move_dy /= len; }
                                 } else {
-                                    // Approach at 30-degree offset
                                     let angle_offset: f64 = if zid_hash % 2 == 0 { 0.5 } else { -0.5 };
                                     let cos_a = angle_offset.cos();
                                     let sin_a = angle_offset.sin();
@@ -945,20 +1320,47 @@ impl Game {
                                     move_dy = ry;
                                 }
                             }
-                            _ => {} // Walker and Brute: direct approach
+                            _ => {}
                         }
 
                         z.pos.x += move_dx * z_speed * dt;
                         z.pos.y += move_dy * z_speed * dt;
 
+                        // Wrap through tunnels
+                        let (zwx, zwy) = wrap_position(z.pos.x, z.pos.y, ZOMBIE_RADIUS);
+                        z.pos.x = zwx;
+                        z.pos.y = zwy;
+
                         z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
                         z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
 
+                        // Barricade collision & thorny damage
+                        for pl in &mut self.placeables {
+                            if pl.item_type == PlaceableType::Barricade && pl.health > 0.0 {
+                                let bdx = z.pos.x - pl.pos.x;
+                                let bdy = z.pos.y - pl.pos.y;
+                                let bdist = (bdx * bdx + bdy * bdy).sqrt();
+                                let min_d = ZOMBIE_RADIUS + BARRICADE_RADIUS;
+                                if bdist < min_d {
+                                    if bdist > 0.001 {
+                                        let overlap = min_d - bdist;
+                                        z.pos.x += (bdx / bdist) * overlap;
+                                        z.pos.y += (bdy / bdist) * overlap;
+                                    }
+                                    pl.health -= 22.0 * dt;
+                                    z.health -= BARRICADE_CONTACT_DAMAGE * dt;
+                                    if z.health <= 0.0 && !zombie_kill_indices.contains(&zi) {
+                                        let score = zombie_score(&z.zombie_type);
+                                        kill_awards.push((pl.owner_id.clone(), score));
+                                        zombie_kill_indices.push(zi);
+                                    }
+                                }
+                            }
+                        }
+
                         // Wall collision — Brutes and Crawlers ignore walls
                         match z_type {
-                            ZombieType::Brute | ZombieType::Crawler => {
-                                // These types phase/smash through walls
-                            }
+                            ZombieType::Brute | ZombieType::Crawler => {}
                             _ => {
                                 let (nx, ny) = resolve_wall_collisions(
                                     z.pos.x, z.pos.y, ZOMBIE_RADIUS, &self.wall_grid,
@@ -976,26 +1378,20 @@ impl Game {
                                     entry.0 += dt;
 
                                     if entry.0 < 0.3 {
-                                        // Brief pause — zombie bumps into wall
                                         z.pos.x = nx;
                                         z.pos.y = ny;
                                     } else {
-                                        // Creep around: pick a steer direction on first stuck frame past delay
                                         if entry.1 == 0.0 {
-                                            // Choose steer direction based on wall normal
-                                            // Try both perpendicular directions, pick the one closer to target
                                             let perp1_x = -move_dy;
                                             let perp1_y = move_dx;
                                             let perp2_x = move_dy;
                                             let perp2_y = -move_dx;
-                                            // Dot product with direction to target to pick best side
                                             let dot1 = perp1_x * (tx - zx) + perp1_y * (ty - zy);
                                             let dot2 = perp2_x * (tx - zx) + perp2_y * (ty - zy);
                                             entry.1 = if dot1 >= dot2 { 1.0 } else { -1.0 };
                                         }
 
                                         let steer_dir = entry.1;
-                                        // Blend: mostly perpendicular, slightly toward target
                                         let creep_dx = -move_dy * steer_dir * 0.8 + move_dx * 0.2;
                                         let creep_dy = move_dx * steer_dir * 0.8 + move_dy * 0.2;
                                         let creep_len = (creep_dx * creep_dx + creep_dy * creep_dy).sqrt();
@@ -1005,9 +1401,11 @@ impl Game {
                                             (0.0, 0.0)
                                         };
 
-                                        // Move at half speed while creeping
                                         z.pos.x = zx + cdx * z_speed * 0.5 * dt;
                                         z.pos.y = zy + cdy * z_speed * 0.5 * dt;
+                                        let (cwx, cwy) = wrap_position(z.pos.x, z.pos.y, ZOMBIE_RADIUS);
+                                        z.pos.x = cwx;
+                                        z.pos.y = cwy;
                                         z.pos.x = z.pos.x.max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
                                         z.pos.y = z.pos.y.max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
                                         let (cnx, cny) = resolve_wall_collisions(
@@ -1017,7 +1415,6 @@ impl Game {
                                         z.pos.y = cny;
                                     }
                                 } else {
-                                    // Not blocked — clear stuck state
                                     self.zombie_wall_stuck.remove(&zid);
                                     z.pos.x = nx;
                                     z.pos.y = ny;
@@ -1026,36 +1423,40 @@ impl Game {
                         }
                     }
 
-                    // Zombie melee attack
+                    // Zombie melee attack (respects player dash i-frames!)
                     let z = &self.zombies[zi];
-                    let zdx = tx - z.pos.x;
-                    let zdy = ty - z.pos.y;
-                    let dist_to_target = (zdx * zdx + zdy * zdy).sqrt();
+                    if z.health > 0.0 {
+                        let zdx = tx - z.pos.x;
+                        let zdy = ty - z.pos.y;
+                        let dist_to_target = (zdx * zdx + zdy * zdy).sqrt();
 
-                    let attack_damage = match z.zombie_type {
-                        ZombieType::Brute => ZOMBIE_DAMAGE * 2.0,    // Juggernaut hits hard
-                        ZombieType::Vampire => ZOMBIE_DAMAGE * 0.8,  // Shade: lighter hit but heals
-                        _ => ZOMBIE_DAMAGE,
-                    };
+                        let attack_damage = match z.zombie_type {
+                            ZombieType::Brute => ZOMBIE_DAMAGE * 2.0,
+                            ZombieType::Vampire => ZOMBIE_DAMAGE * 0.8,
+                            _ => ZOMBIE_DAMAGE,
+                        };
 
-                    if dist_to_target < ZOMBIE_ATTACK_RANGE {
-                        let cd = self
-                            .zombie_attack_cooldowns
-                            .entry(z.id.clone())
-                            .or_insert(0.0);
-                        if *cd <= 0.0 {
-                            let attack_speed = match z.zombie_type {
-                                ZombieType::Crawler => ZOMBIE_ATTACK_COOLDOWN * 0.5, // Skitter attacks fast
-                                ZombieType::Brute => ZOMBIE_ATTACK_COOLDOWN * 1.5,   // Juggernaut slow swing
-                                _ => ZOMBIE_ATTACK_COOLDOWN,
-                            };
-                            *cd = attack_speed;
-                            damage_to_players.push((target_id.clone(), attack_damage));
+                        if dist_to_target < ZOMBIE_ATTACK_RANGE {
+                            let target_invuln = self.dash_iframes.get(target_id).copied().unwrap_or(0.0) > 0.0;
+                            if !target_invuln {
+                                let cd = self
+                                    .zombie_attack_cooldowns
+                                    .entry(z.id.clone())
+                                    .or_insert(0.0);
+                                if *cd <= 0.0 {
+                                    let attack_speed = match z.zombie_type {
+                                        ZombieType::Crawler => ZOMBIE_ATTACK_COOLDOWN * 0.5,
+                                        ZombieType::Brute => ZOMBIE_ATTACK_COOLDOWN * 1.5,
+                                        _ => ZOMBIE_ATTACK_COOLDOWN,
+                                    };
+                                    *cd = attack_speed;
+                                    damage_to_players.push((target_id.clone(), attack_damage));
 
-                            // Vampire heals on hit
-                            if z.zombie_type == ZombieType::Vampire {
-                                let z_mut = &mut self.zombies[zi];
-                                z_mut.health = (z_mut.health + 15.0).min(z_mut.max_health);
+                                    if z.zombie_type == ZombieType::Vampire {
+                                        let z_mut = &mut self.zombies[zi];
+                                        z_mut.health = (z_mut.health + 15.0).min(z_mut.max_health);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1063,7 +1464,7 @@ impl Game {
 
                 // Check bullet collisions
                 for bi in (0..self.bullets.len()).rev() {
-                    if bullet_kill_indices.contains(&bi) {
+                    if bullet_kill_indices.contains(&bi) || zombie_kill_indices.contains(&zi) {
                         continue;
                     }
                     let b = &self.bullets[bi];
@@ -1074,30 +1475,42 @@ impl Game {
                     if dist < ZOMBIE_RADIUS + BULLET_RADIUS {
                         let damage = b.damage;
                         let owner_id = b.owner_id.clone();
-                        let is_rocket = damage >= 100.0;
+                        let is_rocket = b.is_rocket;
                         let impact_x = b.pos.x;
                         let impact_y = b.pos.y;
+                        let b_vel_x = b.vel.x;
+                        let b_vel_y = b.vel.y;
                         bullet_kill_indices.push(bi);
 
                         if is_rocket {
-                            // Rocket AoE: damage all zombies in explosion radius
-                            for zj in 0..self.zombies.len() {
-                                let aoe_dist = f64::hypot(self.zombies[zj].pos.x - impact_x, self.zombies[zj].pos.y - impact_y);
-                                if aoe_dist < ROCKET_EXPLOSION_RADIUS {
-                                    self.zombies[zj].health -= ROCKET_DAMAGE;
-                                    if self.zombies[zj].health <= 0.0 && !zombie_kill_indices.contains(&zj) {
-                                        let score = zombie_score(&self.zombies[zj].zombie_type);
-                                        score_awards.push((owner_id.clone(), score));
-                                        zombie_kill_indices.push(zj);
-                                    }
-                                }
-                            }
+                            explosions.push(ExplosionEvent {
+                                x: impact_x,
+                                y: impact_y,
+                                radius: ROCKET_EXPLOSION_RADIUS,
+                                damage,
+                                owner_id,
+                            });
                             break;
                         } else {
                             self.zombies[zi].health -= damage;
+
+                            // Bullet knockback physics
+                            let b_speed = (b_vel_x * b_vel_x + b_vel_y * b_vel_y).sqrt();
+                            if b_speed > 0.0 {
+                                let kb = if damage >= 25.0 { 10.0 } else { 5.0 };
+                                let z_mut = &mut self.zombies[zi];
+                                z_mut.pos.x = (z_mut.pos.x + (b_vel_x / b_speed) * kb).max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
+                                z_mut.pos.y = (z_mut.pos.y + (b_vel_y / b_speed) * kb).max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
+                                if z_mut.zombie_type != ZombieType::Brute && z_mut.zombie_type != ZombieType::Crawler {
+                                    let (nx, ny) = resolve_wall_collisions(z_mut.pos.x, z_mut.pos.y, ZOMBIE_RADIUS, &self.wall_grid);
+                                    z_mut.pos.x = nx;
+                                    z_mut.pos.y = ny;
+                                }
+                            }
+
                             if self.zombies[zi].health <= 0.0 {
                                 let score = zombie_score(&self.zombies[zi].zombie_type);
-                                score_awards.push((owner_id, score));
+                                kill_awards.push((owner_id, score));
                                 zombie_kill_indices.push(zi);
                                 break;
                             }
@@ -1105,58 +1518,145 @@ impl Game {
                     }
                 }
             }
+        }
 
-            // Decrement zombie attack cooldowns
-            for cd in self.zombie_attack_cooldowns.values_mut() {
-                *cd -= dt;
-            }
-
-            // Apply damage to players
-            for (pid, dmg) in &damage_to_players {
-                if let Some(p) = self.players.get_mut(pid) {
-                    p.health = (p.health - dmg).max(0.0);
+        // Process all queued explosions (including chain reactions with barrels/mines!)
+        let mut processed_placeables = HashSet::new();
+        while let Some(exp) = explosions.pop() {
+            // Damage and knock back zombies in blast radius
+            for (zi, z) in self.zombies.iter_mut().enumerate() {
+                if z.health <= 0.0 {
+                    continue;
                 }
-            }
-
-            // Apply score awards
-            for (pid, score) in &score_awards {
-                if let Some(p) = self.players.get_mut(pid) {
-                    p.score += score;
-                }
-            }
-
-            // Remove dead zombies (reverse sorted to keep indices valid)
-            zombie_kill_indices.sort_unstable();
-            zombie_kill_indices.dedup();
-            for &zi in zombie_kill_indices.iter().rev() {
-                if zi < self.zombies.len() {
-                    if let Some(d) = roll_drop(&self.zombies[zi].zombie_type, self.zombies[zi].pos.x, self.zombies[zi].pos.y, self.game_time) {
-                        self.drops.push(d);
+                let dx = z.pos.x - exp.x;
+                let dy = z.pos.y - exp.y;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < exp.radius {
+                    z.health -= exp.damage;
+                    if dist > 0.0 {
+                        let falloff = (1.0 - dist / exp.radius).max(0.35);
+                        let kb = 60.0 * falloff;
+                        z.pos.x = (z.pos.x + (dx / dist) * kb).max(ZOMBIE_RADIUS).min(MAP_WIDTH - ZOMBIE_RADIUS);
+                        z.pos.y = (z.pos.y + (dy / dist) * kb).max(ZOMBIE_RADIUS).min(MAP_HEIGHT - ZOMBIE_RADIUS);
                     }
-                    self.zombie_attack_cooldowns.remove(&self.zombies[zi].id);
-                    self.zombies.swap_remove(zi);
+                    if z.health <= 0.0 && !zombie_kill_indices.contains(&zi) {
+                        let score = zombie_score(&z.zombie_type);
+                        kill_awards.push((exp.owner_id.clone(), score));
+                        zombie_kill_indices.push(zi);
+                    }
                 }
             }
-            self.wave_kills += zombie_kill_indices.len() as u32;
 
-            // Remove bullets that hit zombies
-            bullet_kill_indices.sort_unstable();
-            bullet_kill_indices.dedup();
-            for &bi in bullet_kill_indices.iter().rev() {
-                if bi < self.bullets.len() {
-                    self.bullet_lifetimes.remove(&self.bullets[bi].id);
-                    self.bullets.swap_remove(bi);
+            // Chain reaction with other placeables
+            for pl in &mut self.placeables {
+                if pl.health <= 0.0 || processed_placeables.contains(&pl.id) {
+                    continue;
                 }
+                let dist = f64::hypot(pl.pos.x - exp.x, pl.pos.y - exp.y);
+                if dist < exp.radius {
+                    match pl.item_type {
+                        PlaceableType::Barrel => {
+                            pl.health = 0.0;
+                            processed_placeables.insert(pl.id.clone());
+                            explosions.push(ExplosionEvent {
+                                x: pl.pos.x,
+                                y: pl.pos.y,
+                                radius: BARREL_EXPLOSION_RADIUS,
+                                damage: BARREL_DAMAGE,
+                                owner_id: exp.owner_id.clone(),
+                            });
+                        }
+                        PlaceableType::Mine => {
+                            pl.health = 0.0;
+                            processed_placeables.insert(pl.id.clone());
+                            explosions.push(ExplosionEvent {
+                                x: pl.pos.x,
+                                y: pl.pos.y,
+                                radius: MINE_EXPLOSION_RADIUS,
+                                damage: MINE_DAMAGE,
+                                owner_id: exp.owner_id.clone(),
+                            });
+                        }
+                        PlaceableType::Barricade => {
+                            pl.health -= exp.damage * 0.35;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove destroyed placeables
+        self.placeables.retain(|pl| pl.health > 0.0);
+
+        // Decrement zombie attack cooldowns
+        for cd in self.zombie_attack_cooldowns.values_mut() {
+            *cd -= dt;
+        }
+
+        // Apply damage to players
+        for (pid, dmg) in &damage_to_players {
+            if let Some(p) = self.players.get_mut(pid) {
+                p.health = (p.health - dmg).max(0.0);
+            }
+        }
+
+        // Apply kill & combo awards
+        for (pid, score) in &kill_awards {
+            if let Some(p) = self.players.get_mut(pid) {
+                award_kill_to_player(p, *score);
+            }
+        }
+
+        // Remove dead zombies (reverse sorted to keep indices valid)
+        zombie_kill_indices.sort_unstable();
+        zombie_kill_indices.dedup();
+        for &zi in zombie_kill_indices.iter().rev() {
+            if zi < self.zombies.len() {
+                if let Some(d) = roll_drop(&self.zombies[zi].zombie_type, self.zombies[zi].pos.x, self.zombies[zi].pos.y, self.game_time) {
+                    self.drops.push(d);
+                }
+                self.zombie_attack_cooldowns.remove(&self.zombies[zi].id);
+                self.zombies.swap_remove(zi);
+            }
+        }
+        self.wave_kills += zombie_kill_indices.len() as u32;
+
+        // Remove bullets that hit zombies
+        bullet_kill_indices.sort_unstable();
+        bullet_kill_indices.dedup();
+        for &bi in bullet_kill_indices.iter().rev() {
+            if bi < self.bullets.len() {
+                self.bullet_lifetimes.remove(&self.bullets[bi].id);
+                self.bullets.swap_remove(bi);
             }
         }
 
         // Despawn expired drops
         self.drops.retain(|d| d.despawn_at > self.game_time);
 
-        // Wave advancement
-        if self.wave_kills >= self.wave * 10 {
-            self.wave += 1;
-            self.wave_kills = 0;
+        // Wave advancement -> triggers Wave Break!
+        let target = self.wave_target();
+        if self.wave_kills >= target && self.wave_break_timer <= 0.0 {
+            self.wave_break_timer = WAVE_BREAK_DURATION;
+            // Clear remaining zombies on wave completion and grant wave clear bonus
+            for z in &self.zombies {
+                if let Some(d) = roll_drop(&z.zombie_type, z.pos.x, z.pos.y, self.game_time) {
+                    self.drops.push(d);
+                }
+            }
+            self.zombies.clear();
+            self.zombie_attack_cooldowns.clear();
+
+            let credit_bonus = 100.0 + (self.wave as f64) * 30.0;
+            for p in self.players.values_mut() {
+                if p.health > 0.0 {
+                    p.health = (p.health + 25.0).min(p.max_health);
+                    p.ammo = (p.ammo + 15.0).min(p.max_ammo);
+                    p.credits += credit_bonus;
+                    p.tactical_items[0] = (p.tactical_items[0] + 1).min(99);
+                    p.tactical_items[1] = (p.tactical_items[1] + 1).min(99);
+                }
+            }
         }
 
         // Revive: living players near dead players revive them over time
@@ -1177,7 +1677,6 @@ impl Game {
                     None => continue,
                 };
 
-                // Find closest alive player within revive range
                 let mut reviver: Option<String> = None;
                 for (aid, ax, ay) in &alive_positions {
                     let dx = ax - dead_pos.0;
@@ -1192,21 +1691,18 @@ impl Game {
                 if let Some(ref reviver_id) = reviver {
                     let entry = self.revive_progress.entry(dead_id.clone())
                         .or_insert((reviver_id.clone(), 0.0));
-                    // Reset progress if a different player is reviving
                     if entry.0 != *reviver_id {
                         *entry = (reviver_id.clone(), 0.0);
                     }
                     entry.1 += dt;
 
                     if entry.1 >= REVIVE_TIME {
-                        // Revive the player
                         if let Some(p) = self.players.get_mut(dead_id) {
                             p.health = REVIVE_HEALTH;
                         }
                         self.revive_progress.remove(dead_id);
                     }
                 } else {
-                    // No one nearby — reset progress
                     self.revive_progress.remove(dead_id);
                 }
             }
@@ -1230,6 +1726,10 @@ impl Game {
 
     pub fn bullets(&self) -> &[Bullet] {
         &self.bullets
+    }
+
+    pub fn placeables(&self) -> &[Placeable] {
+        &self.placeables
     }
 
     pub fn drops(&self) -> Vec<DropPickup> {

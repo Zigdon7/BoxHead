@@ -5,55 +5,53 @@
  * and run json-schema-to-typescript to regenerate this file.
  */
 
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "Weapon".
- */
 export type Weapon = "pistol" | "uzi" | "shotgun" | "rocketLauncher";
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "DropType".
- */
-export type DropType = "ammo" | "health" | "weapon";
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "ZombieType".
- */
+export type DropType = "ammo" | "health" | "weapon" | "tactical";
+export type PlaceableType = "barrel" | "barricade" | "mine";
 export type ZombieType = "zombie" | "devil" | "crawler" | "brute" | "vampire";
 
 export interface BoxheadTypes {
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "Vector2".
- */
+
 export interface Vector2 {
   x: number;
   y: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "DropPickup".
- */
+
+export interface Placeable {
+  id: string;
+  type: PlaceableType;
+  pos: Vector2;
+  health: number;
+  maxHealth: number;
+  ownerId: string;
+  [k: string]: unknown;
+}
+
+export interface PlaceableDelta {
+  id: string;
+  health?: number;
+  [k: string]: unknown;
+}
+
 export interface DropPickup {
   id: string;
   type: DropType;
   pos: Vector2;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "Player".
- */
+
 export interface Player {
   id: string;
   name: string;
   pos: Vector2;
   angle: number;
   score: number;
+  credits: number;
   health: number;
+  maxHealth: number;
   ammo: number;
   maxAmmo: number;
   weapon: Weapon;
@@ -62,12 +60,20 @@ export interface Player {
    * @maxItems 4
    */
   weaponSlots: [boolean, boolean, boolean, boolean];
+  combo: number;
+  comboTimer: number;
+  maxCombo: number;
+  kills: number;
+  /**
+   * @minItems 3
+   * @maxItems 3
+   */
+  tacticalItems: [number, number, number];
+  damageLevel: number;
+  meleeLevel: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "Zombie".
- */
+
 export interface Zombie {
   id: string;
   type: ZombieType;
@@ -77,22 +83,18 @@ export interface Zombie {
   speed: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "Bullet".
- */
+
 export interface Bullet {
   id: string;
   pos: Vector2;
   vel: Vector2;
   ownerId: string;
   damage: number;
+  isCrit?: boolean;
+  isRocket?: boolean;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "Wall".
- */
+
 export interface Wall {
   x: number;
   y: number;
@@ -100,29 +102,20 @@ export interface Wall {
   h: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "AmmoSpawnPoint".
- */
+
 export interface AmmoSpawnPoint {
   x: number;
   y: number;
   amount: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "AmmoPickupState".
- */
+
 export interface AmmoPickupState {
   id: string;
   available: boolean;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "ClientInput".
- */
+
 export interface ClientInput {
   up: boolean;
   down: boolean;
@@ -134,12 +127,11 @@ export interface ClientInput {
   melee: boolean;
   selectWeapon: number;
   dash: boolean;
+  placeItem?: number;
+  buyUpgrade?: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "InitPayload".
- */
+
 export interface InitPayload {
   type: "init";
   id: string;
@@ -151,10 +143,7 @@ export interface InitPayload {
   wave: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "SnapshotState".
- */
+
 export interface SnapshotState {
   type: "snapshot";
   tick: number;
@@ -163,23 +152,26 @@ export interface SnapshotState {
   };
   zombies: Zombie[];
   bullets: Bullet[];
+  placeables: Placeable[];
   wave: number;
+  waveKills: number;
+  waveTarget: number;
+  waveBreakTimer: number;
   ammoPickups: AmmoPickupState[];
   drops: DropPickup[];
   gameOver: boolean;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "PlayerDelta".
- */
+
 export interface PlayerDelta {
   id: string;
   name?: string;
   pos?: Vector2;
   angle?: number;
   score?: number;
+  credits?: number;
   health?: number;
+  maxHealth?: number;
   ammo?: number;
   maxAmmo?: number;
   weapon?: Weapon;
@@ -188,22 +180,27 @@ export interface PlayerDelta {
    * @maxItems 4
    */
   weaponSlots?: [boolean, boolean, boolean, boolean];
+  combo?: number;
+  comboTimer?: number;
+  maxCombo?: number;
+  kills?: number;
+  /**
+   * @minItems 3
+   * @maxItems 3
+   */
+  tacticalItems?: [number, number, number];
+  damageLevel?: number;
+  meleeLevel?: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "ZombieDelta".
- */
+
 export interface ZombieDelta {
   id: string;
   pos?: Vector2;
   health?: number;
   [k: string]: unknown;
 }
-/**
- * This interface was referenced by `BoxheadTypes`'s JSON-Schema
- * via the `definition` "DeltaState".
- */
+
 export interface DeltaState {
   type: "delta";
   tick: number;
@@ -216,9 +213,15 @@ export interface DeltaState {
   zombiesRemoved?: string[];
   bulletsNew?: Bullet[];
   bulletsRemoved?: string[];
+  placeablesNew?: Placeable[];
+  placeablesUpdated?: PlaceableDelta[];
+  placeablesRemoved?: string[];
   dropsNew?: DropPickup[];
   dropsRemoved?: string[];
   wave?: number;
+  waveKills?: number;
+  waveTarget?: number;
+  waveBreakTimer?: number;
   ammoPickups?: AmmoPickupState[];
   gameOver?: boolean;
   [k: string]: unknown;

@@ -152,10 +152,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Bounded channel — drops deltas for slow clients instead of buffering
     let (tx, mut rx) = mpsc::channel::<String>(CLIENT_CHANNEL_CAPACITY);
 
-    // Add player to game (only if game is not over)
+    // Add player to game (if game is over and no one else is connected, auto-reset!)
     let joined_game;
     {
+        let clients_empty = state.clients.lock().await.is_empty();
         let mut game = state.game.lock().await;
+        if game.is_game_over() && clients_empty {
+            game.reset();
+            let mut dt = state.delta_tracker.lock().await;
+            *dt = DeltaTracker::new();
+        }
         let game_over = game.is_game_over();
         let wave = game.wave();
 
@@ -276,8 +282,12 @@ async fn tick(state: &AppState) {
     let players = game.players().clone();
     let zombies = game.zombies().to_vec();
     let bullets = game.bullets().to_vec();
+    let placeables = game.placeables().to_vec();
     let drops = game.drops();
     let wave = game.wave();
+    let wave_kills = game.wave_kills();
+    let wave_target = game.wave_target();
+    let wave_break_timer = game.wave_break_timer();
     let ammo_avail_vec = game.ammo_availability();
     let ammo_availability: HashMap<String, bool> = ammo_avail_vec.iter()
         .map(|a| (a.id.clone(), a.available)).collect();
@@ -286,14 +296,38 @@ async fn tick(state: &AppState) {
 
     // --- Delta computation ---
     let mut dt = state.delta_tracker.lock().await;
-    let delta = dt.compute_delta(&players, &zombies, &bullets, &drops, wave, &ammo_availability, game_over);
+    let delta = dt.compute_delta(
+        &players,
+        &zombies,
+        &bullets,
+        &placeables,
+        &drops,
+        wave,
+        wave_kills,
+        wave_target,
+        wave_break_timer,
+        &ammo_availability,
+        game_over,
+    );
     let delta_str = serde_json::to_string(&delta).unwrap();
 
     let pending = state.pending_snapshots.lock().await;
     let snapshot_ids: Vec<String> = pending.iter().cloned().collect();
 
     let snapshot_str = if !snapshot_ids.is_empty() {
-        let snapshot = dt.build_snapshot(&players, &zombies, &bullets, &drops, wave, &ammo_availability, game_over);
+        let snapshot = dt.build_snapshot(
+            &players,
+            &zombies,
+            &bullets,
+            &placeables,
+            &drops,
+            wave,
+            wave_kills,
+            wave_target,
+            wave_break_timer,
+            &ammo_availability,
+            game_over,
+        );
         Some(serde_json::to_string(&snapshot).unwrap())
     } else {
         None

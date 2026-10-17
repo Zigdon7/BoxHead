@@ -16,7 +16,31 @@
     },
     "DropType": {
       "type": "string",
-      "enum": ["ammo", "health", "weapon"]
+      "enum": ["ammo", "health", "weapon", "tactical"]
+    },
+    "PlaceableType": {
+      "type": "string",
+      "enum": ["barrel", "barricade", "mine"]
+    },
+    "Placeable": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "$ref": "#/$defs/PlaceableType" },
+        "pos": { "$ref": "#/$defs/Vector2" },
+        "health": { "type": "number" },
+        "maxHealth": { "type": "number" },
+        "ownerId": { "type": "string" }
+      },
+      "required": ["id", "type", "pos", "health", "maxHealth", "ownerId"]
+    },
+    "PlaceableDelta": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "health": { "type": "number" }
+      },
+      "required": ["id"]
     },
     "DropPickup": {
       "type": "object",
@@ -35,16 +59,26 @@
       "type": "object",
       "properties": {
         "id": { "type": "string" },
+        "name": { "type": "string" },
         "pos": { "$ref": "#/$defs/Vector2" },
         "angle": { "type": "number" },
         "score": { "type": "number" },
+        "credits": { "type": "number" },
         "health": { "type": "number" },
+        "maxHealth": { "type": "number" },
         "ammo": { "type": "number" },
         "maxAmmo": { "type": "number" },
         "weapon": { "$ref": "#/$defs/Weapon" },
-        "weaponSlots": { "type": "array", "items": { "type": "boolean" }, "minItems": 4, "maxItems": 4 }
+        "weaponSlots": { "type": "array", "items": { "type": "boolean" }, "minItems": 4, "maxItems": 4 },
+        "combo": { "type": "number" },
+        "comboTimer": { "type": "number" },
+        "maxCombo": { "type": "number" },
+        "kills": { "type": "number" },
+        "tacticalItems": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+        "damageLevel": { "type": "number" },
+        "meleeLevel": { "type": "number" }
       },
-      "required": ["id", "pos", "angle", "score", "health", "ammo", "maxAmmo", "weapon", "weaponSlots"]
+      "required": ["id", "name", "pos", "angle", "score", "credits", "health", "maxHealth", "ammo", "maxAmmo", "weapon", "weaponSlots", "combo", "comboTimer", "maxCombo", "kills", "tacticalItems", "damageLevel", "meleeLevel"]
     },
     "Zombie": {
       "type": "object",
@@ -65,7 +99,9 @@
         "pos": { "$ref": "#/$defs/Vector2" },
         "vel": { "$ref": "#/$defs/Vector2" },
         "ownerId": { "type": "string" },
-        "damage": { "type": "number" }
+        "damage": { "type": "number" },
+        "isCrit": { "type": "boolean" },
+        "isRocket": { "type": "boolean" }
       },
       "required": ["id", "pos", "vel", "ownerId", "damage"]
     },
@@ -107,7 +143,10 @@
         "mouseY": { "type": "number" },
         "shooting": { "type": "boolean" },
         "melee": { "type": "boolean" },
-        "selectWeapon": { "type": "number" }
+        "selectWeapon": { "type": "number" },
+        "dash": { "type": "boolean" },
+        "placeItem": { "type": "number" },
+        "buyUpgrade": { "type": "number" }
       },
       "required": ["up", "down", "left", "right", "mouseX", "mouseY", "shooting", "melee", "selectWeapon"]
     },
@@ -119,7 +158,9 @@
         "walls": { "type": "array", "items": { "$ref": "#/$defs/Wall" } },
         "mapWidth": { "type": "number" },
         "mapHeight": { "type": "number" },
-        "ammoSpawnPoints": { "type": "array", "items": { "$ref": "#/$defs/AmmoSpawnPoint" } }
+        "ammoSpawnPoints": { "type": "array", "items": { "$ref": "#/$defs/AmmoSpawnPoint" } },
+        "gameOver": { "type": "boolean" },
+        "wave": { "type": "number" }
       },
       "required": ["type", "id", "walls", "mapWidth", "mapHeight", "ammoSpawnPoints"]
     },
@@ -127,32 +168,46 @@
       "type": "object",
       "properties": {
         "type": { "const": "snapshot" },
-        "tick": { "type": "number" },
+        "tick": { "number": "number" },
         "players": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/Player" }
         },
         "zombies": { "type": "array", "items": { "$ref": "#/$defs/Zombie" } },
         "bullets": { "type": "array", "items": { "$ref": "#/$defs/Bullet" } },
+        "placeables": { "type": "array", "items": { "$ref": "#/$defs/Placeable" } },
         "wave": { "type": "number" },
+        "waveKills": { "type": "number" },
+        "waveTarget": { "type": "number" },
+        "waveBreakTimer": { "type": "number" },
         "ammoPickups": { "type": "array", "items": { "$ref": "#/$defs/AmmoPickupState" } },
         "drops": { "type": "array", "items": { "$ref": "#/$defs/DropPickup" } },
         "gameOver": { "type": "boolean" }
       },
-      "required": ["type", "tick", "players", "zombies", "bullets", "wave", "ammoPickups", "drops", "gameOver"]
+      "required": ["type", "tick", "players", "zombies", "bullets", "placeables", "wave", "waveKills", "waveTarget", "waveBreakTimer", "ammoPickups", "drops", "gameOver"]
     },
     "PlayerDelta": {
       "type": "object",
       "properties": {
         "id": { "type": "string" },
+        "name": { "type": "string" },
         "pos": { "$ref": "#/$defs/Vector2" },
         "angle": { "type": "number" },
         "score": { "type": "number" },
+        "credits": { "type": "number" },
         "health": { "type": "number" },
+        "maxHealth": { "type": "number" },
         "ammo": { "type": "number" },
         "maxAmmo": { "type": "number" },
         "weapon": { "$ref": "#/$defs/Weapon" },
-        "weaponSlots": { "type": "array", "items": { "type": "boolean" }, "minItems": 4, "maxItems": 4 }
+        "weaponSlots": { "type": "array", "items": { "type": "boolean" }, "minItems": 4, "maxItems": 4 },
+        "combo": { "type": "number" },
+        "comboTimer": { "type": "number" },
+        "maxCombo": { "type": "number" },
+        "kills": { "type": "number" },
+        "tacticalItems": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+        "damageLevel": { "type": "number" },
+        "meleeLevel": { "type": "number" }
       },
       "required": ["id"]
     },
@@ -180,9 +235,15 @@
         "zombiesRemoved": { "type": "array", "items": { "type": "string" } },
         "bulletsNew": { "type": "array", "items": { "$ref": "#/$defs/Bullet" } },
         "bulletsRemoved": { "type": "array", "items": { "type": "string" } },
+        "placeablesNew": { "type": "array", "items": { "$ref": "#/$defs/Placeable" } },
+        "placeablesUpdated": { "type": "array", "items": { "$ref": "#/$defs/PlaceableDelta" } },
+        "placeablesRemoved": { "type": "array", "items": { "type": "string" } },
         "dropsNew": { "type": "array", "items": { "$ref": "#/$defs/DropPickup" } },
         "dropsRemoved": { "type": "array", "items": { "type": "string" } },
         "wave": { "type": "number" },
+        "waveKills": { "type": "number" },
+        "waveTarget": { "type": "number" },
+        "waveBreakTimer": { "type": "number" },
         "ammoPickups": { "type": "array", "items": { "$ref": "#/$defs/AmmoPickupState" } },
         "gameOver": { "type": "boolean" }
       },

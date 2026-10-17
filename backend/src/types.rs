@@ -35,6 +35,15 @@ impl Weapon {
         }
     }
 
+    pub fn knockback(&self) -> f64 {
+        match self {
+            Weapon::Pistol => 10.0,
+            Weapon::Uzi => 5.0,
+            Weapon::Shotgun => 16.0,
+            Weapon::RocketLauncher => 55.0,
+        }
+    }
+
     pub fn slot(&self) -> usize {
         match self {
             Weapon::Pistol => 0,
@@ -61,9 +70,39 @@ pub enum DropType {
     Ammo,
     Health,
     Weapon,
+    Tactical,
 }
 
-pub const MELEE_DAMAGE: f64 = 35.0;
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaceableType {
+    Barrel,
+    Barricade,
+    Mine,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Placeable {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub item_type: PlaceableType,
+    pub pos: Vector2,
+    pub health: f64,
+    #[serde(rename = "maxHealth")]
+    pub max_health: f64,
+    #[serde(rename = "ownerId")]
+    pub owner_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlaceableDelta {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<f64>,
+}
+
+pub const MELEE_DAMAGE: f64 = 45.0;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -83,13 +122,28 @@ pub struct Player {
     pub pos: Vector2,
     pub angle: f64,
     pub score: f64,
+    pub credits: f64,
     pub health: f64,
+    #[serde(rename = "maxHealth")]
+    pub max_health: f64,
     pub ammo: f64,
     #[serde(rename = "maxAmmo")]
     pub max_ammo: f64,
     pub weapon: Weapon,
     #[serde(rename = "weaponSlots")]
     pub weapon_slots: [bool; 4],
+    pub combo: u32,
+    #[serde(rename = "comboTimer")]
+    pub combo_timer: f64,
+    #[serde(rename = "maxCombo")]
+    pub max_combo: u32,
+    pub kills: u32,
+    #[serde(rename = "tacticalItems")]
+    pub tactical_items: [u32; 3],
+    #[serde(rename = "damageLevel")]
+    pub damage_level: u32,
+    #[serde(rename = "meleeLevel")]
+    pub melee_level: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -114,6 +168,10 @@ pub struct Bullet {
     #[serde(rename = "ownerId")]
     pub owner_id: String,
     pub damage: f64,
+    #[serde(default, rename = "isCrit")]
+    pub is_crit: bool,
+    #[serde(default, rename = "isRocket")]
+    pub is_rocket: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -145,6 +203,10 @@ pub struct ClientInput {
     pub select_weapon: u8,
     #[serde(default)]
     pub dash: bool,
+    #[serde(default, rename = "placeItem")]
+    pub place_item: u8,
+    #[serde(default, rename = "buyUpgrade")]
+    pub buy_upgrade: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -185,7 +247,14 @@ pub struct SnapshotState {
     pub players: HashMap<String, Player>,
     pub zombies: Vec<Zombie>,
     pub bullets: Vec<Bullet>,
+    pub placeables: Vec<Placeable>,
     pub wave: u32,
+    #[serde(rename = "waveKills")]
+    pub wave_kills: u32,
+    #[serde(rename = "waveTarget")]
+    pub wave_target: u32,
+    #[serde(rename = "waveBreakTimer")]
+    pub wave_break_timer: f64,
     #[serde(rename = "ammoPickups")]
     pub ammo_pickups: Vec<AmmoPickupState>,
     pub drops: Vec<DropPickup>,
@@ -206,7 +275,12 @@ pub struct PlayerDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "maxHealth")]
+    pub max_health: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ammo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,6 +291,25 @@ pub struct PlayerDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "weaponSlots")]
     pub weapon_slots: Option<[bool; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub combo: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "comboTimer")]
+    pub combo_timer: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "maxCombo")]
+    pub max_combo: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kills: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "tacticalItems")]
+    pub tactical_items: Option<[u32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "damageLevel")]
+    pub damage_level: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "meleeLevel")]
+    pub melee_level: Option<u32>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -255,6 +348,15 @@ pub struct DeltaState {
     #[serde(rename = "bulletsRemoved")]
     pub bullets_removed: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "placeablesNew")]
+    pub placeables_new: Option<Vec<Placeable>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "placeablesUpdated")]
+    pub placeables_updated: Option<Vec<PlaceableDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "placeablesRemoved")]
+    pub placeables_removed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "dropsNew")]
     pub drops_new: Option<Vec<DropPickup>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +364,15 @@ pub struct DeltaState {
     pub drops_removed: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wave: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "waveKills")]
+    pub wave_kills: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "waveTarget")]
+    pub wave_target: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "waveBreakTimer")]
+    pub wave_break_timer: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "ammoPickups")]
     pub ammo_pickups: Option<Vec<AmmoPickupState>>,

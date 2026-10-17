@@ -28,20 +28,24 @@ pub const ROCKET_EXPLOSION_RADIUS: f64 = 80.0;
 pub const ROCKET_DAMAGE: f64 = 150.0;
 
 // Melee
-pub const MELEE_RANGE: f64 = 50.0;
-pub const MELEE_ARC: f64 = PI / 2.0;
-pub const MELEE_COOLDOWN: f64 = 0.4;
+pub const MELEE_RANGE: f64 = 62.0;
+pub const MELEE_ARC: f64 = 2.0 * PI / 3.0;
+pub const MELEE_COOLDOWN: f64 = 0.38;
 
 // Ammo pickups
 pub const AMMO_PICKUP_RADIUS: f64 = 18.0;
 pub const AMMO_PICKUP_AMOUNT: i32 = 15;
 pub const AMMO_RESPAWN_TIME: f64 = 15.0;
 
+// Edge tunnels (Pac-Man style teleport)
+pub const TUNNEL_WIDTH: f64 = 200.0; // width of the opening on each edge
+
 // Dash
 pub const DASH_SPEED_MULT: f64 = 3.0;
 pub const DASH_DURATION: f64 = 0.15;
 pub const DASH_MAX_CHARGES: i32 = 3;
 pub const DASH_RECHARGE_TIME: f64 = 2.5; // seconds per charge
+pub const DASH_IFRAME_GRACE: f64 = 0.12; // extra invulnerability seconds after dash
 
 // Revive
 pub const REVIVE_RANGE: f64 = 50.0;
@@ -50,9 +54,33 @@ pub const REVIVE_HEALTH: f64 = 50.0;
 
 // Drop pickups
 pub const DROP_PICKUP_RADIUS: f64 = 18.0;
-pub const DROP_DESPAWN_TIME: f64 = 10.0;
+pub const DROP_DESPAWN_TIME: f64 = 12.0;
 pub const DROP_AMMO_AMOUNT: f64 = 15.0;
 pub const DROP_HEALTH_AMOUNT: f64 = 25.0;
+
+// Combo & Wave Break
+pub const COMBO_DURATION: f64 = 4.0;
+pub const WAVE_BREAK_DURATION: f64 = 8.0;
+
+// Placeable tactical items
+pub const BARREL_RADIUS: f64 = 16.0;
+pub const BARREL_HP: f64 = 30.0;
+pub const BARREL_EXPLOSION_RADIUS: f64 = 110.0;
+pub const BARREL_DAMAGE: f64 = 200.0;
+
+pub const BARRICADE_RADIUS: f64 = 20.0;
+pub const BARRICADE_HP: f64 = 220.0;
+pub const BARRICADE_CONTACT_DAMAGE: f64 = 12.0;
+
+pub const MINE_RADIUS: f64 = 12.0;
+pub const MINE_HP: f64 = 20.0;
+pub const MINE_TRIGGER_RADIUS: f64 = 38.0;
+pub const MINE_EXPLOSION_RADIUS: f64 = 95.0;
+pub const MINE_DAMAGE: f64 = 175.0;
+
+// Crits
+pub const CRIT_BASE_CHANCE: f64 = 0.20;
+pub const CRIT_DAMAGE_MULT: f64 = 1.75;
 
 // Zombie spawning
 pub const MAX_ZOMBIES_BASE: i32 = 30;
@@ -79,12 +107,24 @@ impl Wall {
 pub fn generate_walls() -> Vec<Wall> {
     let w = WALL_THICKNESS;
 
+    // Tunnel midpoints
+    let h_mid = MAP_WIDTH / 2.0;   // horizontal midpoint
+    let v_mid = MAP_HEIGHT / 2.0;  // vertical midpoint
+    let half_t = TUNNEL_WIDTH / 2.0;
+
     vec![
-        // Boundary walls
-        Wall::new(0.0, 0.0, MAP_WIDTH, w),
-        Wall::new(0.0, MAP_HEIGHT - w, MAP_WIDTH, w),
-        Wall::new(0.0, 0.0, w, MAP_HEIGHT),
-        Wall::new(MAP_WIDTH - w, 0.0, w, MAP_HEIGHT),
+        // Top boundary — gap in center
+        Wall::new(0.0, 0.0, h_mid - half_t, w),
+        Wall::new(h_mid + half_t, 0.0, h_mid - half_t, w),
+        // Bottom boundary — gap in center
+        Wall::new(0.0, MAP_HEIGHT - w, h_mid - half_t, w),
+        Wall::new(h_mid + half_t, MAP_HEIGHT - w, h_mid - half_t, w),
+        // Left boundary — gap in center
+        Wall::new(0.0, 0.0, w, v_mid - half_t),
+        Wall::new(0.0, v_mid + half_t, w, v_mid - half_t),
+        // Right boundary — gap in center
+        Wall::new(MAP_WIDTH - w, 0.0, w, v_mid - half_t),
+        Wall::new(MAP_WIDTH - w, v_mid + half_t, w, v_mid - half_t),
         // Central cross with gaps
         Wall::new(300.0, 880.0, 500.0, w),
         Wall::new(1000.0, 880.0, 400.0, w),
@@ -129,6 +169,40 @@ pub fn generate_walls() -> Vec<Wall> {
         Wall::new(2200.0, 700.0, 150.0, w),
         Wall::new(2200.0, 1100.0, 150.0, w),
     ]
+}
+
+/// Check if a position is within a tunnel opening on the map edge,
+/// and if it has crossed the edge, wrap it to the opposite side.
+/// Returns the (possibly wrapped) position.
+pub fn wrap_position(x: f64, y: f64, radius: f64) -> (f64, f64) {
+    let h_mid = MAP_WIDTH / 2.0;
+    let v_mid = MAP_HEIGHT / 2.0;
+    let half_t = TUNNEL_WIDTH / 2.0;
+
+    let mut nx = x;
+    let mut ny = y;
+
+    // Check horizontal tunnels (left/right edges)
+    let in_h_tunnel = y > v_mid - half_t && y < v_mid + half_t;
+    if in_h_tunnel {
+        if nx < -radius {
+            nx = MAP_WIDTH + nx; // wrap from left to right
+        } else if nx > MAP_WIDTH + radius {
+            nx = nx - MAP_WIDTH; // wrap from right to left
+        }
+    }
+
+    // Check vertical tunnels (top/bottom edges)
+    let in_v_tunnel = nx > h_mid - half_t && nx < h_mid + half_t;
+    if in_v_tunnel {
+        if ny < -radius {
+            ny = MAP_HEIGHT + ny; // wrap from top to bottom
+        } else if ny > MAP_HEIGHT + radius {
+            ny = ny - MAP_HEIGHT; // wrap from bottom to top
+        }
+    }
+
+    (nx, ny)
 }
 
 pub fn spawn_zones() -> Vec<(f64, f64)> {

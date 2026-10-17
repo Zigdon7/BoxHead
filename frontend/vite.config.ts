@@ -12,6 +12,14 @@ export default defineConfig({
         target: 'ws://localhost:3001',
         ws: true,
         rewriteWsOrigin: true
+      },
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true
+      },
+      '/admin': {
+        target: 'http://localhost:3001',
+        changeOrigin: true
       }
     }
   }

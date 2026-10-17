@@ -5,14 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
-  <title>BoxHead Remake</title>
+  <title>BoxHead — Tactical Horde Survival</title>
   <style>
     :root {
       --primary: #e53935;
       --primary-glow: rgba(229, 57, 53, 0.6);
+      --accent: #ffb400;
       --bg-dark: #0f1015;
-      --panel-bg: rgba(20, 22, 30, 0.7);
-      --panel-border: rgba(255, 255, 255, 0.1);
+      --panel-bg: rgba(16, 18, 26, 0.85);
+      --panel-border: rgba(255, 255, 255, 0.12);
       --text-main: #f5f5f5;
       --text-mute: #8b8d96;
       --blue: #1185FE;
@@ -30,70 +31,78 @@
     .overlay {
       position: absolute; top: 0; left: 0; width: 100%; height: 100%;
       z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center;
-      background: rgba(0, 0, 0, 0.6);
-      backdrop-filter: blur(8px);
+      background: radial-gradient(circle at center, rgba(20, 10, 12, 0.65) 0%, rgba(5, 6, 10, 0.88) 100%);
+      backdrop-filter: blur(10px);
       transition: opacity 0.3s ease;
     }
     
     .menu-panel {
-      background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 16px;
-      padding: 40px; box-shadow: 0 15px 35px rgba(0,0,0,0.5), inset 0 1px 1px rgba(255,255,255,0.05);
-      display: flex; flex-direction: column; align-items: center; gap: 24px;
-      width: 90%; max-width: 400px;
-      animation: floatUp 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 18px;
+      padding: 36px; box-shadow: 0 20px 50px rgba(0,0,0,0.7), 0 0 30px rgba(229, 57, 53, 0.12), inset 0 1px 1px rgba(255,255,255,0.08);
+      display: flex; flex-direction: column; align-items: center; gap: 20px;
+      width: 92%; max-width: 440px;
+      animation: floatUp 0.5s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
-    @keyframes floatUp { 0% { opacity: 0; transform: translateY(20px) scale(0.95); } 100% { opacity: 1; transform: translateY(0) scale(1); } }
-    @keyframes pulseGlow { 0% { text-shadow: 0 0 10px var(--primary-glow); } 50% { text-shadow: 0 0 25px var(--primary), 0 0 10px var(--primary-glow); } 100% { text-shadow: 0 0 10px var(--primary-glow); } }
+    @keyframes floatUp { 0% { opacity: 0; transform: translateY(20px) scale(0.96); } 100% { opacity: 1; transform: translateY(0) scale(1); } }
+    @keyframes pulseGlow { 0% { text-shadow: 0 0 12px var(--primary-glow); } 50% { text-shadow: 0 0 28px var(--primary), 0 0 12px var(--primary-glow); } 100% { text-shadow: 0 0 12px var(--primary-glow); } }
     
     h1.logo {
-      font-size: 3.5rem; font-weight: 900; letter-spacing: 2px;
-      color: var(--primary); margin-bottom: -10px;
+      font-size: 3.6rem; font-weight: 900; letter-spacing: 3px;
+      color: var(--primary); margin-bottom: -6px;
       animation: pulseGlow 3s infinite ease-in-out;
       text-transform: uppercase;
     }
-    .subtitle { color: var(--text-mute); font-size: 1.1rem; letter-spacing: 1px; margin-bottom: 20px; }
+    .subtitle { color: var(--accent); font-size: 0.9rem; font-weight: 700; letter-spacing: 2.5px; text-transform: uppercase; }
+
+    .feature-pills {
+      display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; width: 100%;
+    }
+    .feature-pill {
+      font-size: 0.72rem; font-weight: 600; color: #ccc; background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1); border-radius: 999px; padding: 4px 10px;
+      letter-spacing: 0.3px;
+    }
+    .feature-pill b { color: var(--accent); }
 
     .input-wrapper { width: 100%; display: flex; flex-direction: column; gap: 8px; }
-    .input-wrapper label { font-size: 0.85rem; color: var(--text-mute); text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
+    .input-wrapper label { font-size: 0.8rem; color: var(--text-mute); text-transform: uppercase; font-weight: 700; letter-spacing: 0.8px; }
     
     input {
-      width: 100%; padding: 14px 16px; border-radius: 8px;
-      background: rgba(0, 0, 0, 0.3); border: 1px solid var(--panel-border);
+      width: 100%; padding: 13px 16px; border-radius: 10px;
+      background: rgba(0, 0, 0, 0.4); border: 1px solid var(--panel-border);
       color: #fff; font-size: 1rem; font-family: inherit; transition: all 0.2s ease;
       outline: none;
     }
-    input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(229, 57, 53, 0.2); background: rgba(0,0,0,0.5); }
+    input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(229, 57, 53, 0.2); background: rgba(0,0,0,0.6); }
     input::placeholder { color: rgba(255,255,255,0.3); }
 
-    .auth-box { width: 100%; background: rgba(255,255,255,0.02); border-radius: 12px; padding: 20px; border: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 12px; }
-    .auth-box p.title { text-align: center; font-size: 0.9rem; color: var(--text-mute); margin-bottom: 5px; }
+    .auth-box { width: 100%; background: rgba(255,255,255,0.025); border-radius: 12px; padding: 16px; border: 1px solid rgba(255,255,255,0.06); display: flex; flex-direction: column; gap: 10px; }
+    .auth-box p.title { text-align: center; font-size: 0.82rem; color: var(--text-mute); text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; }
     
     .btn {
-      width: 100%; padding: 14px; border-radius: 8px; font-weight: 600; font-size: 1rem;
-      cursor: pointer; transition: all 0.2s; border: none; outline: none; display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; padding: 13px; border-radius: 10px; font-weight: 700; font-size: 0.98rem;
+      cursor: pointer; transition: all 0.18s; border: none; outline: none; display: flex; align-items: center; justify-content: center; gap: 8px;
     }
     .btn:active { transform: translateY(2px); }
     
-    .btn-play { background: var(--primary); color: white; font-size: 1.25rem; 
-      box-shadow: 0 6px 20px rgba(229, 57, 53, 0.4); text-transform: uppercase; letter-spacing: 2px; padding: 16px; margin-top: 10px; }
-    .btn-play:hover { background: #f44336; box-shadow: 0 8px 25px rgba(229, 57, 53, 0.6); transform: translateY(-2px); }
+    .btn-play {
+      background: linear-gradient(135deg, #e53935 0%, #c62828 100%);
+      color: white; font-size: 1.2rem;
+      box-shadow: 0 6px 22px rgba(229, 57, 53, 0.45);
+      text-transform: uppercase; letter-spacing: 2px; padding: 15px;
+    }
+    .btn-play:hover { background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%); box-shadow: 0 8px 28px rgba(229, 57, 53, 0.65); transform: translateY(-1px); }
     
     .btn-blue { background: var(--blue); color: white; }
     .btn-blue:hover { background: #3b9bff; }
     .btn-white { background: #fff; color: #111; }
     .btn-white:hover { background: #eee; }
-    .btn-dark { background: rgba(255,255,255,0.1); color: #fff; }
+    .btn-dark { background: rgba(255,255,255,0.09); color: #fff; border: 1px solid rgba(255,255,255,0.1); }
     .btn-dark:hover { background: rgba(255,255,255,0.15); }
 
-    .divider { display: flex; align-items: center; text-align: center; color: var(--text-mute); font-size: 0.85rem; margin: 5px 0; }
-    .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--panel-border); }
-    .divider span { padding: 0 10px; }
-
     .info-text { text-align: center; font-size: 0.95rem; color: var(--green); }
-    .error-text { text-align: center; font-size: 0.85rem; color: #ff5252; min-height: 16px; }
-    
-    .controls-hint { margin-top: 20px; font-size: 0.85rem; color: rgba(255,255,255,0.4); text-align: center; }
+    .error-text { text-align: center; font-size: 0.82rem; color: #ff5252; min-height: 14px; }
     
     /* Friends Panel & Game Over */
     #friendsOverlay, #gameOverOverlay { display: none; }
@@ -109,42 +118,259 @@
     .btn-icon-red { background: none; border: none; color: #ff5252; cursor: pointer; font-size: 1.2rem; }
     .add-friend-row { display: flex; gap: 8px; margin-top: 15px; }
 
-    .game-over-stats { font-size: 1.5rem; text-align: center; margin-bottom: 20px; color: #fff; }
-    .game-over-stats span { color: #ffb400; font-weight: bold; }
+    .game-over-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; margin: 8px 0;
+    }
+    .stat-card {
+      background: rgba(0, 0, 0, 0.45); border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px; padding: 14px; text-align: center;
+    }
+    .stat-card .stat-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-mute); margin-bottom: 4px; }
+    .stat-card .stat-val { font-size: 1.6rem; font-weight: 800; color: var(--accent); font-family: monospace; }
 
-    .auth-tabs { display: flex; gap: 4px; width: 100%; background: rgba(0,0,0,0.2); border-radius: 8px; padding: 4px; }
-    .auth-tab { flex: 1; padding: 8px; border: none; border-radius: 6px; background: transparent; color: var(--text-mute); font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; }
-    .auth-tab.active { background: rgba(255,255,255,0.1); color: #fff; }
+    .auth-tabs { display: flex; gap: 4px; width: 100%; background: rgba(0,0,0,0.25); border-radius: 8px; padding: 4px; }
+    .auth-tab { flex: 1; padding: 7px; border: none; border-radius: 6px; background: transparent; color: var(--text-mute); font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; }
+    .auth-tab.active { background: rgba(255,255,255,0.12); color: #fff; }
     .auth-tab:hover:not(.active) { color: #ccc; }
-    .auth-tab-content { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+    .auth-tab-content { display: flex; flex-direction: column; gap: 8px; width: 100%; }
     .auth-tab-content.hidden { display: none; }
 
     /* Settings */
     #settingsOverlay { display: none; }
-    .settings-grid { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center; max-height: 400px; overflow-y: auto; padding-right: 4px; }
-    .settings-grid .action-label { font-size: 0.9rem; color: var(--text-mute); }
+    .settings-grid { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center; max-height: 380px; overflow-y: auto; padding-right: 4px; }
+    .settings-grid .action-label { font-size: 0.88rem; color: var(--text-mute); }
     .key-btn {
-      padding: 6px 14px; border-radius: 6px; font-family: monospace; font-size: 0.85rem; font-weight: 600;
+      padding: 6px 14px; border-radius: 6px; font-family: monospace; font-size: 0.82rem; font-weight: 700;
       background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #fff;
       cursor: pointer; transition: all 0.15s; min-width: 80px; text-align: center; white-space: nowrap;
     }
     .key-btn:hover { background: rgba(255,255,255,0.15); border-color: var(--primary); }
     .key-btn.listening { background: var(--primary); border-color: var(--primary); animation: pulse 0.8s infinite alternate; color: #fff; }
     @keyframes pulse { from { opacity: 0.7; } to { opacity: 1; } }
-    .settings-section-title { grid-column: 1 / -1; font-size: 0.75rem; color: var(--primary); text-transform: uppercase; letter-spacing: 1px; margin-top: 10px; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.05); }
-    .settings-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-    .settings-toggle { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; margin-top: 6px; }
+    .settings-section-title { grid-column: 1 / -1; font-size: 0.72rem; color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-top: 10px; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .settings-toggle { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; margin-top: 4px; }
     .settings-toggle label { font-size: 0.9rem; color: var(--text-mute); cursor: pointer; }
     .settings-toggle input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; }
 
     .gear-btn {
-      position: absolute; top: 10px; left: 300px; z-index: 5;
-      width: 36px; height: 36px; border-radius: 8px;
-      background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.15);
-      color: #aaa; font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+      position: absolute; top: 14px; left: 318px; z-index: 5;
+      width: 38px; height: 38px; border-radius: 10px;
+      background: rgba(12, 14, 20, 0.78); border: 1px solid rgba(255,255,255,0.15);
+      color: #ccc; font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center;
       transition: all 0.2s;
     }
-    .gear-btn:hover { background: rgba(0,0,0,0.7); color: #fff; border-color: var(--primary); }
+    .gear-btn:hover { background: rgba(25, 28, 40, 0.92); color: #fff; border-color: var(--primary); }
+
+    /* Tactical Armory Modal */
+    #armoryOverlay {
+      display: none;
+      background: radial-gradient(circle at center, rgba(16, 20, 32, 0.72) 0%, rgba(5, 6, 12, 0.88) 100%);
+      backdrop-filter: blur(8px);
+      z-index: 12;
+    }
+    .armory-panel {
+      background: rgba(14, 17, 26, 0.95);
+      border: 1px solid rgba(255, 180, 0, 0.35);
+      border-radius: 18px;
+      padding: 24px 28px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.85), 0 0 40px rgba(255, 180, 0, 0.12), inset 0 1px 1px rgba(255,255,255,0.1);
+      width: 95%;
+      max-width: 780px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      position: relative;
+      animation: floatUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .armory-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      padding-bottom: 14px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .armory-title-group h2 {
+      font-size: 1.45rem;
+      font-weight: 900;
+      letter-spacing: 1.5px;
+      color: #fff;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .armory-title-group h2 span.badge {
+      font-size: 0.7rem;
+      background: rgba(255, 180, 0, 0.18);
+      color: var(--accent);
+      border: 1px solid rgba(255, 180, 0, 0.4);
+      padding: 3px 8px;
+      border-radius: 6px;
+      letter-spacing: 1px;
+    }
+    .armory-title-group p {
+      font-size: 0.78rem;
+      color: var(--text-mute);
+      margin-top: 3px;
+    }
+    .armory-wallet {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .wallet-pill {
+      background: rgba(0, 230, 118, 0.12);
+      border: 1px solid rgba(0, 230, 118, 0.45);
+      border-radius: 12px;
+      padding: 8px 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+    .wallet-pill .wallet-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #81c784;
+      font-weight: 700;
+    }
+    .wallet-pill .wallet-amount {
+      font-size: 1.35rem;
+      font-weight: 900;
+      color: #00e676;
+      font-family: monospace;
+    }
+    .armory-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
+      gap: 12px;
+      width: 100%;
+    }
+    .shop-card {
+      background: rgba(24, 28, 40, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 14px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 10px;
+      transition: all 0.16s ease;
+      position: relative;
+      overflow: hidden;
+    }
+    .shop-card.affordable:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255, 180, 0, 0.6);
+      background: rgba(32, 38, 54, 0.92);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    }
+    .shop-card.locked {
+      opacity: 0.6;
+    }
+    .shop-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .shop-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      font-weight: 900;
+      flex-shrink: 0;
+    }
+    .shop-shortcut {
+      font-family: monospace;
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: #90a4ae;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 2px 7px;
+      border-radius: 5px;
+    }
+    .shop-title {
+      font-size: 0.96rem;
+      font-weight: 800;
+      color: #fff;
+      margin-bottom: 2px;
+    }
+    .shop-desc {
+      font-size: 0.76rem;
+      color: #b0bec5;
+      line-height: 1.35;
+    }
+    .shop-stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.72rem;
+      font-family: monospace;
+      color: var(--accent);
+      background: rgba(0, 0, 0, 0.35);
+      padding: 5px 8px;
+      border-radius: 6px;
+    }
+    .level-pips {
+      display: flex;
+      gap: 3px;
+    }
+    .level-pip {
+      width: 8px;
+      height: 6px;
+      border-radius: 2px;
+      background: rgba(255, 255, 255, 0.14);
+    }
+    .level-pip.filled {
+      background: var(--accent);
+      box-shadow: 0 0 6px rgba(255, 180, 0, 0.6);
+    }
+    .shop-buy-btn {
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: none;
+      font-weight: 800;
+      font-size: 0.82rem;
+      font-family: monospace;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: all 0.15s;
+      text-transform: uppercase;
+    }
+    .shop-buy-btn.can-buy {
+      background: linear-gradient(135deg, #00c853 0%, #009624 100%);
+      color: #051b09;
+      box-shadow: 0 4px 14px rgba(0, 200, 83, 0.3);
+    }
+    .shop-buy-btn.can-buy:hover {
+      background: linear-gradient(135deg, #00e676 0%, #00c853 100%);
+    }
+    .shop-buy-btn.cant-buy {
+      background: rgba(255, 255, 255, 0.06);
+      color: #78909c;
+      cursor: not-allowed;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .armory-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.76rem;
+      color: var(--text-mute);
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 10px;
+    }
 
     .hidden { display: none !important; }
   </style>
@@ -159,17 +385,25 @@
     <div class="menu-panel">
       <div style="text-align: center;">
         <h1 class="logo">BOXHEAD</h1>
-        <p class="subtitle">Survive the horde</p>
+        <p class="subtitle">Tactical Horde Survival</p>
+      </div>
+
+      <div class="feature-pills">
+        <span class="feature-pill"><b>WASD</b> Move</span>
+        <span class="feature-pill"><b>Space / RMB</b> Katana Melee</span>
+        <span class="feature-pill"><b>Shift</b> i-Frame Dash</span>
+        <span class="feature-pill"><b>E / Q / F</b> Tactical Gear</span>
+        <span class="feature-pill"><b>B</b> Armory Shop</span>
       </div>
 
       <div class="input-wrapper">
-        <label>Player Name</label>
-        <input id="nameInput" type="text" maxlength="16" placeholder="Enter name..." />
+        <label>Operative Callsign</label>
+        <input id="nameInput" type="text" maxlength="16" placeholder="Enter callsign..." />
       </div>
 
       <!-- Logged Out Auth Box -->
       <div id="authSectionOut" class="auth-box">
-        <p class="title">Sign in (optional)</p>
+        <p class="title">Account Sync (Optional)</p>
 
         <div class="auth-tabs">
           <button class="auth-tab active" data-tab="email">Email</button>
@@ -212,9 +446,9 @@
         <button id="logoutBtn" class="btn btn-dark">Logout</button>
       </div>
 
-      <div style="display:flex; gap:8px; width:100%;">
-        <button id="playBtn" class="btn btn-play" style="flex:1;">PLAY</button>
-        <button id="menuSettingsBtn" class="btn btn-dark" style="width:50px; font-size:1.4rem; padding:0;">&#9881;</button>
+      <div style="display:flex; gap:10px; width:100%;">
+        <button id="playBtn" class="btn btn-play" style="flex:1;">DEPLOY TO ARENA</button>
+        <button id="menuSettingsBtn" class="btn btn-dark" style="width:52px; font-size:1.4rem; padding:0;" title="Controls & Settings">&#9881;</button>
       </div>
     </div>
   </div>
@@ -237,33 +471,81 @@
 
   <!-- Game Over Overlay -->
   <div id="gameOverOverlay" class="overlay">
-    <div class="menu-panel" style="background: rgba(40, 10, 10, 0.85); border-color: rgba(229, 57, 53, 0.3);">
-      <h1 class="logo" style="margin-bottom: 20px;">GAME OVER</h1>
-      <div class="game-over-stats">
-        Wave: <span id="gameOverWave">0</span><br/>
-        Score: <span id="gameOverScore">0</span>
+    <div class="menu-panel" style="background: rgba(28, 10, 12, 0.92); border-color: rgba(229, 57, 53, 0.4);">
+      <div style="text-align:center;">
+        <h1 class="logo" style="font-size: 3rem;">OVERRUN</h1>
+        <p class="subtitle" style="margin-top:4px;">Squad Eliminated</p>
       </div>
-      <button id="backToMenuBtn" class="btn btn-dark" style="margin-top: 20px; font-size: 1.2rem;">Back to Menu</button>
+
+      <div class="game-over-grid">
+        <div class="stat-card">
+          <div class="stat-label">Wave Reached</div>
+          <div class="stat-val" id="gameOverWave">1</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Final Score</div>
+          <div class="stat-val" id="gameOverScore">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Kills</div>
+          <div class="stat-val" id="gameOverKills">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Max Combo</div>
+          <div class="stat-val" id="gameOverCombo">0x</div>
+        </div>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:10px; width:100%;">
+        <button id="playAgainBtn" class="btn btn-play">PLAY AGAIN</button>
+        <button id="backToMenuBtn" class="btn btn-dark">Back to Menu</button>
+      </div>
     </div>
   </div>
 
   <!-- In-game settings gear -->
-  <button id="gameSettingsBtn" class="gear-btn hidden">&#9881;</button>
+  <button id="gameSettingsBtn" class="gear-btn hidden" title="Settings & Keybinds">&#9881;</button>
+
+  <!-- Tactical Armory Overlay -->
+  <div id="armoryOverlay" class="overlay">
+    <div class="armory-panel">
+      <button id="closeArmoryBtn" class="btn-close" title="Close Armory [B / Esc]">&times;</button>
+      <div class="armory-header">
+        <div class="armory-title-group">
+          <h2>Tactical Armory <span class="badge">FIELD SUPPLY</span></h2>
+          <p>Spend combat <b>$ Credits</b> on weapon &amp; gear upgrades. Your <b>Score</b> is never reduced!</p>
+        </div>
+        <div class="armory-wallet">
+          <div class="wallet-pill">
+            <span class="wallet-label">Available Credits</span>
+            <span class="wallet-amount" id="armoryCreditsVal">$100</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="armoryGrid" class="armory-grid"></div>
+
+      <div class="armory-footer">
+        <span>Tip: Earn <b>$ Credits</b> from kills, combo milestones, and wave clears.</span>
+        <span>Press <b>[B]</b> or <b>[ESC]</b> to return to combat</span>
+      </div>
+    </div>
+  </div>
 
   <!-- Settings Overlay -->
   <div id="settingsOverlay" class="overlay">
-    <div class="menu-panel" style="position: relative; max-width: 480px;">
+    <div class="menu-panel" style="position: relative; max-width: 500px;">
       <button id="closeSettingsBtn" class="btn-close">&times;</button>
-      <h2 style="margin-bottom: 6px;">Settings</h2>
+      <h2 style="margin-bottom: 4px;">Controls & Settings</h2>
 
       <div class="settings-toggle">
         <input type="checkbox" id="doubleTapDashToggle" />
-        <label for="doubleTapDashToggle">Double-tap direction to dash</label>
+        <label for="doubleTapDashToggle">Double-tap movement key to Dash</label>
       </div>
 
       <div id="bindingsGrid" class="settings-grid"></div>
 
-      <div style="display:flex; gap:8px; width:100%; margin-top:16px;">
+      <div style="display:flex; gap:8px; width:100%; margin-top:12px;">
         <button id="resetBindingsBtn" class="btn btn-dark" style="flex:1;">Reset Defaults</button>
         <button id="saveSettingsBtn" class="btn btn-blue" style="flex:1;">Done</button>
       </div>
@@ -275,4 +557,3 @@
   <script type="module" src="/main.ts"></script>
 </body>
 </html>
-
