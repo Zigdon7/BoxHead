@@ -85,6 +85,7 @@
       cursor: pointer; transition: all 0.18s; border: none; outline: none; display: flex; align-items: center; justify-content: center; gap: 8px;
     }
     .btn:active { transform: translateY(2px); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     
     .btn-play {
       background: linear-gradient(135deg, #e53935 0%, #c62828 100%);
@@ -408,6 +409,8 @@
 
       <small style="color:#aaa">New rounds only. Joining a squad keeps its current wave.</small>
 
+      <nav style="display:flex;gap:20px"><a href="/about.html" target="_blank" rel="noopener" style="color:#67d9ff">About ↗</a><a href="/learn.html" target="_blank" rel="noopener" style="color:#67d9ff">Learn to Play ↗</a></nav>
+
       <!-- Logged Out Auth Box -->
       <div id="authSectionOut" class="auth-box">
         <p class="title">Account Sync (Optional)</p>
@@ -512,6 +515,18 @@
         <button id="backToMenuBtn" class="btn btn-dark">Back to Menu</button>
       </div>
     </div>
+  </div>
+
+  <div id="roomControls" class="hidden" style="position:fixed;top:214px;left:12px;z-index:12;display:flex;gap:8px;align-items:center">
+    <button id="pauseBtn" class="btn btn-dark" style="width:auto;padding:9px 12px">Pause [P]</button>
+    <a href="/learn.html" target="_blank" rel="noopener" class="btn btn-dark" style="width:auto;padding:9px 12px;text-decoration:none">Field Guide ↗</a>
+  </div>
+  <div id="pauseOverlay" hidden style="position:fixed;inset:0;z-index:11;background:#070a10b8;display:none;place-items:center;pointer-events:none">
+    <section style="text-align:center;background:#111722;border:1px solid #ffb400;padding:28px;border-radius:16px;pointer-events:auto">
+      <h2>ROUND PAUSED</h2><p id="pauseMessage" style="margin:16px 0"></p>
+      <button id="resumeBtn" class="btn btn-play">Resume [P]</button>
+      <p style="margin-top:14px"><a href="/learn.html" target="_blank" rel="noopener" style="color:#67d9ff">Read the field guide ↗</a></p>
+    </section>
   </div>
 
   <!-- In-game settings gear -->

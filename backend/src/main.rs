@@ -39,6 +39,7 @@ struct AppState {
     clients: Mutex<HashMap<String, ClientSender>>,
     pending_snapshots: Mutex<HashSet<String>>,
     wave_profiles: Mutex<HashMap<String, (String, u32)>>,
+    last_room_status: Mutex<String>,
     social: Mutex<SocialState>,
     db: Database,
     google_client_id: String,
@@ -59,6 +60,7 @@ async fn main() {
         clients: Mutex::new(HashMap::new()),
         pending_snapshots: Mutex::new(HashSet::new()),
         wave_profiles: Mutex::new(HashMap::new()),
+        last_room_status: Mutex::new(String::new()),
         social: Mutex::new(SocialState::new()),
         db,
         google_client_id,
@@ -233,7 +235,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             if let Message::Text(text) = msg {
                 let text_str: &str = &text;
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text_str) {
-                    if client_msg.msg_type == "input" {
+                    if client_msg.msg_type == "pause" {
+                        if let Some(paused) = client_msg.paused {
+                            state_recv.game.lock().await.set_paused(&pid_recv, paused);
+                        }
+                    } else if client_msg.msg_type == "input" {
                         if let Some(input) = client_msg.input {
                             let mut game = state_recv.game.lock().await;
                             game.handle_input(&pid_recv, input);
@@ -282,8 +288,12 @@ async fn tick(state: &AppState) {
 
     // --- Physics step (every tick, 60 Hz) ---
     let mut game = state.game.lock().await;
-    let paused = game.is_game_over();
-    if !paused {
+    let game_finished = game.is_game_over();
+    let room_paused = game.is_paused();
+    let room_status = serde_json::json!({
+        "type": "room", "hostId": game.host_id(), "paused": room_paused,
+    }).to_string();
+    if !game_finished && !room_paused {
         game.update(1.0 / 60.0);
     }
 
@@ -312,6 +322,17 @@ async fn tick(state: &AppState) {
                 *recorded_wave = wave;
             }
         }
+    }
+
+    let room_changed = {
+        let mut previous = state.last_room_status.lock().await;
+        let changed = *previous != room_status;
+        *previous = room_status.clone();
+        changed
+    };
+
+    if room_changed {
+        state.pending_snapshots.lock().await.extend(players.keys().cloned());
     }
 
     // --- Delta computation ---
@@ -365,12 +386,16 @@ async fn tick(state: &AppState) {
     // --- Adaptive broadcast: try_send skips slow clients ---
     let clients = state.clients.lock().await;
     for (id, tx) in clients.iter() {
+        if room_changed || snapshot_ids.contains(id) {
+            // Host/pause changes must not be lost like disposable physics deltas.
+            let _ = tx.send(room_status.clone()).await;
+        }
         if snapshot_ids.contains(id) {
             // Snapshots are critical — use blocking send
             if let Some(ref ss) = snapshot_str {
                 let _ = tx.send(ss.clone()).await;
             }
-        } else if !paused {
+        } else if !game_finished && !room_paused {
             // Deltas are droppable — skip if client channel is full
             // Don't spam deltas when paused (nothing is changing)
             let _ = tx.try_send(delta_str.clone());
@@ -485,6 +510,8 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
     let zombies = game.zombies().len();
     let wave = game.wave();
     let game_over = game.is_game_over();
+    let paused = game.is_paused();
+    let host_id = game.host_id().map(str::to_owned);
     drop(game);
 
     let clients = state.clients.lock().await;
@@ -497,6 +524,8 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
         "zombies": zombies,
         "wave": wave,
         "game_over": game_over,
+        "paused": paused,
+        "host_id": host_id,
     }))
 }
 

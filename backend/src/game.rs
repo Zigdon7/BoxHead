@@ -310,6 +310,8 @@ fn award_kill_to_player(p: &mut Player, base_score: f64) {
 pub struct Game {
     players: HashMap<String, Player>,
     player_names: HashMap<String, String>,
+    join_order: Vec<String>,
+    paused: bool,
     inputs: HashMap<String, ClientInput>,
     zombies: Vec<Zombie>,
     bullets: Vec<Bullet>,
@@ -364,6 +366,8 @@ impl Game {
         Self {
             players: HashMap::new(),
             player_names: HashMap::new(),
+            join_order: Vec::new(),
+            paused: false,
             inputs: HashMap::new(),
             zombies: Vec::new(),
             bullets: Vec::new(),
@@ -427,6 +431,7 @@ impl Game {
         self.drops.clear();
         self.wave = 1;
         self.game_over = false;
+        self.paused = false;
         self.zombie_spawn_timer = 0.0;
         self.wave_kills = 0;
         self.wave_break_timer = 0.0;
@@ -447,7 +452,8 @@ impl Game {
             pickup.respawn_at = None;
         }
         // Respawn all players (preserve names)
-        let ids: Vec<String> = self.players.keys().cloned().collect();
+        let ids = self.join_order.clone();
+        self.join_order.clear();
         self.players.clear();
         self.inputs.clear();
         for id in ids {
@@ -457,6 +463,7 @@ impl Game {
     }
 
     pub fn add_player(&mut self, id: &str, name: &str) {
+        if !self.players.contains_key(id) { self.join_order.push(id.to_string()); }
         self.player_names.insert(id.to_string(), name.to_string());
         let player = Player {
             id: id.to_string(),
@@ -484,6 +491,11 @@ impl Game {
     }
 
     pub fn remove_player(&mut self, id: &str) {
+        if self.host_id() == Some(id) {
+            self.paused = false;
+            self.inputs.clear();
+        }
+        self.join_order.retain(|player| player != id);
         self.players.remove(id);
         self.player_names.remove(id);
         self.inputs.remove(id);
@@ -494,12 +506,26 @@ impl Game {
         self.dash_iframes.remove(id);
     }
 
+    pub fn host_id(&self) -> Option<&str> { self.join_order.first().map(String::as_str) }
+
+    pub fn is_paused(&self) -> bool { self.paused }
+
+    pub fn set_paused(&mut self, id: &str, paused: bool) -> bool {
+        if self.host_id() != Some(id) || self.game_over { return false; }
+        if self.paused != paused {
+            self.paused = paused;
+            self.inputs.clear();
+        }
+        true
+    }
+
     pub fn handle_input(&mut self, id: &str, input: ClientInput) {
+        if self.paused || !self.players.contains_key(id) { return; }
         self.inputs.insert(id.to_string(), input);
     }
 
     pub fn update(&mut self, dt: f64) {
-        if self.game_over {
+        if self.game_over || self.paused {
             return;
         }
 
@@ -1889,5 +1915,83 @@ mod starting_wave_tests {
         assert_eq!(game.wave(), 8);
         assert_eq!(game.players()["host"].health, 100.0);
         assert!(game.players()["host"].damage_log.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod host_pause_tests {
+    use super::*;
+
+    #[test]
+    fn only_first_connected_player_can_pause_or_resume() {
+        let mut game = Game::new();
+        game.add_player("first", "First"); game.add_player("second", "Second");
+        assert_eq!(game.host_id(), Some("first"));
+        assert!(!game.set_paused("second", true));
+        assert!(!game.set_paused("missing", true));
+        assert!(!game.is_paused());
+        assert!(game.set_paused("first", true));
+        assert!(!game.set_paused("second", false));
+        assert!(game.is_paused());
+        assert!(game.set_paused("first", false));
+    }
+
+    #[test]
+    fn pause_freezes_entire_world_and_rejects_inputs() {
+        let mut game = Game::new(); game.add_player("host", "Host");
+        game.update(0.016);
+        let clock = game.game_time;
+        let before = serde_json::to_string(&game.players).unwrap();
+        let enemies = serde_json::to_string(&game.zombies).unwrap();
+        let spawn_timer = game.zombie_spawn_timer;
+        game.set_paused("host", true);
+        let input = serde_json::from_value(serde_json::json!({
+            "up":true,"down":false,"left":false,"right":false,
+            "mouseX":0,"mouseY":0,"shooting":true,"melee":true,"selectWeapon":0,
+            "dash":true,"placeItem":1,"buyUpgrade":1,
+        })).unwrap();
+        game.handle_input("host", input);
+        for _ in 0..120 { game.update(1.0/60.0); }
+        assert_eq!(game.game_time, clock);
+        assert_eq!(game.zombie_spawn_timer, spawn_timer);
+        assert_eq!(serde_json::to_string(&game.players).unwrap(), before);
+        assert_eq!(serde_json::to_string(&game.zombies).unwrap(), enemies);
+        assert!(game.inputs.is_empty());
+        game.set_paused("host", false); game.update(0.016);
+        assert!(game.game_time > clock);
+    }
+
+    #[test]
+    fn host_departure_resumes_and_transfers_to_oldest_remaining_player() {
+        let mut game = Game::new();
+        for id in ["one", "two", "three"] { game.add_player(id, id); }
+        game.set_paused("one", true);
+        game.remove_player("one");
+        assert!(!game.is_paused());
+        assert_eq!(game.host_id(), Some("two"));
+        assert!(game.set_paused("two", true));
+        game.remove_player("three");
+        assert!(game.is_paused());
+        game.remove_player("two");
+        assert_eq!(game.host_id(), None); assert!(!game.is_paused());
+    }
+
+    #[test]
+    fn restart_preserves_host_order_and_unpauses() {
+        let mut game = Game::new();
+        game.add_player("z", "Host"); game.add_player("a", "Guest");
+        game.set_paused("z", true); game.reset_at_wave(5, 5);
+        assert_eq!(game.host_id(), Some("z"));
+        assert_eq!(game.join_order, vec!["z", "a"]);
+        assert!(!game.is_paused());
+        assert_eq!(game.wave(), 5);
+    }
+
+    #[test]
+    fn a_late_joiner_does_not_unpause_or_take_host() {
+        let mut game = Game::new(); game.add_player("host", "Host");
+        game.set_paused("host", true);
+        game.add_player("new", "New");
+        assert!(game.is_paused()); assert_eq!(game.host_id(), Some("host"));
     }
 }

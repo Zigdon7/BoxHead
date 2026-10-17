@@ -34,3 +34,11 @@ A modern multiplayer rebuild of the classic game **BoxHead**, featuring a 60 Hz 
 - **1 - 4** — Select Weapon (Pistol, Uzi, Shotgun, Rocket Launcher)
 - **E / Q / F** (or **5 / 6 / 7**) — Place Explosive Barrel / Barricade / Claymore Mine
 - **B** — Open/Close Tactical Armory (Spend Score on upgrades)
+
+## Host Pause & Field Guide
+
+- The first connected player is host. Use **P** or **Pause / Resume** to freeze or resume the entire round. Only the host can do this.
+- If the host disconnects, the round resumes automatically and the longest-connected remaining player becomes host. Restarts retain that order.
+- **About:** `/about.html` · **Learn to Play:** `/learn.html`. Both are linked from the main menu; the in-game **Field Guide** opens in a new tab without leaving the squad.
+- The illustrated guide covers all five enemy types, weapons, deployables, pickups and armory upgrades, with a wave-based enemy stat preview. Enemy, firearm, pickup and deployable illustrations share rendering code with the game.
+- Reading a guide or opening the armory does not automatically pause the round. Ask the host to pause first if needed.

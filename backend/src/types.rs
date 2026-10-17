@@ -408,4 +408,5 @@ pub struct ClientMessage {
     pub profile_id: Option<String>,
     #[serde(rename = "startingWave")]
     pub starting_wave: Option<u32>,
+    pub paused: Option<bool>,
 }

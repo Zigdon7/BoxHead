@@ -1,3 +1,4 @@
+import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite } from './sprites';
 import {
   Player,
   Zombie,
@@ -340,6 +341,31 @@ async function refreshWaveProgress() {
 renderWaveOptions();
 void refreshWaveProgress();
 
+let serverPaused = false;
+let roomHostId: string | null = null;
+const roomControls = document.getElementById('roomControls')!;
+const pauseButton = document.getElementById('pauseBtn') as HTMLButtonElement;
+const resumeButton = document.getElementById('resumeBtn') as HTMLButtonElement;
+const pauseOverlay = document.getElementById('pauseOverlay')!;
+function renderRoomControls() {
+  const playing = currentScreen === 'playing';
+  const host = roomHostId === myId && !!myId;
+  roomControls.classList.toggle('hidden', !playing);
+  pauseButton.disabled = !host;
+  pauseButton.textContent = host ? (serverPaused ? 'Resume [P]' : 'Pause [P]') : 'Host controls pause';
+  pauseButton.title = host ? 'Pause or resume the entire round' : 'Only the first connected player can pause';
+  pauseOverlay.hidden = !serverPaused || !playing;
+  pauseOverlay.style.display = serverPaused && playing ? 'grid' : 'none';
+  resumeButton.hidden = !host;
+  document.getElementById('pauseMessage')!.textContent = host ? 'You are the host. Everyone’s game is paused.' : 'Paused by the host. Waiting for them to resume.';
+}
+function requestPause() {
+  if (currentScreen !== 'playing' || roomHostId !== myId || ws?.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'pause', paused: !serverPaused }));
+}
+pauseButton.addEventListener('click', requestPause);
+resumeButton.addEventListener('click', requestPause);
+
 function setScreen(scr: Screen) {
   currentScreen = scr;
   mainMenuOverlay.classList.toggle('hidden', scr !== 'menu');
@@ -351,6 +377,7 @@ function setScreen(scr: Screen) {
   }
   friendsOverlay.classList.toggle('hidden', true);
   document.getElementById('gameSettingsBtn')?.classList.toggle('hidden', scr !== 'playing');
+  renderRoomControls();
   if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); }
   if (scr === 'gameover') {
     gameOverWave.textContent = finalWave.toString();
@@ -839,8 +866,8 @@ function renderArmoryDOM() {
 
   const dmgLv = p.damageLevel || 0;
   const meleeLv = p.meleeLevel || 0;
-  const dmgCost = 150 + dmgLv * 125;
-  const meleeCost = 125 + meleeLv * 100;
+  const dmgCost = 200 + dmgLv * 150;
+  const meleeCost = 150 + meleeLv * 125;
 
   const slots = p.weaponSlots || [true, false, false, false];
   const weaponNames = ['Pistol', 'Uzi SMG', 'Combat Shotgun', 'Rocket Launcher'];
@@ -886,7 +913,7 @@ function renderArmoryDOM() {
       desc: 'Permanently increases Max HP by +25 and immediately restores +60 Health.',
       statText: `HP ${Math.ceil(p.health)}/${p.maxHealth} → +25 Max & +60 Heal`,
       pips: '',
-      cost: 120,
+      cost: 150,
     },
     {
       id: 3,
@@ -898,7 +925,7 @@ function renderArmoryDOM() {
       desc: 'Increases Max Ammo capacity by +25 and completely refills your reserve.',
       statText: `Ammo ${Math.floor(p.ammo)}/${p.maxAmmo} → ${p.maxAmmo + 25} Full`,
       pips: '',
-      cost: 100,
+      cost: 125,
     },
     {
       id: 4,
@@ -910,7 +937,7 @@ function renderArmoryDOM() {
       desc: 'Field resupply of +2 Explosive Barrels, +2 Steel Barricades, and +2 Claymores.',
       statText: `Gear: ${(p.tacticalItems?.[0] || 0)}B / ${(p.tacticalItems?.[1] || 0)}W / ${(p.tacticalItems?.[2] || 0)}M (+2 All)`,
       pips: '',
-      cost: 125,
+      cost: 140,
     },
     {
       id: 6,
@@ -918,11 +945,11 @@ function renderArmoryDOM() {
       icon: '🚀',
       iconBg: 'rgba(206, 147, 216, 0.18)',
       iconColor: '#ce93d8',
-      title: nextLockedIdx !== -1 ? `Unlock ${nextWeaponName}` : 'Full Arsenal Resupply',
+      title: nextLockedIdx !== -1 ? `Unlock ${nextWeaponName}` : 'Arsenal Complete',
       desc:
         nextLockedIdx !== -1
-          ? `Immediately unlocks & equips the ${nextWeaponName} with a full ammo reserve.`
-          : 'All firearms unlocked! Grants a full ammo refill +20 bonus capacity.',
+          ? `Immediately unlocks & equips the ${nextWeaponName}. Uses your shared ammo reserve.`
+          : 'All firearms are unlocked. Use Expanded Magazine to refill ammunition.',
       statText: nextLockedIdx !== -1 ? `UNLOCK SLOT [${nextLockedIdx + 1}]` : 'ARSENAL COMPLETE',
       pips: renderLevelPips(slots.filter(Boolean).length, 4),
       cost: 250,
@@ -931,7 +958,7 @@ function renderArmoryDOM() {
 
   armoryGrid.innerHTML = cards
     .map((c) => {
-      const canBuy = credits >= c.cost;
+      const canBuy = credits >= c.cost && !(c.id === 6 && nextLockedIdx === -1) && !(c.id === 1 && dmgLv >= 10) && !(c.id === 5 && meleeLv >= 10);
       return `
       <div class="shop-card ${canBuy ? 'affordable' : 'locked'}">
         <div>
@@ -1148,7 +1175,7 @@ function getExtrapolatedBullets(): Bullet[] {
   const result: Bullet[] = [];
   for (const [id, b] of bulletMap) {
     const created = bulletCreationTime.get(id) ?? now;
-    const elapsed = (now - created) / 1000;
+    const elapsed = serverPaused ? 0 : (now - created) / 1000;
     result.push({
       ...b,
       pos: {
@@ -1314,6 +1341,8 @@ function drainDeltaQueue() {
 }
 
 function resetGameState() {
+  serverPaused = false;
+  roomHostId = null;
   players = {};
   zombieMap.clear();
   bulletMap.clear();
@@ -1364,7 +1393,21 @@ function connectToServer() {
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data) as { type: string };
 
-    if (data.type === 'init') {
+    if (data.type === 'room') {
+      const room = data as { type: string; hostId: string | null; paused: boolean };
+      roomHostId = room.hostId;
+      if (serverPaused !== room.paused) {
+        serverPaused = room.paused;
+        input.up = input.down = input.left = input.right = input.shooting = input.melee = input.dash = false;
+        input.placeItem = input.buyUpgrade = input.selectWeapon = 0;
+        keysDown.clear();
+        dashPending = false;
+        dashActiveTimer = dashIframeTimer = 0;
+        lastSentInput = '';
+        toggleArmory(false);
+      }
+      renderRoomControls();
+    } else if (data.type === 'init') {
       const init = data as InitPayload;
       myId = init.id;
       staticWalls = init.walls;
@@ -1673,7 +1716,7 @@ function applyDelta(delta: DeltaState) {
       const b = bulletMap.get(id);
       if (b && b.isRocket) {
         const created = bulletCreationTime.get(id) ?? now;
-        const elapsed = (now - created) / 1000;
+        const elapsed = serverPaused ? 0 : (now - created) / 1000;
         const rx = b.pos.x + b.vel.x * elapsed;
         const ry = b.pos.y + b.vel.y * elapsed;
         spawnExplosion(rx, ry, 85, '#ff5722');
@@ -1864,6 +1907,10 @@ window.addEventListener('keydown', (e) => {
   if (document.activeElement?.tagName === 'INPUT') return;
   if (settingsListening) return;
   const code = e.code;
+  if (code === 'KeyP' && !e.repeat && currentScreen === 'playing') {
+    e.preventDefault(); requestPause(); return;
+  }
+  if (serverPaused) return;
   const wasDown = keysDown.has(code);
   if (wasDown) return;
   keysDown.add(code);
@@ -1905,8 +1952,8 @@ window.addEventListener('mousemove', (e) => {
 });
 
 window.addEventListener('mousedown', (e) => {
-  if (settingsListening) return;
-  if ((e.target as HTMLElement).closest('#armoryOverlay') || (e.target as HTMLElement).closest('#settingsOverlay')) {
+  if (settingsListening || serverPaused) return;
+  if ((e.target as HTMLElement).closest('#roomControls, #pauseOverlay, #armoryOverlay') || (e.target as HTMLElement).closest('#settingsOverlay')) {
     return;
   }
   if (currentScreen === 'playing' && e.button === 0) {
@@ -1984,6 +2031,7 @@ const JOYSTICK_DEAD_ZONE = 15;
 const JOYSTICK_MAX = 60;
 
 function handleTouchStart(e: TouchEvent) {
+  if (serverPaused) return;
   e.preventDefault();
   for (let i = 0; i < e.changedTouches.length; i++) {
     const t = e.changedTouches[i];
@@ -2095,7 +2143,7 @@ const HEARTBEAT_INTERVAL = 500;
 
 function maybeSendInput() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  if (currentScreen !== 'playing') return;
+  if (currentScreen !== 'playing' || serverPaused) return;
 
   input.mouseX = Math.round(screenMouseX + camX);
   input.mouseY = Math.round(screenMouseY + camY);
@@ -2324,91 +2372,7 @@ function drawPlaceables(state: GameState) {
     const sy = pl.pos.y - camY;
     if (sx < -60 || sx > canvas.width + 60 || sy < -60 || sy > canvas.height + 60) continue;
 
-    ctx.save();
-    ctx.translate(sx, sy);
-
-    if (pl.type === 'barrel') {
-      // Shadow
-      ctx.fillStyle = 'rgba(0,0,0,0.45)';
-      ctx.beginPath();
-      ctx.ellipse(0, 12, 16, 8, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Red explosive barrel
-      ctx.fillStyle = '#d32f2f';
-      ctx.beginPath();
-      ctx.arc(0, 0, 15, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.lineWidth = 2.5;
-      ctx.strokeStyle = '#ffeb3b';
-      ctx.stroke();
-
-      // Inner hazard ring & icon
-      ctx.fillStyle = '#b71c1c';
-      ctx.beginPath();
-      ctx.arc(0, 0, 9, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = '#ffeb3b';
-      ctx.font = 'bold 11px monospace';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('TNT', 0, 1);
-    } else if (pl.type === 'barricade') {
-      // Shadow
-      ctx.fillStyle = 'rgba(0,0,0,0.45)';
-      ctx.fillRect(-19, -15, 42, 34);
-
-      // Reinforced steel/sandbag barricade
-      ctx.fillStyle = '#5d4037';
-      ctx.fillRect(-20, -16, 40, 32);
-      ctx.strokeStyle = '#8d6e63';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(-20, -16, 40, 32);
-
-      // Steel cross-bracing
-      ctx.fillStyle = '#78909c';
-      ctx.fillRect(-18, -5, 36, 10);
-      ctx.fillStyle = '#cfd8dc';
-      ctx.fillRect(-14, -2, 4, 4);
-      ctx.fillRect(10, -2, 4, 4);
-
-      // Health bar if damaged
-      if (pl.health < pl.maxHealth) {
-        const bw = 36;
-        ctx.fillStyle = 'rgba(0,0,0,0.7)';
-        ctx.fillRect(-bw / 2, -24, bw, 4);
-        ctx.fillStyle = '#ffb400';
-        ctx.fillRect(-bw / 2, -24, bw * Math.max(0, pl.health / pl.maxHealth), 4);
-      }
-    } else if (pl.type === 'mine') {
-      // Faint sensor trigger radius
-      const blink = Math.sin(now / 150) > 0;
-      ctx.strokeStyle = blink ? 'rgba(255, 82, 82, 0.32)' : 'rgba(255, 82, 82, 0.14)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.arc(0, 0, 38, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Mine body
-      ctx.fillStyle = '#263238';
-      ctx.beginPath();
-      ctx.arc(0, 0, 10, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#90a4ae';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-
-      // Blinking LED
-      ctx.fillStyle = blink ? '#ff1744' : '#880e4f';
-      ctx.beginPath();
-      ctx.arc(0, 0, 4, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    ctx.restore();
+    drawPlaceableSprite(ctx, pl, sx, sy, now);
   }
 }
 
@@ -2451,92 +2415,7 @@ function drawDrops(state: GameState) {
     const sy = d.pos.y - camY;
     if (sx < -40 || sx > canvas.width + 40 || sy < -40 || sy > canvas.height + 40) continue;
 
-    const pulse = 0.75 + 0.25 * Math.sin(now / 200);
-    const bob = Math.sin(now / 300) * 3;
-    const dy = sy + bob;
-
-    const glowColors: Record<string, string> = {
-      ammo: 'rgba(255,200,0,0.25)',
-      health: 'rgba(76,175,80,0.3)',
-      weapon: 'rgba(156,39,176,0.3)',
-      tactical: 'rgba(255,109,0,0.3)',
-    };
-    const glowR = 22 + 4 * Math.sin(now / 250);
-    ctx.beginPath();
-    ctx.arc(sx, dy, glowR, 0, Math.PI * 2);
-    ctx.fillStyle = glowColors[d.type] || 'rgba(255,255,255,0.1)';
-    ctx.fill();
-
-    const bgColors: Record<string, string> = {
-      ammo: `rgba(50,40,0,${pulse})`,
-      health: `rgba(0,40,10,${pulse})`,
-      weapon: `rgba(40,0,50,${pulse})`,
-      tactical: `rgba(55,20,0,${pulse})`,
-    };
-    ctx.beginPath();
-    ctx.arc(sx, dy, 14, 0, Math.PI * 2);
-    ctx.fillStyle = bgColors[d.type] || 'rgba(0,0,0,0.5)';
-    ctx.fill();
-
-    const ringColors: Record<string, string> = {
-      ammo: '#ffb400',
-      health: '#4caf50',
-      weapon: '#ce93d8',
-      tactical: '#ff6d00',
-    };
-    ctx.strokeStyle = ringColors[d.type] || '#fff';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    if (d.type === 'ammo') {
-      ctx.fillStyle = '#ffd54f';
-      ctx.fillRect(sx - 6, dy - 3, 4, 10);
-      ctx.fillRect(sx - 1, dy - 3, 4, 10);
-      ctx.fillRect(sx + 4, dy - 3, 4, 10);
-      ctx.fillStyle = '#ff8f00';
-      ctx.fillRect(sx - 6, dy - 5, 4, 3);
-      ctx.fillRect(sx - 1, dy - 5, 4, 3);
-      ctx.fillRect(sx + 4, dy - 5, 4, 3);
-    } else if (d.type === 'health') {
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(sx - 2, dy - 8, 5, 16);
-      ctx.fillRect(sx - 8, dy - 2, 16, 5);
-      ctx.fillStyle = '#e53935';
-      ctx.fillRect(sx - 1, dy - 7, 3, 14);
-      ctx.fillRect(sx - 7, dy - 1, 14, 3);
-    } else if (d.type === 'weapon') {
-      ctx.fillStyle = '#ce93d8';
-      ctx.fillRect(sx - 2, dy - 8, 5, 10);
-      ctx.fillRect(sx - 6, dy - 2, 13, 5);
-      ctx.fillRect(sx - 4, dy + 3, 4, 6);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 8px sans-serif';
-      ctx.fillText('\u2605', sx + 5, dy - 5);
-    } else if (d.type === 'tactical') {
-      ctx.fillStyle = '#ffab00';
-      ctx.font = 'bold 11px monospace';
-      ctx.fillText('TAC', sx, dy + 1);
-    }
-
-    const labelColors: Record<string, string> = {
-      ammo: '#ffd54f',
-      health: '#81c784',
-      weapon: '#ce93d8',
-      tactical: '#ffab00',
-    };
-    const labelText: Record<string, string> = {
-      ammo: 'AMMO',
-      health: 'HEALTH',
-      weapon: 'WEAPON',
-      tactical: 'GEAR',
-    };
-    ctx.fillStyle = labelColors[d.type] || '#fff';
-    ctx.font = 'bold 8px monospace';
-    ctx.textBaseline = 'top';
-    ctx.fillText(labelText[d.type] || '', sx, dy + 16);
+    drawDropSprite(ctx, d, sx, sy, now);
   }
 }
 
@@ -2581,19 +2460,6 @@ function drawZombies(state: GameState) {
     const sy = z.pos.y - camY;
     if (sx < -60 || sx > canvas.width + 60 || sy < -60 || sy > canvas.height + 60) continue;
 
-    let size = 10;
-    let bodyColor = '#4CAF50';
-    let shoulderColor = '#388E3C';
-    let eyeColor = '#fff';
-
-    if (z.type === 'devil') { size = 14; bodyColor = '#e53935'; shoulderColor = '#b71c1c'; eyeColor = '#ffeb3b'; }
-    if (z.type === 'crawler') { size = 8; bodyColor = '#bcc6cc'; shoulderColor = '#98a4ab'; eyeColor = '#b71c1c'; }
-    if (z.type === 'brute') { size = 20; bodyColor = '#5d4037'; shoulderColor = '#3e2723'; eyeColor = '#ff5722'; }
-    if (z.type === 'vampire') { size = 12; bodyColor = '#e0e0e0'; shoulderColor = '#9e9e9e'; eyeColor = '#d50000'; }
-
-    ctx.save();
-    ctx.translate(sx, sy);
-
     let angle = 0;
     let closestP = null;
     let minDist = Infinity;
@@ -2607,76 +2473,7 @@ function drawZombies(state: GameState) {
       angle = Math.atan2(closestP.pos.y - z.pos.y, closestP.pos.x - z.pos.x);
     }
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-    ctx.beginPath();
-    ctx.ellipse(0, size + 4, size * 1.5, size * 0.8, 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.rotate(angle);
-
-    if (z.type === 'vampire') {
-      ctx.fillStyle = '#111';
-      ctx.beginPath();
-      ctx.moveTo(-size, 0);
-      ctx.lineTo(-size - 10, -size - 8);
-      ctx.lineTo(-size - 10, size + 8);
-      ctx.fill();
-    }
-
-    ctx.fillStyle = shoulderColor;
-    ctx.fillRect(-size * 0.8, -size * 1.2, size * 1.6, size * 2.4);
-
-    if (z.type === 'brute') {
-      ctx.fillStyle = '#212121';
-      ctx.fillRect(-size * 0.9, -size * 1.3, size * 1.8, size * 2.6);
-    }
-
-    ctx.fillStyle = bodyColor;
-    if (z.type === 'crawler') {
-      ctx.fillRect(0, -size * 1.5, size * 1.2, 4);
-      ctx.fillRect(0, size * 1.5 - 4, size * 1.2, 4);
-    } else {
-      ctx.fillRect(size * 0.2, -size * 1.4, size, size * 0.6);
-      ctx.fillRect(size * 0.2, size * 0.8, size, size * 0.6);
-    }
-
-    ctx.fillStyle = bodyColor;
-    ctx.fillRect(-size, -size, size * 2, size * 2);
-
-    ctx.strokeStyle = 'rgba(0,0,0,0.2)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(-size + 1, -size + 1, size * 2 - 2, size * 2 - 2);
-
-    ctx.fillStyle = eyeColor;
-    ctx.fillRect(size * 0.4, -size * 0.6, size * 0.3, size * 0.3);
-    ctx.fillRect(size * 0.4, size * 0.3, size * 0.3, size * 0.3);
-
-    if (z.type !== 'vampire' && z.type !== 'brute') {
-      ctx.fillStyle = '#000';
-      ctx.fillRect(size * 0.5, -size * 0.5, size * 0.1, size * 0.1);
-      ctx.fillRect(size * 0.5, size * 0.4, size * 0.1, size * 0.1);
-    }
-
-    if (z.type === 'devil') {
-      ctx.fillStyle = '#b71c1c';
-      ctx.beginPath();
-      ctx.moveTo(-size * 0.5, -size);
-      ctx.lineTo(size * 0.5, -size - 8);
-      ctx.lineTo(size * 0.5, -size);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.moveTo(-size * 0.5, size);
-      ctx.lineTo(size * 0.5, size + 8);
-      ctx.lineTo(size * 0.5, size);
-      ctx.fill();
-    }
-
-    if (z.type === 'brute') {
-      ctx.fillStyle = '#8e0000';
-      ctx.fillRect(size * 0.6, -size * 0.3, size * 0.4, size * 0.6);
-    }
-
-    ctx.restore();
+    const size = drawEnemySprite(ctx, z.type, sx, sy, angle);
 
     const barW = size * 2 + 10;
     drawTickHealthBar(sx - barW / 2, sy - size - 16, z.health, z.maxHealth, barW, weaponDmg);
@@ -2968,7 +2765,6 @@ function drawPlayers(dt: number, state: GameState) {
 
     const suitColor = isMe ? '#1976D2' : '#D32F2F';
     const skinColor = '#FFC107';
-    const gunColor = '#424242';
 
     // Sheathed Plasma Katana on back/hip (when not actively mid-swing)
     if (!isMe || meleeSwingTime <= 0) {
@@ -3003,29 +2799,7 @@ function drawPlayers(dt: number, state: GameState) {
     ctx.strokeRect(10, -16, 8, 8);
     ctx.strokeRect(10, 8, 8, 8);
 
-    // Gun
-    ctx.fillStyle = gunColor;
-    if (p.weapon === 'pistol') {
-      ctx.fillRect(15, -4, 18, 8);
-    } else if (p.weapon === 'uzi') {
-      ctx.fillRect(12, -4, 20, 8);
-      ctx.fillRect(20, -6, 4, 12);
-    } else if (p.weapon === 'shotgun') {
-      ctx.fillRect(10, -5, 26, 10);
-      ctx.fillStyle = '#795548';
-      ctx.fillRect(10, -4, 8, 8);
-    } else if (p.weapon === 'rocketLauncher') {
-      ctx.fillRect(8, -6, 28, 12);
-      ctx.fillStyle = '#795548';
-      ctx.fillRect(8, -4, 8, 8);
-      ctx.fillStyle = '#f44336';
-      ctx.beginPath();
-      ctx.arc(34, 0, 5, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      ctx.fillRect(15, -4, 18, 8);
-    }
-    ctx.strokeRect(15, -4, 18, 8);
+    drawGunSprite(ctx, p.weapon);
 
     // Head
     ctx.fillStyle = skinColor;
@@ -3756,10 +3530,11 @@ function updateDeathRecap() {
 
 function draw() {
   const now = performance.now();
-  const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
+  const frameDt = Math.min(0.1, (now - lastFrameTime) / 1000);
   lastFrameTime = now;
 
   drainDeltaQueue();
+  const dt = serverPaused ? 0 : frameDt;
   updateDeathRecap();
   predictLocalMovement(dt);
 
