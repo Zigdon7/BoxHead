@@ -1,5 +1,9 @@
 import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite } from './sprites';
 import {
+  RoomInfo, Friend, OPEN_ROOM_ID, partitionRooms, resolveSelectedRoom, roomStatusText,
+  verifyStatusText, sortFriends, friendsSummary, defaultCallsign, accountLabel,
+} from './lobby';
+import {
   Player,
   Zombie,
   Bullet,
@@ -256,12 +260,14 @@ const closeFriendsBtn = document.getElementById('closeFriendsBtn')!;
 const addFriendBtn = document.getElementById('addFriendBtn')!;
 const backToMenuBtn = document.getElementById('backToMenuBtn')!;
 
-const authSectionOut = document.getElementById('authSectionOut')!;
+const signInBtn = document.getElementById('signInBtn')!;
 const authSectionIn = document.getElementById('authSectionIn')!;
 const loggedInStatus = document.getElementById('loggedInStatus')!;
 const loginErrorMsg = document.getElementById('loginErrorMsg')!;
 
 const friendsListContainer = document.getElementById('friendsListContainer')!;
+const homeFriendsList = document.getElementById('homeFriendsList')!;
+const homeFriendsSummary = document.getElementById('homeFriendsSummary')!;
 const addFriendErrorMsg = document.getElementById('addFriendErrorMsg')!;
 
 const gameOverWave = document.getElementById('gameOverWave')!;
@@ -276,19 +282,146 @@ function resizeCanvas() {
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
+// --- Servers (rooms) ---
+// Every lobby is hosted by the game server. Signed-in (verified) accounts can
+// join any lobby; guests can only join open lobbies. The server enforces this
+// on join — the UI just reflects what the server reports.
+let rooms: RoomInfo[] = [];
+let accountVerified = false;
+let selectedRoomId = localStorage.getItem('boxhead_room') || OPEN_ROOM_ID;
+let currentRoomId = selectedRoomId;
+let currentRoomName = 'Arena';
+const verifiedRoomListEl = document.getElementById('verifiedRoomList')!;
+const openRoomListEl = document.getElementById('openRoomList')!;
+const deployBtn = document.getElementById('deployBtn') as HTMLButtonElement;
+const verifyStatusEl = document.getElementById('verifyStatus')!;
+const roomErrorMsg = document.getElementById('roomErrorMsg')!;
+const roomNameInput = document.getElementById('roomNameInput') as HTMLInputElement;
+const roomVerifiedOnly = document.getElementById('roomVerifiedOnly') as HTMLInputElement;
+const roomVerifiedLabel = document.getElementById('roomVerifiedLabel')!;
+
+function selectRoom(id: string) {
+  selectedRoomId = id;
+  localStorage.setItem('boxhead_room', id);
+  renderRooms();
+}
+
+function renderRoomItem(room: RoomInfo): HTMLButtonElement {
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.className = 'room-item' + (room.id === selectedRoomId ? ' selected' : '');
+  item.disabled = !room.canJoin;
+  item.title = room.canJoin ? `Select ${room.name} (double-click to deploy)` : 'Sign in to join verified lobbies';
+  const name = document.createElement('span');
+  name.className = 'room-name';
+  name.textContent = (room.canJoin ? '' : '🔒 ') + room.name;
+  const meta = document.createElement('span');
+  meta.className = 'room-meta';
+  meta.textContent = roomStatusText(room);
+  item.append(name, meta);
+  item.addEventListener('click', () => selectRoom(room.id));
+  item.addEventListener('dblclick', () => { selectRoom(room.id); deploy(); });
+  return item;
+}
+
+function renderRoomList(container: HTMLElement, list: RoomInfo[], emptyText: string) {
+  if (list.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'room-empty';
+    empty.textContent = emptyText;
+    container.replaceChildren(empty);
+  } else {
+    container.replaceChildren(...list.map(renderRoomItem));
+  }
+}
+
+function renderRooms() {
+  // Fall back to the open arena if the remembered lobby vanished or is locked.
+  selectedRoomId = resolveSelectedRoom(rooms, selectedRoomId);
+  verifyStatusEl.textContent = verifyStatusText(accountVerified, isLoggedIn);
+  verifyStatusEl.classList.toggle('ok', accountVerified);
+  roomVerifiedOnly.disabled = !accountVerified;
+  if (!accountVerified) roomVerifiedOnly.checked = false;
+  roomVerifiedLabel.classList.toggle('locked', !accountVerified);
+  roomVerifiedLabel.title = accountVerified ? 'Only verified accounts can join' : 'Sign in to host verified lobbies';
+
+  const { verified, open } = partitionRooms(rooms);
+  renderRoomList(verifiedRoomListEl, verified, 'No verified lobbies yet.');
+  renderRoomList(openRoomListEl, open, 'No open lobbies yet.');
+  const selected = rooms.find(r => r.id === selectedRoomId);
+  deployBtn.textContent = selected ? `DEPLOY TO ${selected.name}` : 'DEPLOY';
+}
+
+async function refreshRooms() {
+  try {
+    const res = await fetch(`/api/rooms?token=${encodeURIComponent(authToken)}`);
+    const data = await res.json();
+    if (!data.ok) return;
+    rooms = data.rooms;
+    accountVerified = !!data.verified;
+    renderRooms();
+  } catch { /* keep the last list */ }
+}
+
+async function createRoom() {
+  roomErrorMsg.textContent = '';
+  const name = roomNameInput.value.trim();
+  if (!name) { roomErrorMsg.textContent = 'Name your lobby first'; return; }
+  try {
+    const res = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: authToken, name, verifiedOnly: roomVerifiedOnly.checked }),
+    });
+    const data = await res.json();
+    if (!data.ok) { roomErrorMsg.textContent = data.error || 'Could not create lobby'; return; }
+    roomNameInput.value = '';
+    selectedRoomId = data.room.id;
+    localStorage.setItem('boxhead_room', selectedRoomId);
+    await refreshRooms();
+  } catch {
+    roomErrorMsg.textContent = 'Network error';
+  }
+}
+
+document.getElementById('refreshRoomsBtn')!.addEventListener('click', () => void refreshRooms());
+document.getElementById('createRoomBtn')!.addEventListener('click', () => void createRoom());
+roomNameInput.addEventListener('keydown', e => { if (e.key === 'Enter') void createRoom(); });
+setInterval(() => { if (currentScreen === 'menu' && menuView === 'browser') void refreshRooms(); }, 5000);
+
+// --- Menu views: home (Play / Sign in), server browser, sign in ---
+type MenuView = 'home' | 'browser' | 'signin';
+let menuView: MenuView = 'home';
+const menuViews: Record<MenuView, HTMLElement> = {
+  home: document.getElementById('menuHome')!,
+  browser: document.getElementById('menuBrowser')!,
+  signin: document.getElementById('menuSignIn')!,
+};
+function showMenuView(view: MenuView) {
+  menuView = view;
+  for (const [name, el] of Object.entries(menuViews)) el.classList.toggle('hidden', name !== view);
+  if (view === 'browser') void refreshRooms();
+}
+document.querySelectorAll<HTMLElement>('[data-menu-view]').forEach(el =>
+  el.addEventListener('click', () => showMenuView(el.dataset.menuView as MenuView)));
+document.getElementById('signInBtn')!.addEventListener('click', () => showMenuView('signin'));
+
+function deploy() {
+  if (!playerName.trim()) playerName = 'Operative';
+  nameInputEl.value = playerName;
+  connectToServer();
+}
+deployBtn.addEventListener('click', deploy);
+
 // --- Screen state ---
 type Screen = 'menu' | 'playing' | 'gameover';
 let currentScreen: Screen = 'menu';
 
 function updateAuthDOM() {
+  signInBtn.classList.toggle('hidden', isLoggedIn);
+  authSectionIn.classList.toggle('hidden', !isLoggedIn);
   if (isLoggedIn) {
-    authSectionOut.classList.add('hidden');
-    authSectionIn.classList.remove('hidden');
-    loggedInStatus.textContent = `Logged in as @${authHandle}`;
-    friendsBtn.textContent = `Friends (${friendsList.filter(f => f.online).length}/${friendsList.length})`;
-  } else {
-    authSectionOut.classList.remove('hidden');
-    authSectionIn.classList.add('hidden');
+    loggedInStatus.textContent = `Signed in as ${accountLabel(authHandle)}`;
   }
 }
 
@@ -378,7 +511,7 @@ function setScreen(scr: Screen) {
   friendsOverlay.classList.toggle('hidden', true);
   document.getElementById('gameSettingsBtn')?.classList.toggle('hidden', scr !== 'playing');
   renderRoomControls();
-  if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); }
+  if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); void refreshRooms(); }
   if (scr === 'gameover') {
     gameOverWave.textContent = finalWave.toString();
     gameOverScore.textContent = Math.floor(finalScore).toString();
@@ -391,7 +524,8 @@ let finalWave = 1;
 let finalScore = 0;
 let finalKills = 0;
 let finalMaxCombo = 0;
-let playerName = localStorage.getItem('boxhead_name') || 'Operative';
+// Older builds saved the full sign-in email as the callsign; never broadcast that.
+let playerName = (n => (n.includes('@') ? defaultCallsign(n) : n))(localStorage.getItem('boxhead_name') || 'Operative');
 
 // --- Auth ---
 let authToken = localStorage.getItem('boxhead_auth_token') || '';
@@ -400,7 +534,6 @@ let authUserId = localStorage.getItem('boxhead_auth_user_id') || '';
 let isLoggedIn = !!authToken;
 
 // --- Friends ---
-interface Friend { handle: string; display_name: string; user_id: string; online: boolean; }
 let friendsList: Friend[] = [];
 
 function setAuthState(token: string, handle: string, userId: string, displayName?: string) {
@@ -408,7 +541,7 @@ function setAuthState(token: string, handle: string, userId: string, displayName
   authHandle = handle || displayName || '';
   authUserId = userId;
   isLoggedIn = true;
-  playerName = authHandle;
+  playerName = defaultCallsign(authHandle);
   nameInputEl.value = playerName;
   localStorage.setItem('boxhead_auth_token', authToken);
   localStorage.setItem('boxhead_auth_handle', authHandle);
@@ -416,6 +549,8 @@ function setAuthState(token: string, handle: string, userId: string, displayName
   localStorage.setItem('boxhead_name', playerName);
   updateAuthDOM();
   refreshFriends();
+  void refreshRooms();
+  if (menuView === 'signin') showMenuView('home');
 }
 
 function clearAuthState() {
@@ -428,6 +563,9 @@ function clearAuthState() {
   localStorage.removeItem('boxhead_auth_token');
   localStorage.removeItem('boxhead_auth_handle');
   localStorage.removeItem('boxhead_auth_user_id');
+  accountVerified = false;
+  updateFriendsDOM();
+  void refreshRooms();
 }
 
 async function bskyLogin(handle: string, password: string) {
@@ -523,22 +661,45 @@ async function refreshFriends() {
   } catch { /* ignore */ }
 }
 
-function updateFriendsDOM() {
+// Built with DOM nodes (not innerHTML) so handles can never inject markup.
+function renderFriendList(container: HTMLElement, removable: boolean) {
   if (friendsList.length === 0) {
-    friendsListContainer.innerHTML = '<div style="text-align:center; color:#666; padding:10px;">No friends yet</div>';
+    const empty = document.createElement('div');
+    empty.className = 'friends-empty';
+    empty.textContent = removable ? 'No friends yet' : 'No friends yet. Add some from Manage Friends.';
+    container.replaceChildren(empty);
     return;
   }
-  friendsListContainer.innerHTML = friendsList.map(f => `
-    <div class="friend-item">
-      <span>
-        <div class="status-dot ${f.online ? 'online' : ''}"></div>
-        ${f.handle}
-      </span>
-      <button class="btn-icon-red" onclick="window.removeFriendFromDOM('${f.user_id}')">✕</button>
-    </div>
-  `).join('');
+  container.replaceChildren(...sortFriends(friendsList).map(f => {
+    const row = document.createElement('div');
+    row.className = 'friend-item';
+    const label = document.createElement('span');
+    const dot = document.createElement('div');
+    dot.className = `status-dot${f.online ? ' online' : ''}`;
+    const handle = document.createElement('span');
+    handle.textContent = f.handle;
+    const state = document.createElement('span');
+    state.className = `friend-state${f.online ? ' online' : ''}`;
+    state.textContent = f.online ? 'Online' : 'Offline';
+    label.append(dot, handle);
+    row.append(label, state);
+    if (removable) {
+      const remove = document.createElement('button');
+      remove.className = 'btn-icon-red';
+      remove.title = `Remove ${f.handle}`;
+      remove.textContent = '✕';
+      remove.addEventListener('click', () => void removeFriend(f.user_id));
+      row.append(remove);
+    }
+    return row;
+  }));
 }
-(window as any).removeFriendFromDOM = removeFriend;
+
+function updateFriendsDOM() {
+  renderFriendList(friendsListContainer, true);
+  renderFriendList(homeFriendsList, false);
+  homeFriendsSummary.textContent = friendsSummary(friendsList);
+}
 
 async function addFriend(handle: string) {
   addFriendErrorMsg.textContent = '';
@@ -572,6 +733,7 @@ async function removeFriend(userId: string) {
 }
 
 setInterval(() => { if (isLoggedIn) refreshFriends(); }, 5000);
+updateFriendsDOM();
 if (isLoggedIn) refreshFriends();
 
 // --- Static data (received once on init) ---
@@ -696,14 +858,10 @@ bskyLoginBtn.addEventListener('click', () => {
 });
 googleLoginBtn.addEventListener('click', googleLogin);
 logoutBtn.addEventListener('click', clearAuthState);
-playBtn.addEventListener('click', () => {
-  if (!playerName.trim()) playerName = 'Operative';
-  nameInputEl.value = playerName;
-  connectToServer();
-});
+playBtn.addEventListener('click', () => showMenuView('browser'));
 playAgainBtn.addEventListener('click', async () => {
   try {
-    const params = new URLSearchParams({ profileId: waveProfile, startingWave: String(startingWave) });
+    const params = new URLSearchParams({ profileId: waveProfile, startingWave: String(startingWave), roomId: currentRoomId, token: authToken });
     const response = await fetch(`/admin/restart?${params}`, { method: 'POST' });
     const result = await response.json();
     if (!response.ok || !result.ok) return;
@@ -1379,6 +1537,9 @@ function triggerWaveBanner(title: string, subtitle: string, color = '#ffb400') {
 }
 
 function connectToServer() {
+  roomErrorMsg.textContent = '';
+  currentRoomId = selectedRoomId;
+  currentRoomName = rooms.find(r => r.id === currentRoomId)?.name ?? 'Arena';
   resetGameState();
   setScreen('playing');
   localStorage.setItem('boxhead_name', playerName);
@@ -1387,15 +1548,20 @@ function connectToServer() {
   ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined, profileId: waveProfile, startingWave }));
+    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined, profileId: waveProfile, startingWave, roomId: currentRoomId }));
   };
 
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data) as { type: string };
 
-    if (data.type === 'room') {
-      const room = data as { type: string; hostId: string | null; paused: boolean };
+    if (data.type === 'joinError') {
+      // The server refused the join (e.g. verified-only room); onclose returns to the menu.
+      roomErrorMsg.textContent = (data as { type: string; error?: string }).error || 'Could not join that lobby';
+      showMenuView('browser');
+    } else if (data.type === 'room') {
+      const room = data as { type: string; hostId: string | null; paused: boolean; roomName?: string };
       roomHostId = room.hostId;
+      if (room.roomName) currentRoomName = room.roomName;
       if (serverPaused !== room.paused) {
         serverPaused = room.paused;
         input.up = input.down = input.left = input.right = input.shooting = input.melee = input.dash = false;
@@ -1425,7 +1591,7 @@ function connectToServer() {
         setScreen('gameover');
       } else {
         triggerWaveBanner(`WAVE ${init.wave}`, 'SURVIVE THE HORDE', '#e53935');
-        pushFeedEvent(`Deployed to Arena — Wave ${init.wave}`, '#64b5f6');
+        pushFeedEvent(`Deployed to ${currentRoomName} — Wave ${init.wave}`, '#64b5f6');
       }
     } else if (data.type === 'snapshot') {
       const snap = data as SnapshotState;

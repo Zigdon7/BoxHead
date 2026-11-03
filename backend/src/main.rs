@@ -5,8 +5,9 @@ mod game;
 mod delta;
 mod social;
 mod db;
+mod rooms;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use axum::{
@@ -22,45 +23,36 @@ use tower_http::services::ServeDir;
 use tokio::sync::mpsc;
 
 use crate::types::*;
-use crate::game::Game;
-use crate::delta::DeltaTracker;
 use crate::social::SocialState;
 use crate::db::Database;
+use crate::rooms::{RoomRegistry, OPEN_ROOM_ID};
 
 // Bounded channel: capacity = a few ticks of headroom.
 // If a client falls behind, we skip deltas rather than buffer indefinitely.
 const CLIENT_CHANNEL_CAPACITY: usize = 4;
 
-type ClientSender = mpsc::Sender<String>;
-
 struct AppState {
-    game: Mutex<Game>,
-    delta_tracker: Mutex<DeltaTracker>,
-    clients: Mutex<HashMap<String, ClientSender>>,
-    pending_snapshots: Mutex<HashSet<String>>,
-    wave_profiles: Mutex<HashMap<String, (String, u32)>>,
-    last_room_status: Mutex<String>,
+    rooms: Arc<RoomRegistry>,
     social: Mutex<SocialState>,
-    db: Database,
+    db: Arc<Database>,
     google_client_id: String,
     google_client_secret: String,
 }
 
 #[tokio::main]
 async fn main() {
-    let db = Database::open("boxhead.db")
-        .expect("Failed to open database");
+    let db = Arc::new(Database::open("boxhead.db")
+        .expect("Failed to open database"));
 
     let google_client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();
     let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
 
+    // Every room is simulated server-side on its own 60 Hz task.
+    let rooms = RoomRegistry::new(db.clone(), rooms::empty_room_ttl_from_env());
+    rooms.start().await;
+
     let state = Arc::new(AppState {
-        game: Mutex::new(Game::new()),
-        delta_tracker: Mutex::new(DeltaTracker::new()),
-        clients: Mutex::new(HashMap::new()),
-        pending_snapshots: Mutex::new(HashSet::new()),
-        wave_profiles: Mutex::new(HashMap::new()),
-        last_room_status: Mutex::new(String::new()),
+        rooms,
         social: Mutex::new(SocialState::new()),
         db,
         google_client_id,
@@ -77,16 +69,6 @@ async fn main() {
         }
     });
 
-    // 60 Hz physics + adaptive-rate network broadcast (up to 60 Hz per client)
-    let tick_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
-        loop {
-            interval.tick().await;
-            tick(&tick_state).await;
-        }
-    });
-
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
 
@@ -95,6 +77,7 @@ async fn main() {
         .route("/admin", get(admin_panel))
         .route("/admin/restart", post(admin_restart))
         .route("/admin/status", get(admin_status))
+        .route("/api/rooms", get(rooms_list).post(rooms_create))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/email/register", post(email_register))
         .route("/api/auth/email/login", post(email_login))
@@ -122,13 +105,19 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+async fn send_join_error(ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>, error: &str) {
+    let msg = serde_json::json!({ "type": "joinError", "error": error }).to_string();
+    let _ = ws_sender.send(Message::Text(msg.into())).await;
+    let _ = ws_sender.send(Message::Close(None)).await;
+}
+
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let player_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Wait for join message with player name and optional auth token
-    let (player_name, auth_token, profile_id, starting_wave) = loop {
+    // Wait for join message with player name, target room and optional auth token
+    let (player_name, auth_token, profile_id, starting_wave, room_id) = loop {
         match ws_receiver.next().await {
             Some(Ok(Message::Text(text))) => {
                 let text_str: &str = &text;
@@ -137,7 +126,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         let name = msg.name.unwrap_or_default();
                         let name = name.trim().chars().take(16).collect::<String>();
                         let name = if name.is_empty() { format!("Player_{}", &player_id[..4]) } else { name };
-                        break (name, msg.token, msg.profile_id, msg.starting_wave.unwrap_or(1));
+                        let room_id = msg.room_id.unwrap_or_else(|| OPEN_ROOM_ID.to_string());
+                        break (name, msg.token, msg.profile_id, msg.starting_wave.unwrap_or(1), room_id);
                     }
                 }
             }
@@ -146,18 +136,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
+    // Verification comes from the server-side session, never from the client.
+    let user_id = auth_token.as_deref().and_then(|t| state.db.validate_session(t));
+    let verified = user_id.as_deref().is_some_and(|id| state.db.is_verified(id));
+
+    let Some(room) = state.rooms.get(&room_id).await else {
+        send_join_error(&mut ws_sender, "That room no longer exists.").await;
+        return;
+    };
+    if !rooms::can_join(room.verified_only, verified) {
+        send_join_error(&mut ws_sender, "This room is for signed-in accounts only. Sign in to join.").await;
+        return;
+    }
+
     let profile_id = profile_id
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let unlocked_wave = state.db.highest_wave(&profile_id);
-
-    // Link player to auth identity if they have a valid session
-    if let Some(ref token) = auth_token {
-        if let Some(user_id) = state.db.validate_session(token) {
-            let mut social = state.social.lock().await;
-            social.link_player(&player_id, &user_id);
-        }
-    }
 
     // Bounded channel — drops deltas for slow clients instead of buffering
     let (tx, mut rx) = mpsc::channel::<String>(CLIENT_CHANNEL_CAPACITY);
@@ -165,10 +160,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // The first player chooses the new round; late joiners keep its current wave.
     let joined_game;
     {
-        let mut game = state.game.lock().await;
+        let mut game = room.game.lock().await;
         if game.start_empty_round(starting_wave, unlocked_wave) {
-            let mut dt = state.delta_tracker.lock().await;
-            *dt = DeltaTracker::new();
+            *room.delta_tracker.lock().await = delta::DeltaTracker::new();
         }
         let game_over = game.is_game_over();
         let wave = game.wave();
@@ -176,7 +170,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         if !game_over {
             game.add_player(&player_id, &player_name);
             state.db.record_wave(&profile_id, wave);
-            state.wave_profiles.lock().await.insert(player_id.clone(), (profile_id.clone(), wave));
+            room.wave_profiles.lock().await.insert(player_id.clone(), (profile_id.clone(), wave));
+            room.clients.lock().await.insert(player_id.clone(), tx);
             joined_game = true;
         } else {
             joined_game = false;
@@ -204,21 +199,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Register client sender
-    {
-        let mut clients = state.clients.lock().await;
-        clients.insert(player_id.clone(), tx);
+    // Link player to auth identity for friends' online presence
+    if let Some(ref user_id) = user_id {
+        state.social.lock().await.link_player(&player_id, user_id);
     }
 
-    // Queue snapshot
-    {
-        let mut pending = state.pending_snapshots.lock().await;
-        pending.insert(player_id.clone());
-    }
+    room.pending_snapshots.lock().await.insert(player_id.clone());
 
     let pid_send = player_id.clone();
     let pid_recv = player_id.clone();
-    let state_recv = state.clone();
+    let room_recv = room.clone();
 
     // Task: forward channel messages to WebSocket
     let send_task = tokio::spawn(async move {
@@ -237,12 +227,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(text_str) {
                     if client_msg.msg_type == "pause" {
                         if let Some(paused) = client_msg.paused {
-                            state_recv.game.lock().await.set_paused(&pid_recv, paused);
+                            room_recv.game.lock().await.set_paused(&pid_recv, paused);
                         }
                     } else if client_msg.msg_type == "input" {
                         if let Some(input) = client_msg.input {
-                            let mut game = state_recv.game.lock().await;
-                            game.handle_input(&pid_recv, input);
+                            room_recv.game.lock().await.handle_input(&pid_recv, input);
                         }
                     }
                 }
@@ -258,148 +247,39 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Cleanup
-    state.wave_profiles.lock().await.remove(&pid_cleanup);
-    {
-        let mut game = state.game.lock().await;
-        game.remove_player(&pid_cleanup);
-    }
-    {
-        let mut clients = state.clients.lock().await;
-        clients.remove(&pid_cleanup);
-    }
-    {
-        let mut pending = state.pending_snapshots.lock().await;
-        pending.remove(&pid_cleanup);
-    }
-    {
-        let mut social = state.social.lock().await;
-        social.unlink_player(&pid_cleanup);
-    }
+    room.wave_profiles.lock().await.remove(&pid_cleanup);
+    room.game.lock().await.remove_player(&pid_cleanup);
+    room.clients.lock().await.remove(&pid_cleanup);
+    room.pending_snapshots.lock().await.remove(&pid_cleanup);
+    state.social.lock().await.unlink_player(&pid_cleanup);
 }
 
-async fn tick(state: &AppState) {
-    // Skip ticking entirely if no players connected
-    {
-        let clients = state.clients.lock().await;
-        if clients.is_empty() {
-            return;
-        }
+// --- Rooms API ---
+
+async fn rooms_list(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let verified = state.db.session_is_verified(params.get("token").map(String::as_str));
+    let mut rooms = Vec::new();
+    for room in state.rooms.all().await {
+        rooms.push(room.summary(verified).await);
     }
+    Json(serde_json::json!({ "ok": true, "verified": verified, "rooms": rooms }))
+}
 
-    // --- Physics step (every tick, 60 Hz) ---
-    let mut game = state.game.lock().await;
-    let game_finished = game.is_game_over();
-    let room_paused = game.is_paused();
-    let room_status = serde_json::json!({
-        "type": "room", "hostId": game.host_id(), "paused": room_paused,
-    }).to_string();
-    if !game_finished && !room_paused {
-        game.update(1.0 / 60.0);
+async fn rooms_create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let verified = state.db.session_is_verified(body["token"].as_str());
+    let verified_only = body["verifiedOnly"].as_bool().unwrap_or(false);
+    if verified_only && !verified {
+        return Json(serde_json::json!({ "ok": false, "error": "Only verified accounts can create verified rooms" }));
     }
-
-    // Snapshot state for network
-    let players = game.players().clone();
-    let zombies = game.zombies().to_vec();
-    let bullets = game.bullets().to_vec();
-    let placeables = game.placeables().to_vec();
-    let drops = game.drops();
-    let wave = game.wave();
-    let wave_kills = game.wave_kills();
-    let wave_target = game.wave_target();
-    let wave_break_timer = game.wave_break_timer();
-    let ammo_avail_vec = game.ammo_availability();
-    let ammo_availability: HashMap<String, bool> = ammo_avail_vec.iter()
-        .map(|a| (a.id.clone(), a.available)).collect();
-    let game_over = game.is_game_over();
-    drop(game);
-
-    // Persist only when a connected browser reaches a new wave, not every tick.
-    {
-        let mut profiles = state.wave_profiles.lock().await;
-        for (profile, recorded_wave) in profiles.values_mut() {
-            if wave > *recorded_wave {
-                state.db.record_wave(profile, wave);
-                *recorded_wave = wave;
-            }
-        }
-    }
-
-    let room_changed = {
-        let mut previous = state.last_room_status.lock().await;
-        let changed = *previous != room_status;
-        *previous = room_status.clone();
-        changed
-    };
-
-    if room_changed {
-        state.pending_snapshots.lock().await.extend(players.keys().cloned());
-    }
-
-    // --- Delta computation ---
-    let mut dt = state.delta_tracker.lock().await;
-    let delta = dt.compute_delta(
-        &players,
-        &zombies,
-        &bullets,
-        &placeables,
-        &drops,
-        wave,
-        wave_kills,
-        wave_target,
-        wave_break_timer,
-        &ammo_availability,
-        game_over,
-    );
-    let delta_str = serde_json::to_string(&delta).unwrap();
-
-    let pending = state.pending_snapshots.lock().await;
-    let snapshot_ids: Vec<String> = pending.iter().cloned().collect();
-
-    let snapshot_str = if !snapshot_ids.is_empty() {
-        let snapshot = dt.build_snapshot(
-            &players,
-            &zombies,
-            &bullets,
-            &placeables,
-            &drops,
-            wave,
-            wave_kills,
-            wave_target,
-            wave_break_timer,
-            &ammo_availability,
-            game_over,
-        );
-        Some(serde_json::to_string(&snapshot).unwrap())
-    } else {
-        None
-    };
-    drop(dt);
-    drop(pending);
-
-    if !snapshot_ids.is_empty() {
-        let mut pending = state.pending_snapshots.lock().await;
-        for id in &snapshot_ids {
-            pending.remove(id);
-        }
-    }
-
-    // --- Adaptive broadcast: try_send skips slow clients ---
-    let clients = state.clients.lock().await;
-    for (id, tx) in clients.iter() {
-        if room_changed || snapshot_ids.contains(id) {
-            // Host/pause changes must not be lost like disposable physics deltas.
-            let _ = tx.send(room_status.clone()).await;
-        }
-        if snapshot_ids.contains(id) {
-            // Snapshots are critical — use blocking send
-            if let Some(ref ss) = snapshot_str {
-                let _ = tx.send(ss.clone()).await;
-            }
-        } else if !game_finished && !room_paused {
-            // Deltas are droppable — skip if client channel is full
-            // Don't spam deltas when paused (nothing is changing)
-            let _ = tx.try_send(delta_str.clone());
-        }
+    match state.rooms.create(body["name"].as_str().unwrap_or(""), verified_only).await {
+        Ok(room) => Json(serde_json::json!({ "ok": true, "room": room.summary(verified).await })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
     }
 }
 
@@ -481,51 +361,71 @@ async fn admin_restart(
     let unlocked = params.get("profileId")
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .map(|id| state.db.highest_wave(id)).unwrap_or(1);
-    let mut game = state.game.lock().await;
-    // The menu's replay control cannot reset somebody else's active round.
-    if params.contains_key("profileId") && !game.is_game_over() {
-        return Json(serde_json::json!({ "ok": false, "error": "Round is still active" }));
-    }
-    game.reset_at_wave(requested, unlocked);
-    drop(game);
 
-    let mut dt = state.delta_tracker.lock().await;
-    *dt = DeltaTracker::new();
-    drop(dt);
+    // A player's "Play again" targets their own room; the admin panel restarts every room.
+    let targets = match params.get("roomId") {
+        Some(id) => match state.rooms.get(id).await {
+            Some(room) => {
+                let verified = state.db.session_is_verified(params.get("token").map(String::as_str));
+                if !rooms::can_join(room.verified_only, verified) {
+                    return Json(serde_json::json!({ "ok": false, "error": "Verified accounts only" }));
+                }
+                vec![room]
+            }
+            None => return Json(serde_json::json!({ "ok": false, "error": "Room not found" })),
+        },
+        None => state.rooms.all().await,
+    };
 
-    // Queue fresh snapshots for all connected clients
-    let clients = state.clients.lock().await;
-    let mut pending = state.pending_snapshots.lock().await;
-    for id in clients.keys() {
-        pending.insert(id.clone());
+    for room in targets {
+        // The menu's replay control cannot reset somebody else's active round.
+        if params.contains_key("profileId") && !room.game.lock().await.is_game_over() {
+            return Json(serde_json::json!({ "ok": false, "error": "Round is still active" }));
+        }
+        room.restart(requested, unlocked).await;
     }
 
     Json(serde_json::json!({ "message": "Game restarted", "ok": true }))
 }
 
 async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let game = state.game.lock().await;
-    let players = game.players().len();
-    let alive = game.players().values().filter(|p| p.health > 0.0).count();
-    let zombies = game.zombies().len();
-    let wave = game.wave();
-    let game_over = game.is_game_over();
-    let paused = game.is_paused();
-    let host_id = game.host_id().map(str::to_owned);
-    drop(game);
+    let (mut players, mut alive, mut zombies, mut connected, mut max_wave) = (0, 0, 0, 0, 1);
+    let mut any_running = false;
+    let mut room_list = Vec::new();
+    for room in state.rooms.all().await {
+        let game = room.game.lock().await;
+        let room_players = game.players().len();
+        let room_alive = game.players().values().filter(|p| p.health > 0.0).count();
+        let room_zombies = game.zombies().len();
+        let (wave, game_over, paused) = (game.wave(), game.is_game_over(), game.is_paused());
+        let host_id = game.host_id().map(str::to_owned);
+        drop(game);
+        let room_connected = room.clients.lock().await.len();
 
-    let clients = state.clients.lock().await;
-    let connected = clients.len();
+        players += room_players;
+        alive += room_alive;
+        zombies += room_zombies;
+        connected += room_connected;
+        if room_connected > 0 {
+            max_wave = max_wave.max(wave);
+            any_running |= !game_over;
+        }
+        room_list.push(serde_json::json!({
+            "id": room.id, "name": room.name, "verified_only": room.verified_only,
+            "players": room_players, "connected": room_connected, "alive": room_alive,
+            "zombies": room_zombies, "wave": wave, "game_over": game_over,
+            "paused": paused, "host_id": host_id,
+        }));
+    }
 
     Json(serde_json::json!({
         "players": players,
         "connected": connected,
         "alive": alive,
         "zombies": zombies,
-        "wave": wave,
-        "game_over": game_over,
-        "paused": paused,
-        "host_id": host_id,
+        "wave": max_wave,
+        "game_over": connected > 0 && !any_running,
+        "rooms": room_list,
     }))
 }
 
@@ -584,6 +484,7 @@ async fn auth_login(
                 "user_id": user_id,
                 "handle": session.handle,
                 "display_name": session.handle,
+                "verified": true,
             }))
         }
         Err(e) => {
@@ -618,6 +519,7 @@ async fn email_register(
                 "user_id": user_id,
                 "handle": email,
                 "display_name": email,
+                "verified": state.db.is_verified(&user_id),
             }))
         }
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
@@ -647,6 +549,7 @@ async fn email_login(
                 "user_id": user_id,
                 "handle": email,
                 "display_name": email,
+                "verified": state.db.is_verified(&user_id),
             }))
         }
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
@@ -717,7 +620,8 @@ if (window.opener) {{
         token: '{}',
         user_id: '{}',
         handle: '{}',
-        display_name: '{}'
+        display_name: '{}',
+        verified: true
     }}, window.location.origin);
 }}
 setTimeout(() => window.close(), 1000);
@@ -771,6 +675,7 @@ async fn auth_me(
         "user_id": user.id,
         "display_name": user.display_name,
         "handle": handle,
+        "verified": state.db.is_verified(&user.id),
     }))
 }
 

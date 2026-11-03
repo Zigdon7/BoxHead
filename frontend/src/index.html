@@ -102,6 +102,56 @@
     .btn-dark { background: rgba(255,255,255,0.09); color: #fff; border: 1px solid rgba(255,255,255,0.1); }
     .btn-dark:hover { background: rgba(255,255,255,0.15); }
 
+    .room-refresh { background: none; border: none; color: var(--text-mute); font-size: 1.1rem; cursor: pointer; }
+    .room-refresh:hover { color: #fff; }
+    .verify-status { font-size: 0.8rem; color: var(--text-mute); }
+    .verify-status.ok { color: var(--green); }
+    .room-list { max-height: 190px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+    .room-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border-radius: 10px; background: rgba(0,0,0,0.3); border: 1px solid var(--panel-border); color: #fff; font: inherit; text-align: left; cursor: pointer; }
+    .room-item:hover:not(:disabled) { background: rgba(255,255,255,0.06); }
+    .room-item.selected { border-color: var(--primary); background: rgba(229, 57, 53, 0.12); }
+    .room-item:disabled { opacity: 0.45; cursor: not-allowed; }
+    .room-name { flex: 1; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .room-meta { font-size: 0.78rem; color: var(--text-mute); white-space: nowrap; }
+    .room-badge { font-size: 0.66rem; font-weight: 800; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+    .room-badge.verified { background: rgba(76,175,80,0.18); color: var(--green); }
+    .room-badge.open { background: rgba(255,255,255,0.08); color: #ccc; }
+    .room-create { display: flex; gap: 8px; align-items: center; }
+    .room-create input[type="text"] { padding: 10px 12px; font-size: 0.9rem; }
+    .room-check { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; color: #ccc; white-space: nowrap; cursor: pointer; }
+    .room-check input { width: auto; }
+    .room-check.locked { opacity: 0.45; cursor: not-allowed; }
+
+    /* Menu views */
+    .menu-wide { max-width: 720px; }
+    .home-actions { width: 100%; display: flex; flex-direction: column; gap: 12px; }
+    .home-actions .btn-play { font-size: 1.5rem; padding: 18px; letter-spacing: 4px; }
+    .account-chip { display: flex; flex-direction: column; gap: 10px; }
+    .account-actions { display: flex; gap: 8px; }
+    .home-links { display: flex; gap: 18px; align-items: center; justify-content: center; flex-wrap: wrap; font-size: 0.9rem; }
+    .home-links a, .link-btn { color: #67d9ff; text-decoration: none; }
+    .link-btn { background: none; border: none; font: inherit; font-size: 0.9rem; cursor: pointer; padding: 0; }
+    .link-btn:hover, .home-links a:hover { color: #fff; }
+    .view-head { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .view-head h2 { font-size: 1.25rem; letter-spacing: 1px; text-transform: uppercase; }
+    .loadout-row { width: 100%; display: flex; gap: 12px; }
+    .wave-select { width: 100%; padding: 13px 12px; border-radius: 10px; background: rgba(0,0,0,0.4); color: #fff; border: 1px solid var(--panel-border); font: inherit; }
+    .hint { width: 100%; font-size: 0.78rem; color: var(--text-mute); margin-top: -10px; }
+    .lobby-columns { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .lobby-section { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+    .lobby-section h3 { font-size: 0.82rem; color: var(--text-mute); text-transform: uppercase; letter-spacing: 0.8px; display: flex; align-items: center; gap: 6px; }
+    .lobby-section .room-list { min-height: 60px; }
+    .room-empty { font-size: 0.8rem; color: var(--text-mute); padding: 10px 4px; }
+    .room-item { flex-wrap: wrap; row-gap: 2px; }
+    .room-item .room-meta { width: 100%; }
+    .room-create { width: 100%; }
+    @media (max-width: 640px) {
+      .lobby-columns { grid-template-columns: 1fr; }
+      .loadout-row { flex-direction: column; }
+      .loadout-row .input-wrapper { max-width: none !important; }
+      .room-create { flex-wrap: wrap; }
+    }
+
     .info-text { text-align: center; font-size: 0.95rem; color: var(--green); }
     .error-text { text-align: center; font-size: 0.82rem; color: #ff5252; min-height: 14px; }
     
@@ -111,6 +161,14 @@
     .friends-list { max-height: 200px; overflow-y: auto; width: 100%; }
     .friend-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid var(--panel-border); }
     .friend-item span { display: flex; align-items: center; gap: 8px; font-size: 0.95rem; }
+    .friend-state { font-size: 0.75rem; color: var(--text-mute); }
+    .friend-state.online { color: var(--green); }
+    .friends-empty { text-align: center; color: #666; padding: 10px; font-size: 0.85rem; }
+    .home-friends { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 10px 12px; }
+    .home-friends h3 { display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--text-mute); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 4px; }
+    .home-friends .friends-list { max-height: 160px; }
+    .home-friends .friend-item { padding: 7px 4px; }
+    .friends-summary { text-transform: none; letter-spacing: 0; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
     .status-dot.online { background: var(--green); box-shadow: 0 0 8px rgba(76,175,80,0.5); }
     
@@ -381,40 +439,92 @@
   
   <canvas id="gameCanvas"></canvas>
 
-  <!-- Main Menu Overlay -->
+  <!-- Main Menu Overlay: home → server browser / sign in -->
   <div id="mainMenuOverlay" class="overlay">
-    <div class="menu-panel">
+    <!-- Home: just the essentials -->
+    <div id="menuHome" class="menu-panel menu-view">
       <div style="text-align: center;">
         <h1 class="logo">BOXHEAD</h1>
         <p class="subtitle">Tactical Horde Survival</p>
       </div>
 
-      <div class="feature-pills">
-        <span class="feature-pill"><b>WASD</b> Move</span>
-        <span class="feature-pill"><b>Space / RMB</b> Katana Melee</span>
-        <span class="feature-pill"><b>Shift</b> i-Frame Dash</span>
-        <span class="feature-pill"><b>E / Q / F</b> Tactical Gear</span>
-        <span class="feature-pill"><b>B</b> Armory Shop</span>
+      <div class="home-actions">
+        <button id="playBtn" class="btn btn-play">PLAY</button>
+        <button id="signInBtn" class="btn btn-dark">Sign In</button>
+
+        <div id="authSectionIn" class="account-chip hidden">
+          <p id="loggedInStatus" class="info-text">Signed in as @handle</p>
+          <section class="home-friends">
+            <h3><span>Friends</span> <span id="homeFriendsSummary" class="friends-summary">0/0 online</span></h3>
+            <div id="homeFriendsList" class="friends-list" aria-label="Friends"></div>
+          </section>
+          <div class="account-actions">
+            <button id="friendsBtn" class="btn btn-dark">Manage Friends</button>
+            <button id="logoutBtn" class="btn btn-dark">Sign Out</button>
+          </div>
+        </div>
       </div>
 
-      <div class="input-wrapper">
-        <label>Operative Callsign</label>
-        <input id="nameInput" type="text" maxlength="16" placeholder="Enter callsign..." />
+      <nav class="home-links">
+        <a href="/learn.html" target="_blank" rel="noopener">Learn to Play ↗</a>
+        <a href="/about.html" target="_blank" rel="noopener">About ↗</a>
+        <button id="menuSettingsBtn" class="link-btn" title="Controls & Settings">&#9881; Settings</button>
+      </nav>
+    </div>
+
+    <!-- Server browser: every lobby is hosted and simulated by the game server -->
+    <div id="menuBrowser" class="menu-panel menu-view menu-wide hidden">
+      <div class="view-head">
+        <button class="link-btn" data-menu-view="home">&larr; Back</button>
+        <h2>Server Browser</h2>
+        <button id="refreshRoomsBtn" class="room-refresh" title="Refresh lobbies" aria-label="Refresh lobbies">&#8635;</button>
       </div>
 
-      <div class="input-group" style="width:100%">
-        <label>Starting Wave <select data-wave-select aria-label="Starting wave" style="margin-left:10px;background:#241a1c;color:#fff;border:1px solid #654;padding:8px;border-radius:6px"><option value="1">Wave 1</option></select></label>
-        <small data-wave-status style="display:block;margin-top:8px;color:#aaa">Highest reached: 1 · Saved for this browser</small>
+      <div class="loadout-row">
+        <div class="input-wrapper">
+          <label for="nameInput">Callsign</label>
+          <input id="nameInput" type="text" maxlength="16" placeholder="Enter callsign..." />
+        </div>
+        <div class="input-wrapper" style="max-width:170px">
+          <label>Starting Wave</label>
+          <select data-wave-select aria-label="Starting wave" class="wave-select"><option value="1">Wave 1</option></select>
+        </div>
+      </div>
+      <small class="hint"><span data-wave-status>Highest reached: 1 · Saved for this browser</span> · Applies when you start a new round. Joining an active lobby keeps its current wave.</small>
+
+      <p id="verifyStatus" class="verify-status"></p>
+
+      <div class="lobby-columns">
+        <section class="lobby-section">
+          <h3><span class="room-badge verified">Verified</span> Lobbies</h3>
+          <div id="verifiedRoomList" class="room-list" aria-label="Verified lobbies"></div>
+        </section>
+        <section class="lobby-section">
+          <h3><span class="room-badge open">Open</span> Lobbies</h3>
+          <div id="openRoomList" class="room-list" aria-label="Open lobbies"></div>
+        </section>
       </div>
 
-      <small style="color:#aaa">New rounds only. Joining a squad keeps its current wave.</small>
+      <div class="room-create">
+        <input id="roomNameInput" type="text" maxlength="24" placeholder="Host a lobby: name it..." />
+        <label id="roomVerifiedLabel" class="room-check"><input id="roomVerifiedOnly" type="checkbox" /> Verified only</label>
+        <button id="createRoomBtn" class="btn btn-dark" style="width:auto;padding:10px 14px">Create</button>
+      </div>
+      <div id="roomErrorMsg" class="error-text"></div>
 
-      <nav style="display:flex;gap:20px"><a href="/about.html" target="_blank" rel="noopener" style="color:#67d9ff">About ↗</a><a href="/learn.html" target="_blank" rel="noopener" style="color:#67d9ff">Learn to Play ↗</a></nav>
+      <button id="deployBtn" class="btn btn-play">DEPLOY</button>
+    </div>
 
-      <!-- Logged Out Auth Box -->
+    <!-- Sign in -->
+    <div id="menuSignIn" class="menu-panel menu-view hidden">
+      <div class="view-head">
+        <button class="link-btn" data-menu-view="home">&larr; Back</button>
+        <h2>Sign In</h2>
+        <span style="width:40px"></span>
+      </div>
+      <p class="hint" style="text-align:center">Signed-in accounts are verified and can join every lobby. Guests can only join open lobbies.</p>
+
       <div id="authSectionOut" class="auth-box">
-        <p class="title">Account Sync (Optional)</p>
-
         <div class="auth-tabs">
           <button class="auth-tab active" data-tab="email">Email</button>
           <button class="auth-tab" data-tab="bsky">Bluesky</button>
@@ -447,18 +557,6 @@
         </div>
 
         <div id="loginErrorMsg" class="error-text"></div>
-      </div>
-
-      <!-- Logged In Auth Box -->
-      <div id="authSectionIn" class="auth-box hidden">
-        <p id="loggedInStatus" class="info-text">Logged in as @handle</p>
-        <button id="friendsBtn" class="btn btn-blue">Friends (0/0)</button>
-        <button id="logoutBtn" class="btn btn-dark">Logout</button>
-      </div>
-
-      <div style="display:flex; gap:10px; width:100%;">
-        <button id="playBtn" class="btn btn-play" style="flex:1;">DEPLOY TO ARENA</button>
-        <button id="menuSettingsBtn" class="btn btn-dark" style="width:52px; font-size:1.4rem; padding:0;" title="Controls & Settings">&#9881;</button>
       </div>
     </div>
   </div>

@@ -409,4 +409,6 @@ pub struct ClientMessage {
     #[serde(rename = "startingWave")]
     pub starting_wave: Option<u32>,
     pub paused: Option<bool>,
+    #[serde(rename = "roomId")]
+    pub room_id: Option<String>,
 }

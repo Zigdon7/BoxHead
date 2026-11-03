@@ -169,6 +169,24 @@ impl Database {
         ).ok()
     }
 
+    /// Every signed-in account (email, Google or Bluesky) is verified; guests are not.
+    /// Email confirmation is planned before launch — gate email accounts here once it exists.
+    pub fn is_verified(&self, user_id: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+            params![user_id],
+            |row| row.get::<_, bool>(0),
+        ).unwrap_or(false)
+    }
+
+    /// Verification status for a session token; invalid or missing tokens are unverified.
+    pub fn session_is_verified(&self, token: Option<&str>) -> bool {
+        token.filter(|t| !t.is_empty())
+            .and_then(|t| self.validate_session(t))
+            .is_some_and(|user_id| self.is_verified(&user_id))
+    }
+
     /// Add bidirectional friendship.
     pub fn add_friend(&self, user_id: &str, friend_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
@@ -313,6 +331,26 @@ mod wave_progress_tests {
         db.record_wave("second", 4);
         assert_eq!(db.highest_wave("first"), 8);
         assert_eq!(db.highest_wave("second"), 4);
+    }
+
+    #[test]
+    fn every_signed_in_account_is_verified_guests_are_not() {
+        let db = Database::open(":memory:").unwrap();
+        let email_user = db.register_email_user("a@example.com", "secret1").unwrap();
+        let google_user = db.find_or_create_user("google", "sub-1", "g@example.com", "G").unwrap();
+        let bsky_user = db.find_or_create_user("bluesky", "did:plc:x", "x.bsky.social", "x").unwrap();
+        assert!(db.is_verified(&email_user));
+        assert!(db.is_verified(&google_user));
+        assert!(db.is_verified(&bsky_user));
+        assert!(!db.is_verified("no-such-user"));
+
+        let email_token = db.create_session(&email_user).unwrap();
+        let google_token = db.create_session(&google_user).unwrap();
+        assert!(db.session_is_verified(Some(&email_token)));
+        assert!(db.session_is_verified(Some(&google_token)));
+        assert!(!db.session_is_verified(Some("bogus")));
+        assert!(!db.session_is_verified(Some("")));
+        assert!(!db.session_is_verified(None));
     }
 
     #[test]
