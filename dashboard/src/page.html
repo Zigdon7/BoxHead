@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BoxHead Ops</title>
+<style>
+  :root { --bg:#0d1017; --panel:#151a24; --line:#232a38; --text:#e6e8ee; --mute:#8a92a6; --ok:#4caf50; --warn:#ffb400; --bad:#ef5350; --accent:#64b5f6; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, sans-serif; padding: 24px; }
+  h1 { font-size: 20px; letter-spacing: 1px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 18px; gap: 12px; flex-wrap: wrap; }
+  #updated { color: var(--mute); font-size: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 22px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .label { color: var(--mute); font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; }
+  .card .value { font-size: 22px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  section.server { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 18px; }
+  .server-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .server-head h2 { font-size: 16px; }
+  .server-head .meta { color: var(--mute); font-size: 12px; }
+  .server-head .spacer { flex: 1; }
+  .pill { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .pill.up, .pill.ok { background: #4caf5026; color: var(--ok); }
+  .pill.down, .pill.over { background: #ef535026; color: var(--bad); }
+  .pill.warn { background: #ffb40026; color: var(--warn); }
+  .pill.idle { background: #ffffff12; color: var(--mute); }
+  .pill.verified { background: #64b5f626; color: var(--accent); }
+  .error { color: var(--bad); font-size: 12px; margin-bottom: 10px; }
+  h3 { font-size: 12px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.8px; margin: 6px 0 8px; }
+  .threads { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .thread { background: #0f131b; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .thread .row { display: flex; justify-content: space-between; font-size: 12px; }
+  .thread .name { font-family: ui-monospace, monospace; }
+  .bar { height: 6px; background: #ffffff10; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--ok); }
+  .bar.warn > div { background: var(--warn); }
+  .bar.hot > div { background: var(--bad); }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=search] { background: #0f131b; border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 6px 10px; min-width: 220px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--mute); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; cursor: pointer; user-select: none; }
+  th.num, td.num { text-align: right; }
+  td.name { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  td.thread-cell { font-family: ui-monospace, monospace; color: var(--mute); }
+  tr.over td { background: #ef53500f; }
+  button { background: #ffffff10; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  button:hover { background: #ffffff1c; }
+  button.danger { border-color: #ef535066; color: #ff8a80; }
+  .empty { color: var(--mute); padding: 10px 0; }
+  #toast { position: fixed; bottom: 18px; right: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BOXHEAD OPS</h1>
+  <span id="updated">Connecting…</span>
+</header>
+<div class="cards" id="cards"></div>
+<div id="servers"></div>
+<div id="toast" role="status"></div>
+
+<script>
+const fmtPct = v => `${(v * 100).toFixed(1)}%`;
+const fmtMs = us => us >= 1000 ? `${(us / 1000).toFixed(2)} ms` : `${us} µs`;
+const fmtUptime = ms => {
+  if (ms == null) return '—';
+  const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+};
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === 'class') node.className = v;
+    else if (k === 'text') node.textContent = v; // text only: room names are player input
+    else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  node.append(...children.filter(c => c != null));
+  return node;
+}
+function toast(text) {
+  const t = document.getElementById('toast');
+  t.textContent = text; t.style.display = 'block';
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { t.style.display = 'none'; }, 3000);
+}
+
+async function action(url, label) {
+  if (!confirm(label + '?')) return;
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dashboard-Action': '1' }, body: '{}' });
+    const data = await res.json().catch(() => ({}));
+    toast(res.ok && data.ok ? `${label}: done` : `${label} failed: ${data.error || res.status}`);
+  } catch (e) { toast(`${label} failed: ${e}`); }
+  refresh();
+}
+
+const ui = { sort: 'maxUs', desc: true, filter: '' };
+const columns = [
+  ['name', 'Room'], ['health', 'Health'], ['connected', 'Players', 'num'], ['wave', 'Wave', 'num'],
+  ['zombies', 'Zombies', 'num'], ['avgUs', 'Avg tick', 'num'], ['maxUs', 'Max tick', 'num'],
+  ['overruns', 'Overruns', 'num'], ['pubAvgUs', 'Send avg', 'num'], ['pubMaxUs', 'Send max', 'num'],
+  ['skippedFrames', 'Skipped', 'num'], ['droppedDeltas', 'Dropped', 'num'], ['lastThread', 'Threads'], ['uptimeMs', 'Uptime', 'num'],
+];
+const pub = r => r.publish || {};
+const sortValue = (r, key) => {
+  if (key === 'pubAvgUs') return pub(r).avgUs;
+  if (key === 'pubMaxUs') return pub(r).maxUs;
+  if (key === 'skippedFrames') return pub(r).skippedFrames;
+  return key in (r.tick || {}) ? r.tick[key] : r[key];
+};
+
+function card(label, value) { return el('div', { class: 'card' }, el('div', { class: 'label', text: label }), el('div', { class: 'value', text: String(value) })); }
+
+function renderThreads(threads) {
+  if (!threads.length) return el('p', { class: 'empty', text: 'No thread samples yet.' });
+  return el('div', { class: 'threads' }, ...threads.map(t => {
+    const level = t.utilization > 0.8 ? 'hot' : t.utilization > 0.5 ? 'warn' : '';
+    const fill = el('div'); fill.style.width = fmtPct(Math.min(1, t.utilization));
+    return el('div', { class: 'thread' },
+      el('div', { class: 'row' }, el('span', { class: 'name', text: t.name }), el('span', { text: fmtPct(t.utilization) })),
+      el('div', { class: 'row' }, el('span', { class: 'meta', text: `${t.ticksPerSec.toFixed(0)} room ticks/s` })),
+      el('div', { class: `bar ${level}` }, fill));
+  }));
+}
+
+function renderRooms(server) {
+  const needle = ui.filter.toLowerCase();
+  const rooms = server.rooms
+    .filter(r => !needle || r.name.toLowerCase().includes(needle) || r.id.includes(needle))
+    .sort((a, b) => {
+      const va = sortValue(a, ui.sort), vb = sortValue(b, ui.sort);
+      const cmp = typeof va === 'string' ? va.localeCompare(vb) : (va ?? 0) - (vb ?? 0);
+      return ui.desc ? -cmp : cmp;
+    });
+  if (!rooms.length) return el('p', { class: 'empty', text: 'No rooms match.' });
+  const head = el('tr', {}, ...columns.map(([key, label, cls]) =>
+    el('th', { class: cls || '', text: label + (ui.sort === key ? (ui.desc ? ' ▾' : ' ▴') : ''), onclick: () => {
+      ui.desc = ui.sort === key ? !ui.desc : true; ui.sort = key; render();
+    } })), el('th', { text: '' }));
+  const rows = rooms.map(r => el('tr', { class: r.health },
+    el('td', { class: 'name', title: r.id },
+      el('span', { text: r.name }), ' ',
+      r.verifiedOnly ? el('span', { class: 'pill verified', text: 'verified' }) : null,
+      r.permanent ? el('span', { class: 'pill idle', text: 'official' }) : null),
+    el('td', {}, el('span', { class: `pill ${r.health}`, text: r.health })),
+    el('td', { class: 'num', text: String(r.connected) }),
+    el('td', { class: 'num', text: r.gameOver ? `${r.wave} ✖` : r.paused ? `${r.wave} ⏸` : String(r.wave) }),
+    el('td', { class: 'num', text: String(r.zombies) }),
+    el('td', { class: 'num', text: fmtMs(r.tick.avgUs) }),
+    el('td', { class: 'num', text: fmtMs(r.tick.maxUs) }),
+    el('td', { class: 'num', text: String(r.tick.overruns) }),
+    el('td', { class: 'num', text: fmtMs(pub(r).avgUs ?? 0) }),
+    el('td', { class: 'num', text: fmtMs(pub(r).maxUs ?? 0) }),
+    el('td', { class: 'num', text: String(pub(r).skippedFrames ?? 0) }),
+    el('td', { class: 'num', text: String(r.tick.droppedDeltas) }),
+    el('td', { class: 'thread-cell', text: `${r.tick.lastThread || '—'} · ${pub(r).lastThread || '—'}` }),
+    el('td', { class: 'num', text: fmtUptime(r.uptimeMs) }),
+    el('td', {}, el('button', { text: 'Restart', onclick: () =>
+      action(`/api/servers/${server.index}/rooms/${encodeURIComponent(r.id)}/restart`, `Restart "${r.name}"`) }))));
+  return el('table', {}, el('thead', {}, head), el('tbody', {}, ...rows));
+}
+
+function renderServer(s) {
+  const t = s.totals || {};
+  return el('section', { class: 'server' },
+    el('div', { class: 'server-head' },
+      el('h2', { text: s.serverId || s.url }),
+      el('span', { class: `pill ${s.up ? 'up' : 'down'}`, text: s.up ? 'up' : 'down' }),
+      el('span', { class: 'meta', text: `${s.url} · v${s.version ?? '?'} · up ${fmtUptime(s.uptimeMs)} · ${s.simThreadCount ?? '?'} game + ${s.publishThreadCount ?? '?'} state threads · ${t.rooms ?? 0}/${s.roomLimit ?? '?'} rooms · ${t.connected ?? 0} players` }),
+      el('span', { class: 'spacer' }),
+      el('button', { class: 'danger', text: 'Restart all rooms', onclick: () => action(`/api/servers/${s.index}/restart-all`, `Restart every room on ${s.serverId || s.url}`) })),
+    s.up ? null : el('p', { class: 'error', text: `Unreachable: ${s.lastError || 'no response yet'}${s.lastOkAgoMs != null ? ` (last seen ${fmtUptime(s.lastOkAgoMs)} ago)` : ''}` }),
+    el('h3', { text: 'Game threads (physics only)' }),
+    renderThreads((s.threads || []).filter(t => t.name.startsWith('room-sim'))),
+    el('h3', { text: 'State provider threads (diff, serialize, send)' }),
+    renderThreads((s.threads || []).filter(t => !t.name.startsWith('room-sim'))),
+    el('h3', { text: 'Rooms' }),
+    renderRooms(s));
+}
+
+let latest = null;
+function render() {
+  if (!latest) return;
+  const t = latest.totals;
+  document.getElementById('cards').replaceChildren(
+    card('Servers up', `${t.serversUp}/${t.servers}`), card('Rooms', t.rooms), card('Players', t.connected),
+    card('Zombies', t.zombies), card('Game / state threads', `${t.simThreads} / ${t.publishThreads}`),
+    card('Hottest game thread', fmtPct(t.hottestThreadUtilization)), card('Hottest state thread', fmtPct(t.hottestPublishUtilization)),
+    card('Rooms over budget', t.roomsOverBudget));
+  const filter = el('input', { type: 'search', placeholder: 'Filter rooms by name or id…', value: ui.filter,
+    oninput: e => { ui.filter = e.target.value; render(); const box = document.querySelector('input[type=search]'); box.focus(); box.setSelectionRange(ui.filter.length, ui.filter.length); } });
+  document.getElementById('servers').replaceChildren(el('div', { class: 'toolbar' }, filter), ...latest.servers.map(renderServer));
+  document.getElementById('updated').textContent = `Updated ${new Date(latest.generatedAtMs).toLocaleTimeString()} · polling every ${latest.pollMs} ms`;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/overview');
+    latest = await res.json();
+    // Don't rebuild while the operator is typing in the filter box.
+    if (document.activeElement?.type !== 'search') render();
+  } catch { document.getElementById('updated').textContent = 'Dashboard unreachable'; }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

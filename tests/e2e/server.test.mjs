@@ -1,8 +1,11 @@
 // End-to-end tests: boots the real server binary against a throwaway database
 // and drives it over HTTP + WebSocket exactly like the browser client does.
 //
-// Run: node --test tests/e2e   (after `cargo build` and `vite build`)
-// Override the binary with BOXHEAD_SERVER_BIN.
+// Also boots the separate ops dashboard service against the game server's
+// internal ops API (plus a dead server, to check outage reporting).
+//
+// Run: node --test tests/e2e/server.test.mjs  (after building backend, dashboard and frontend)
+// Override binaries with BOXHEAD_SERVER_BIN / BOXHEAD_DASHBOARD_BIN.
 
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,13 +19,23 @@ import { DatabaseSync } from 'node:sqlite';
 
 const ROOT = resolve(import.meta.dirname, '..', '..');
 const EMPTY_TTL_SECS = 2;
-const BIN = process.env.BOXHEAD_SERVER_BIN
-  ?? joinPath(ROOT, 'backend', 'target', 'debug', process.platform === 'win32' ? 'boxhead-server.exe' : 'boxhead-server');
+const EXE = process.platform === 'win32' ? '.exe' : '';
+const BIN = process.env.BOXHEAD_SERVER_BIN ?? joinPath(ROOT, 'backend', 'target', 'debug', `boxhead-server${EXE}`);
+const DASH_BIN = process.env.BOXHEAD_DASHBOARD_BIN ?? joinPath(ROOT, 'dashboard', 'target', 'debug', `boxhead-dashboard${EXE}`);
+const OPS_TOKEN = `ops-${randomUUID()}`;
+const SIM_THREADS = 4;
+const PUBLISH_THREADS = 2;
+const MAX_ROOMS = 64;
 
 let server;
+let dashboard;
 let workDir;
 let base;
 let wsUrl;
+let opsBase;
+let dashBase;
+let deadServer;
+const extraProcesses = [];
 
 // ---------------------------------------------------------------- helpers
 
@@ -101,10 +114,15 @@ class Client {
       this.waiters.push({ pred, res: m => { clearTimeout(timer); res(m); } });
     });
   }
-  /** Only messages arriving after this call. */
+  /** Only messages arriving after this call. Use `mark()` + `waitAfter()` when
+   *  the trigger is an awaited request: the reply could land before this runs. */
   waitForNext(pred, timeout, label) {
-    const seen = this.messages.length;
-    return this.waitFor((m) => this.messages.indexOf(m) >= seen && pred(m), timeout, label);
+    return this.waitAfter(this.mark(), pred, timeout, label);
+  }
+  mark() { return this.messages.length; }
+  /** Messages received after `mark` (an index from `mark()`). */
+  waitAfter(mark, pred, timeout, label) {
+    return this.waitFor((m) => this.messages.indexOf(m) >= mark && pred(m), timeout, label);
   }
   async close() {
     if (this.ws.readyState <= 1) this.ws.close();
@@ -144,31 +162,59 @@ const idle = { up: false, down: false, left: false, right: false, mouseX: 0, mou
 
 // ---------------------------------------------------------------- lifecycle
 
+/** Spawn a binary, capturing output; `ready` polls until it is serving. */
+async function launch(bin, { env, cwd, ready }) {
+  const child = spawn(bin, [], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.log = '';
+  child.stdout.on('data', d => { child.log += d; });
+  child.stderr.on('data', d => { child.log += d; });
+  child.exitCode$ = new Promise(res => child.once('exit', code => res(code)));
+  if (ready) {
+    const died = child.exitCode$.then(code => { throw new Error(`${bin} exited (${code}):\n${child.log}`); });
+    await Promise.race([died, waitUntil(ready, { message: `${bin} to start` })]);
+  }
+  return child;
+}
+
 before(async () => {
-  assert.ok(existsSync(BIN), `Server binary not found at ${BIN}. Run cargo build first.`);
+  assert.ok(existsSync(BIN), `Server binary not found at ${BIN}. Run cargo build in backend/ first.`);
+  assert.ok(existsSync(DASH_BIN), `Dashboard binary not found at ${DASH_BIN}. Run cargo build in dashboard/ first.`);
   workDir = mkdtempSync(joinPath(tmpdir(), 'boxhead-e2e-'));
-  const port = await freePort();
+  const [port, opsPort, dashPort, deadPort] = [await freePort(), await freePort(), await freePort(), await freePort()];
   base = `http://127.0.0.1:${port}`;
   wsUrl = `ws://127.0.0.1:${port}/ws`;
-  server = spawn(BIN, [], {
+  opsBase = `http://127.0.0.1:${opsPort}`;
+  dashBase = `http://127.0.0.1:${dashPort}`;
+  deadServer = `http://127.0.0.1:${deadPort}`;
+  server = await launch(BIN, {
     cwd: workDir, // fresh boxhead.db per run
     env: {
-      ...process.env,
       PORT: String(port),
       STATIC_DIR: joinPath(ROOT, 'frontend', 'dist'),
       BOXHEAD_EMPTY_ROOM_TTL_SECS: String(EMPTY_TTL_SECS),
+      BOXHEAD_OPS_TOKEN: OPS_TOKEN,
+      BOXHEAD_OPS_ADDR: `127.0.0.1:${opsPort}`,
+      BOXHEAD_SERVER_ID: 'e2e-game',
+      BOXHEAD_SIM_THREADS: String(SIM_THREADS),
+      BOXHEAD_PUBLISH_THREADS: String(PUBLISH_THREADS),
+      BOXHEAD_MAX_ROOMS: String(MAX_ROOMS),
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    ready: () => listRooms().then(r => r.ok).catch(() => false),
   });
-  let log = '';
-  server.stdout.on('data', d => { log += d; });
-  server.stderr.on('data', d => { log += d; });
-  const exited = new Promise((_, rej) => server.once('exit', code => rej(new Error(`server exited (${code}):\n${log}`))));
-  await Promise.race([exited, waitUntil(() => listRooms().then(r => r.ok).catch(() => false), { message: 'server start' })]);
+  dashboard = await launch(DASH_BIN, {
+    cwd: workDir,
+    env: {
+      BOXHEAD_OPS_TOKEN: OPS_TOKEN,
+      GAME_SERVERS: `${opsBase}, ${deadServer}`,
+      DASHBOARD_ADDR: `127.0.0.1:${dashPort}`,
+      DASHBOARD_POLL_MS: '250',
+    },
+    ready: () => fetch(`${dashBase}/healthz`).then(r => r.ok).catch(() => false),
+  });
 });
 
 after(async () => {
-  server?.kill();
+  for (const child of [server, dashboard, ...extraProcesses]) child?.kill();
   await sleep(200);
   for (let i = 0; i < 10 && workDir; i++) {
     try { rmSync(workDir, { recursive: true, force: true }); break; } catch { await sleep(200); }
@@ -514,50 +560,264 @@ describe('lobby lifetime', () => {
   });
 });
 
-// ---------------------------------------------------------------- restart / admin
+// ---------------------------------------------------------------- replay / ops API
 
-describe('restart and admin', () => {
-  test('play-again restart is gated like joining', async () => {
-    const guest = new URLSearchParams({ roomId: 'verified', profileId: randomUUID(), startingWave: '1' });
-    assert.match((await api(`/admin/restart?${guest}`, { method: 'POST' })).error, /verified/i);
-    const missing = new URLSearchParams({ roomId: 'gone', profileId: randomUUID() });
-    assert.match((await api(`/admin/restart?${missing}`, { method: 'POST' })).error, /not found/i);
+async function ops(path, { method = 'GET', token = OPS_TOKEN, body } = {}) {
+  const headers = {};
+  if (token != null) headers.Authorization = `Bearer ${token}`;
+  if (body) headers['Content-Type'] = 'application/json';
+  const res = await fetch(opsBase + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+const opsRoom = async id => (await ops('/ops/v1/status')).json.rooms.find(r => r.id === id);
+const replay = (roomId, body = {}) => api(`/api/rooms/${encodeURIComponent(roomId)}/replay`, { method: 'POST', body: { profileId: randomUUID(), startingWave: 1, ...body } });
+
+describe('player replay', () => {
+  test('replay is gated like joining', async () => {
+    assert.match((await replay('verified')).error, /verified/i);
+    assert.match((await replay('verified', { token: 'forged' })).error, /verified/i);
+    assert.match((await replay('gone')).error, /not found/i);
   });
 
-  test('play-again cannot reset a round that is still running', async () => {
+  test('players cannot reset a round that is still running', async () => {
     const { room } = await mustCreate('Active Round');
     const c = await joinOk({ roomId: room.id });
-    const params = new URLSearchParams({ roomId: room.id, profileId: randomUUID(), startingWave: '1' });
-    const res = await api(`/admin/restart?${params}`, { method: 'POST' });
+    const res = await replay(room.id);
     assert.equal(res.ok, false);
     assert.match(res.error, /still active/);
     await c.close();
   });
 
-  test('admin restart of one room resyncs only that room', async () => {
+  test('the old public admin endpoints are gone', async () => {
+    for (const [method, path] of [['GET', '/admin'], ['GET', '/admin/status'], ['POST', '/admin/restart'], ['GET', '/ops/v1/status']]) {
+      const res = await fetch(base + path, { method });
+      assert.ok(res.status >= 400, `${method} ${path} should not be served publicly (got ${res.status})`);
+      const text = await res.text();
+      assert.ok(!text.includes('"rooms"'), `${method} ${path} leaked room data`);
+    }
+  });
+});
+
+describe('ops API (internal, for the dashboard)', () => {
+  test('requires the bearer token', async () => {
+    assert.equal((await ops('/ops/v1/status', { token: null })).status, 401);
+    assert.equal((await ops('/ops/v1/status', { token: 'wrong' })).status, 401);
+    assert.equal((await ops('/ops/v1/status', { token: '' })).status, 401);
+    assert.equal((await ops('/ops/v1/restart-all', { method: 'POST', token: 'wrong' })).status, 401);
+    assert.equal((await ops('/ops/v1/rooms/open/restart', { method: 'POST', token: null })).status, 401);
+  });
+
+  test('reports the server, its sim threads and every room', async () => {
+    const { room } = await mustCreate('Ops Visible');
+    const c = await joinOk({ roomId: room.id });
+    await sleep(300);
+    const { status, json } = await ops('/ops/v1/status');
+    assert.equal(status, 200);
+    assert.equal(json.serverId, 'e2e-game');
+    assert.equal(json.simThreadCount, SIM_THREADS);
+    assert.ok(json.simThreads.length >= 1 && json.simThreads.length <= SIM_THREADS);
+    assert.ok(json.simThreads.every(t => t.name.startsWith('room-sim-')));
+    assert.equal(json.publishThreadCount, PUBLISH_THREADS);
+    assert.ok(json.publishThreads.length >= 1 && json.publishThreads.every(t => t.name.startsWith('room-pub-')));
+    assert.equal(json.roomLimit, MAX_ROOMS);
+    assert.equal(json.emptyRoomTtlSecs, EMPTY_TTL_SECS);
+    const entry = json.rooms.find(r => r.id === room.id);
+    assert.equal(entry.connected, 1);
+    assert.equal(entry.hostId, c.id);
+    assert.ok(entry.tick.count > 5, 'room has been ticking');
+    assert.match(entry.tick.lastThread, /^room-sim-\d+$/);
+    assert.equal(entry.tick.budgetUs, 16667);
+    assert.ok(entry.publish.count > 5, 'state provider has been sending');
+    assert.match(entry.publish.lastThread, /^room-pub-\d+$/, 'network work runs off the game threads');
+    assert.ok(json.totals.connected >= 1);
+    await c.close();
+  });
+
+  test('restarting one room resyncs only that room', async () => {
     const { room } = await mustCreate('Restart Me');
     const c = await joinOk({ roomId: room.id });
     const other = await joinOk({ roomId: 'open' });
     await sleep(100);
-    const res = await api(`/admin/restart?roomId=${room.id}`, { method: 'POST' });
-    assert.equal(res.ok, true);
-    await c.waitForNext(m => m.type === 'snapshot', 3000, 'resync snapshot');
+    const since = c.mark();
+    const res = await ops(`/ops/v1/rooms/${room.id}/restart`, { method: 'POST', body: { startingWave: 3 } });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.startingWave, 3);
+    const snap = await c.waitAfter(since, m => m.type === 'snapshot', 3000, 'resync snapshot');
+    assert.equal(snap.wave, 3, 'operators can choose the restart wave');
     await sleep(200);
-    const otherSnapshots = other.messages.filter(m => m.type === 'snapshot').length;
-    assert.equal(otherSnapshots, 1, 'other room not resynced');
+    assert.equal(other.messages.filter(m => m.type === 'snapshot').length, 1, 'other room not resynced');
+    assert.equal((await ops('/ops/v1/rooms/nope/restart', { method: 'POST' })).status, 404);
     await Promise.all([c.close(), other.close()]);
   });
 
-  test('admin status aggregates every room', async () => {
-    const { room } = await mustCreate('Status Check');
+  test('restart-all resyncs every room', async () => {
+    const { room } = await mustCreate('Everyone');
+    const a = await joinOk({ roomId: room.id });
+    const b = await joinOk({ roomId: 'open' });
+    const [sinceA, sinceB] = [a.mark(), b.mark()];
+    const res = await ops('/ops/v1/restart-all', { method: 'POST' });
+    assert.equal(res.json.ok, true);
+    assert.ok(res.json.restarted >= 3);
+    await a.waitAfter(sinceA, m => m.type === 'snapshot', 3000, 'resync A');
+    await b.waitAfter(sinceB, m => m.type === 'snapshot', 3000, 'resync B');
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  test('without BOXHEAD_OPS_TOKEN the ops API is not started at all', async () => {
+    const dir = mkdtempSync(joinPath(tmpdir(), 'boxhead-e2e-noops-'));
+    const [port, opsPort] = [await freePort(), await freePort()];
+    const env = { ...process.env, PORT: String(port), STATIC_DIR: joinPath(ROOT, 'frontend', 'dist'), BOXHEAD_OPS_ADDR: `127.0.0.1:${opsPort}` };
+    delete env.BOXHEAD_OPS_TOKEN;
+    const child = spawn(BIN, [], { cwd: dir, env, stdio: 'ignore' });
+    extraProcesses.push(child);
+    await waitUntil(() => fetch(`http://127.0.0.1:${port}/api/rooms`).then(r => r.ok).catch(() => false), { message: 'second server' });
+    await assert.rejects(fetch(`http://127.0.0.1:${opsPort}/ops/v1/status`), 'ops port must be closed');
+    child.kill();
+  });
+});
+
+// ---------------------------------------------------------------- parallel simulation
+
+describe('parallel room simulation', () => {
+  test('many busy rooms tick in parallel across sim threads while the API stays responsive', async () => {
+    const ROOMS = 24;
+    const clients = [];
+    for (let i = 0; i < ROOMS; i++) {
+      const { room } = await mustCreate(`Load ${i}`);
+      clients.push(await joinOk({ roomId: room.id, name: `bot${i}` }));
+      clients.at(-1).roomId = room.id;
+    }
+    const before = (await ops('/ops/v1/status')).json;
+    const started = Date.now();
+    await sleep(1500);
+
+    // The public API answers quickly even with every room simulating.
+    const t0 = Date.now();
+    assert.equal((await listRooms()).ok, true);
+    assert.ok(Date.now() - t0 < 500, `listing took ${Date.now() - t0}ms under load`);
+
+    const after = (await ops('/ops/v1/status')).json;
+    const elapsedSecs = (Date.now() - started) / 1000;
+    for (const c of clients) {
+      const r = after.rooms.find(x => x.id === c.roomId);
+      const r0 = before.rooms.find(x => x.id === c.roomId);
+      const rate = (r.tick.count - r0.tick.count) / elapsedSecs;
+      assert.ok(rate > 40, `${r.name} ticked at ${rate.toFixed(1)}/s, expected ~60`);
+      assert.ok(r.tick.avgUs < r.tick.budgetUs, `${r.name} average tick ${r.tick.avgUs}us exceeds the budget`);
+      assert.match(r.tick.lastThread, /^room-sim-/);
+      assert.match(r.publish.lastThread, /^room-pub-/);
+    }
+    const busyThreads = after.simThreads.filter(t => {
+      const t0 = before.simThreads.find(x => x.name === t.name);
+      return t.ticks - (t0?.ticks ?? 0) > 0;
+    });
+    assert.ok(busyThreads.length >= 2, `work should spread over several threads, used ${busyThreads.length}`);
+    await Promise.all(clients.map(c => c.close()));
+  });
+});
+
+// ---------------------------------------------------------------- dashboard service
+
+async function dash(path, { method = 'GET', headers = {}, body } = {}) {
+  const res = await fetch(dashBase + path, { method, headers: { 'Content-Type': 'application/json', ...headers }, body });
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+const overview = async () => (await dash('/api/overview')).json;
+
+describe('dashboard service', () => {
+  test('serves the ops page', async () => {
+    const res = await fetch(dashBase + '/');
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('BOXHEAD OPS'));
+    assert.ok(!html.includes('innerHTML'), 'page must render player-supplied names as text');
+  });
+
+  test('shows the live game server and flags the unreachable one', async () => {
+    const o = await waitUntil(async () => {
+      const v = await overview();
+      return v.servers[0].up && v.servers[1].lastError ? v : null;
+    }, { message: 'dashboard to poll both servers' });
+    assert.equal(o.totals.servers, 2);
+    assert.equal(o.totals.serversUp, 1);
+    assert.equal(o.servers[0].serverId, 'e2e-game');
+    assert.equal(o.servers[0].simThreadCount, SIM_THREADS);
+    assert.equal(o.servers[1].up, false);
+    assert.ok(o.servers[1].lastError);
+  });
+
+  test('tracks rooms, tick health and per-thread load', async () => {
+    const { room } = await mustCreate('Dash Room');
     const c = await joinOk({ roomId: room.id });
-    const status = await api('/admin/status');
-    assert.ok(Array.isArray(status.rooms));
-    const entry = status.rooms.find(r => r.id === room.id);
-    assert.equal(entry.connected, 1);
-    assert.equal(entry.host_id, c.id);
-    assert.ok(status.connected >= 1);
+    const entry = await waitUntil(async () => {
+      const o = await overview();
+      const r = o.servers[0].rooms.find(x => x.id === room.id);
+      return r && r.tick.count > 10 ? { o, r } : null;
+    }, { message: 'room to appear on the dashboard' });
+    assert.equal(entry.r.name, 'Dash Room');
+    assert.equal(entry.r.connected, 1);
+    assert.ok(['ok', 'warn', 'over'].includes(entry.r.health));
+    assert.match(entry.r.tick.lastThread, /^room-sim-/);
+    const threads = entry.o.servers[0].threads;
+    assert.ok(threads.length >= 1);
+    for (const t of threads) assert.ok(t.utilization >= 0 && t.utilization <= 1);
+    await waitUntil(async () => (await overview()).servers[0].threads.some(t => t.ticksPerSec > 0), { message: 'thread tick rate' });
     await c.close();
+  });
+
+  test('restart actions need the anti-CSRF header', async () => {
+    const res = await dash('/api/servers/0/restart-all', { method: 'POST', body: '{}' });
+    assert.equal(res.status, 403);
+    const form = await fetch(`${dashBase}/api/servers/0/rooms/open/restart`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'a=1',
+    });
+    assert.equal(form.status, 403, 'a cross-site form post is refused');
+  });
+
+  test('restarts a room through the dashboard', async () => {
+    const { room } = await mustCreate('Dash Restart');
+    const c = await joinOk({ roomId: room.id });
+    const since = c.mark();
+    const res = await dash(`/api/servers/0/rooms/${room.id}/restart`, { method: 'POST', headers: { 'X-Dashboard-Action': '1' }, body: '{}' });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    assert.equal(res.json.ok, true);
+    await c.waitAfter(since, m => m.type === 'snapshot', 3000, 'resync after dashboard restart');
+    await c.close();
+  });
+
+  test('rejects bad targets', async () => {
+    const h = { 'X-Dashboard-Action': '1' };
+    assert.equal((await dash('/api/servers/9/restart-all', { method: 'POST', headers: h, body: '{}' })).status, 404);
+    assert.equal((await dash('/api/servers/0/rooms/no-such-room/restart', { method: 'POST', headers: h, body: '{}' })).status, 404);
+    assert.equal((await dash('/api/servers/0/rooms/a.b/restart', { method: 'POST', headers: h, body: '{}' })).status, 400);
+    assert.equal((await dash('/api/servers/1/restart-all', { method: 'POST', headers: h, body: '{}' })).status, 502, 'dead server reported as bad gateway');
+  });
+
+  test('refuses to start without a token or exposed without a password', async () => {
+    const env = { BOXHEAD_OPS_TOKEN: OPS_TOKEN, GAME_SERVERS: opsBase };
+    const noToken = await launch(DASH_BIN, { cwd: workDir, env: { ...env, BOXHEAD_OPS_TOKEN: '', DASHBOARD_ADDR: `127.0.0.1:${await freePort()}` } });
+    assert.equal(await noToken.exitCode$, 2);
+    const exposed = await launch(DASH_BIN, { cwd: workDir, env: { ...env, DASHBOARD_ADDR: `0.0.0.0:${await freePort()}` } });
+    assert.equal(await exposed.exitCode$, 2);
+    assert.match(exposed.log, /DASHBOARD_PASSWORD/);
+  });
+
+  test('a password-protected dashboard requires HTTP basic auth', async () => {
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const child = await launch(DASH_BIN, {
+      cwd: workDir,
+      env: { BOXHEAD_OPS_TOKEN: OPS_TOKEN, GAME_SERVERS: opsBase, DASHBOARD_ADDR: `127.0.0.1:${port}`, DASHBOARD_PASSWORD: 'correct horse' },
+      ready: () => fetch(`${url}/healthz`).then(r => r.ok).catch(() => false),
+    });
+    extraProcesses.push(child);
+    const basic = pw => ({ Authorization: 'Basic ' + Buffer.from(`ops:${pw}`).toString('base64') });
+    assert.equal((await fetch(`${url}/api/overview`)).status, 401);
+    assert.equal((await fetch(`${url}/`)).status, 401);
+    assert.equal((await fetch(`${url}/api/overview`, { headers: basic('wrong') })).status, 401);
+    assert.equal((await fetch(`${url}/api/overview`, { headers: basic('correct horse') })).status, 200);
+    child.kill();
   });
 });
 
@@ -579,11 +839,11 @@ describe('static client', () => {
 describe('capacity', () => {
   test('the server caps the number of rooms', async () => {
     let error;
-    for (let i = 0; i < 40 && !error; i++) {
+    for (let i = 0; i < MAX_ROOMS + 10 && !error; i++) {
       const res = await createRoom(`Flood ${i}`);
       if (!res.ok) error = res.error;
     }
     assert.match(error ?? '', /limit/i);
-    assert.ok((await listRooms()).rooms.length <= 32);
+    assert.ok((await listRooms()).rooms.length <= MAX_ROOMS);
   });
 });

@@ -861,8 +861,11 @@ logoutBtn.addEventListener('click', clearAuthState);
 playBtn.addEventListener('click', () => showMenuView('browser'));
 playAgainBtn.addEventListener('click', async () => {
   try {
-    const params = new URLSearchParams({ profileId: waveProfile, startingWave: String(startingWave), roomId: currentRoomId, token: authToken });
-    const response = await fetch(`/admin/restart?${params}`, { method: 'POST' });
+    const response = await fetch(`/api/rooms/${encodeURIComponent(currentRoomId)}/replay`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: authToken, profileId: waveProfile, startingWave }),
+    });
     const result = await response.json();
     if (!response.ok || !result.ok) return;
   } catch { /* ignore */ }

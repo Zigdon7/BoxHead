@@ -1,20 +1,135 @@
-//! Server-hosted rooms. Every room owns its own authoritative `Game` and is
-//! simulated by a dedicated 60 Hz task on the server — clients never host.
+//! Server-hosted rooms. Every room owns its own authoritative `Game`. Clients never host.
+//!
+//! Each room runs as two decoupled tasks on separate thread pools (see `sim.rs`):
+//!
+//! * **Game loop** (`room-sim-*`): 60 Hz physics only. It copies the resulting
+//!   state into a [`Frame`] and hands it off without ever waiting on players,
+//!   the database or the dashboard.
+//! * **State provider** (`room-pub-*`): takes the latest frame, computes
+//!   deltas/snapshots, serializes them and sends them to players, and records
+//!   wave progress. If it falls behind it skips straight to the newest frame
+//!   instead of slowing the game down.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::db::Database;
 use crate::delta::DeltaTracker;
 use crate::game::Game;
+use crate::sim;
+use crate::types::{Bullet, DropPickup, Placeable, Player, Zombie};
 
 pub type ClientSender = mpsc::Sender<String>;
 
 pub const OPEN_ROOM_ID: &str = "open";
 pub const VERIFIED_ROOM_ID: &str = "verified";
-pub const MAX_ROOMS: usize = 32;
+/// Default room cap; override with `BOXHEAD_MAX_ROOMS`.
+pub const MAX_ROOMS: usize = 256;
+/// 60 Hz frame budget for one room tick.
+pub const TICK_BUDGET: Duration = Duration::from_micros(16_667);
+const MAX_WINDOW: Duration = Duration::from_secs(5);
+
+/// Game state copied out by the game loop for the state provider.
+pub struct Frame {
+    pub seq: u64,
+    pub players: HashMap<String, Player>,
+    pub zombies: Vec<Zombie>,
+    pub bullets: Vec<Bullet>,
+    pub placeables: Vec<Placeable>,
+    pub drops: Vec<DropPickup>,
+    pub wave: u32,
+    pub wave_kills: u32,
+    pub wave_target: u32,
+    pub wave_break_timer: f64,
+    pub ammo_availability: HashMap<String, bool>,
+    pub game_over: bool,
+    /// The round was already over before this tick (no deltas are sent).
+    pub was_finished: bool,
+    pub paused: bool,
+    pub host_id: Option<String>,
+}
+
+/// Cheap, lock-free-to-the-game summary for the room list and ops dashboard.
+#[derive(Clone, Debug, Default)]
+pub struct RoomStats {
+    pub players: usize,
+    pub alive: usize,
+    pub zombies: usize,
+    pub bullets: usize,
+    pub wave: u32,
+    pub game_over: bool,
+    pub paused: bool,
+    pub host_id: Option<String>,
+}
+
+impl RoomStats {
+    fn from_game(game: &Game) -> Self {
+        Self {
+            players: game.players().len(),
+            alive: game.players().values().filter(|p| p.health > 0.0).count(),
+            zombies: game.zombies().len(),
+            bullets: game.bullets().len(),
+            wave: game.wave(),
+            game_over: game.is_game_over(),
+            paused: game.is_paused(),
+            host_id: game.host_id().map(str::to_owned),
+        }
+    }
+}
+
+pub fn max_rooms_from_env() -> usize {
+    std::env::var("BOXHEAD_MAX_ROOMS").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(MAX_ROOMS)
+}
+
+/// Rolling tick statistics for one room, read by the ops API.
+#[derive(Debug)]
+pub struct TickMetrics {
+    pub ticks: u64,
+    pub total_ns: u64,
+    pub ewma_ns: f64,
+    window_max_ns: u64,
+    prev_window_max_ns: u64,
+    window_started: Instant,
+    pub overruns: u64,
+    pub dropped_deltas: u64,
+    pub last_thread: String,
+}
+
+impl Default for TickMetrics {
+    fn default() -> Self {
+        Self {
+            ticks: 0, total_ns: 0, ewma_ns: 0.0, window_max_ns: 0, prev_window_max_ns: 0,
+            window_started: Instant::now(), overruns: 0, dropped_deltas: 0, last_thread: String::new(),
+        }
+    }
+}
+
+impl TickMetrics {
+    pub fn record(&mut self, elapsed: Duration, dropped: u64, thread: String, now: Instant) {
+        let ns = elapsed.as_nanos() as u64;
+        self.ewma_ns = if self.ticks == 0 { ns as f64 } else { self.ewma_ns * 0.95 + ns as f64 * 0.05 };
+        self.ticks += 1;
+        self.total_ns += ns;
+        if elapsed > TICK_BUDGET { self.overruns += 1; }
+        self.dropped_deltas += dropped;
+        self.last_thread = thread;
+        if now.saturating_duration_since(self.window_started) >= MAX_WINDOW {
+            self.prev_window_max_ns = self.window_max_ns;
+            self.window_max_ns = 0;
+            self.window_started = now;
+        }
+        self.window_max_ns = self.window_max_ns.max(ns);
+    }
+
+    /// Worst tick over roughly the last 5-10 seconds.
+    pub fn recent_max_ns(&self) -> u64 { self.window_max_ns.max(self.prev_window_max_ns) }
+}
 /// Player-created rooms are shut down after being empty this long (default).
 pub const EMPTY_ROOM_TTL: Duration = Duration::from_secs(90);
 
@@ -52,26 +167,91 @@ pub struct Room {
     pub wave_profiles: Mutex<HashMap<String, (String, u32)>>,
     last_room_status: Mutex<String>,
     empty_since: Mutex<Option<Instant>>,
+    /// Game-loop (physics) timing.
+    pub metrics: std::sync::Mutex<TickMetrics>,
+    /// State-provider (diff + serialize + send) timing.
+    pub publish_metrics: std::sync::Mutex<TickMetrics>,
+    pub stats: std::sync::Mutex<RoomStats>,
+    frames: watch::Sender<Option<Arc<Frame>>>,
+    next_seq: AtomicU64,
+    last_published_seq: AtomicU64,
+    skipped_frames: AtomicU64,
+    slow_client_retries: AtomicU64,
+    created_at: Instant,
 }
 
 impl Room {
     fn new(id: String, name: String, verified_only: bool, permanent: bool) -> Self {
+        let game = Game::new();
+        let stats = RoomStats::from_game(&game);
         Self {
             id, name, verified_only, permanent,
-            game: Mutex::new(Game::new()),
+            game: Mutex::new(game),
             delta_tracker: Mutex::new(DeltaTracker::new()),
             clients: Mutex::new(HashMap::new()),
             pending_snapshots: Mutex::new(HashSet::new()),
             wave_profiles: Mutex::new(HashMap::new()),
             last_room_status: Mutex::new(String::new()),
             empty_since: Mutex::new(Some(Instant::now())),
+            metrics: std::sync::Mutex::new(TickMetrics::default()),
+            publish_metrics: std::sync::Mutex::new(TickMetrics::default()),
+            stats: std::sync::Mutex::new(stats),
+            frames: watch::channel(None).0,
+            next_seq: AtomicU64::new(0),
+            last_published_seq: AtomicU64::new(0),
+            skipped_frames: AtomicU64::new(0),
+            slow_client_retries: AtomicU64::new(0),
+            created_at: Instant::now(),
         }
     }
 
+    pub fn stats(&self) -> RoomStats { self.stats.lock().unwrap().clone() }
+
+    /// Full operational view of the room for the ops dashboard.
+    /// Never touches the game lock: reads stats cached by the game loop.
+    pub async fn ops_snapshot(&self) -> serde_json::Value {
+        let RoomStats { players, alive, zombies, bullets, wave, game_over, paused, host_id } = self.stats();
+        let connected = self.clients.lock().await.len();
+        let m = self.metrics.lock().unwrap();
+        let p = self.publish_metrics.lock().unwrap();
+        serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "verifiedOnly": self.verified_only,
+            "permanent": self.permanent,
+            "connected": connected,
+            "players": players,
+            "alive": alive,
+            "zombies": zombies,
+            "bullets": bullets,
+            "wave": wave,
+            "gameOver": game_over,
+            "paused": paused,
+            "hostId": host_id,
+            "uptimeMs": self.created_at.elapsed().as_millis() as u64,
+            "tick": {
+                "count": m.ticks,
+                "avgUs": (m.ewma_ns / 1000.0).round() as u64,
+                "maxUs": m.recent_max_ns() / 1000,
+                "budgetUs": TICK_BUDGET.as_micros() as u64,
+                "overruns": m.overruns,
+                "droppedDeltas": p.dropped_deltas,
+                "lastThread": m.last_thread,
+            },
+            "publish": {
+                "count": p.ticks,
+                "avgUs": (p.ewma_ns / 1000.0).round() as u64,
+                "maxUs": p.recent_max_ns() / 1000,
+                "droppedDeltas": p.dropped_deltas,
+                "skippedFrames": self.skipped_frames.load(Ordering::Relaxed),
+                "slowClientRetries": self.slow_client_retries.load(Ordering::Relaxed),
+                "lastThread": p.last_thread,
+            },
+        })
+    }
+
     pub async fn summary(&self, player_verified: bool) -> serde_json::Value {
-        let game = self.game.lock().await;
-        let (wave, game_over, paused) = (game.wave(), game.is_game_over(), game.is_paused());
-        drop(game);
+        let RoomStats { wave, game_over, paused, .. } = self.stats();
         let players = self.clients.lock().await.len();
         serde_json::json!({
             "id": self.id,
@@ -88,52 +268,92 @@ impl Room {
 
     /// Restart this room's round and resync every connected client.
     pub async fn restart(&self, requested: u32, unlocked: u32) {
-        self.game.lock().await.reset_at_wave(requested, unlocked);
+        {
+            let mut game = self.game.lock().await;
+            game.reset_at_wave(requested, unlocked);
+            *self.stats.lock().unwrap() = RoomStats::from_game(&game);
+        }
         *self.delta_tracker.lock().await = DeltaTracker::new();
         let clients = self.clients.lock().await;
         self.pending_snapshots.lock().await.extend(clients.keys().cloned());
     }
 
-    /// One server-side simulation + broadcast step.
+    /// Run one game tick and publish it inline. The live server runs these two
+    /// halves on separate pools (see `spawn_room_loops`); this keeps tests simple.
     pub async fn tick(&self, db: &Database) {
-        if self.clients.lock().await.is_empty() {
-            return;
+        if let Some(frame) = self.sim_tick().await {
+            self.publish_frame(&frame, db).await;
         }
+    }
 
-        // --- Physics step (every tick, 60 Hz) ---
+    /// Game-thread half: physics plus copying state out. Never awaits players,
+    /// the database or the network. Returns `None` for idle (empty) rooms.
+    pub async fn sim_tick(&self) -> Option<Arc<Frame>> {
+        if self.clients.lock().await.is_empty() {
+            return None;
+        }
+        let started = Instant::now();
         let mut game = self.game.lock().await;
-        let game_finished = game.is_game_over();
-        let room_paused = game.is_paused();
-        let room_status = serde_json::json!({
-            "type": "room", "hostId": game.host_id(), "paused": room_paused,
-            "roomId": self.id, "roomName": self.name, "verifiedOnly": self.verified_only,
-        }).to_string();
-        if !game_finished && !room_paused {
+        let was_finished = game.is_game_over();
+        let paused = game.is_paused();
+        if !was_finished && !paused {
             game.update(1.0 / 60.0);
         }
-
-        // Snapshot state for network
-        let players = game.players().clone();
-        let zombies = game.zombies().to_vec();
-        let bullets = game.bullets().to_vec();
-        let placeables = game.placeables().to_vec();
-        let drops = game.drops();
-        let wave = game.wave();
-        let wave_kills = game.wave_kills();
-        let wave_target = game.wave_target();
-        let wave_break_timer = game.wave_break_timer();
-        let ammo_availability: HashMap<String, bool> = game.ammo_availability().iter()
-            .map(|a| (a.id.clone(), a.available)).collect();
-        let game_over = game.is_game_over();
+        let frame = Frame {
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            players: game.players().clone(),
+            zombies: game.zombies().to_vec(),
+            bullets: game.bullets().to_vec(),
+            placeables: game.placeables().to_vec(),
+            drops: game.drops(),
+            wave: game.wave(),
+            wave_kills: game.wave_kills(),
+            wave_target: game.wave_target(),
+            wave_break_timer: game.wave_break_timer(),
+            ammo_availability: game.ammo_availability().iter().map(|a| (a.id.clone(), a.available)).collect(),
+            game_over: game.is_game_over(),
+            was_finished,
+            paused,
+            host_id: game.host_id().map(str::to_owned),
+        };
+        let stats = RoomStats::from_game(&game);
         drop(game);
+        *self.stats.lock().unwrap() = stats;
+
+        let elapsed = started.elapsed();
+        let thread = sim::record_tick(elapsed);
+        self.metrics.lock().unwrap().record(elapsed, 0, thread, Instant::now());
+        Some(Arc::new(frame))
+    }
+
+    /// State-provider half: diff, serialize and send one frame, and persist
+    /// wave progress. Runs off the game threads.
+    pub async fn publish_frame(&self, frame: &Frame, db: &Database) {
+        let started = Instant::now();
+        let previous = self.last_published_seq.swap(frame.seq, Ordering::Relaxed);
+        if previous != 0 && frame.seq > previous + 1 {
+            self.skipped_frames.fetch_add(frame.seq - previous - 1, Ordering::Relaxed);
+        }
+        let dropped = self.publish(frame, db).await;
+        let elapsed = started.elapsed();
+        let thread = sim::record_tick(elapsed);
+        self.publish_metrics.lock().unwrap().record(elapsed, dropped, thread, Instant::now());
+    }
+
+    /// Returns the number of deltas dropped for clients that were behind.
+    async fn publish(&self, frame: &Frame, db: &Database) -> u64 {
+        let room_status = serde_json::json!({
+            "type": "room", "hostId": frame.host_id, "paused": frame.paused,
+            "roomId": self.id, "roomName": self.name, "verifiedOnly": self.verified_only,
+        }).to_string();
 
         // Persist only when a connected browser reaches a new wave, not every tick.
         {
             let mut profiles = self.wave_profiles.lock().await;
             for (profile, recorded_wave) in profiles.values_mut() {
-                if wave > *recorded_wave {
-                    db.record_wave(profile, wave);
-                    *recorded_wave = wave;
+                if frame.wave > *recorded_wave {
+                    db.record_wave(profile, frame.wave);
+                    *recorded_wave = frame.wave;
                 }
             }
         }
@@ -145,14 +365,15 @@ impl Room {
             changed
         };
         if room_changed {
-            self.pending_snapshots.lock().await.extend(players.keys().cloned());
+            self.pending_snapshots.lock().await.extend(frame.players.keys().cloned());
         }
 
         // --- Delta computation ---
         let mut dt = self.delta_tracker.lock().await;
         let delta = dt.compute_delta(
-            &players, &zombies, &bullets, &placeables, &drops,
-            wave, wave_kills, wave_target, wave_break_timer, &ammo_availability, game_over,
+            &frame.players, &frame.zombies, &frame.bullets, &frame.placeables, &frame.drops,
+            frame.wave, frame.wave_kills, frame.wave_target, frame.wave_break_timer,
+            &frame.ammo_availability, frame.game_over,
         );
         let delta_str = serde_json::to_string(&delta).unwrap();
 
@@ -162,8 +383,9 @@ impl Room {
         };
         let snapshot_str = if !snapshot_ids.is_empty() {
             let snapshot = dt.build_snapshot(
-                &players, &zombies, &bullets, &placeables, &drops,
-                wave, wave_kills, wave_target, wave_break_timer, &ammo_availability, game_over,
+                &frame.players, &frame.zombies, &frame.bullets, &frame.placeables, &frame.drops,
+                frame.wave, frame.wave_kills, frame.wave_target, frame.wave_break_timer,
+                &frame.ammo_availability, frame.game_over,
             );
             Some(serde_json::to_string(&snapshot).unwrap())
         } else {
@@ -171,35 +393,66 @@ impl Room {
         };
         drop(dt);
 
-        // --- Adaptive broadcast: try_send skips slow clients ---
+        // --- Adaptive broadcast: deltas are droppable; status + snapshots must arrive ---
+        let mut dropped = 0;
+        let mut retry = Vec::new();
         let clients = self.clients.lock().await;
         for (id, tx) in clients.iter() {
             let needs_snapshot = snapshot_ids.contains(id);
             if room_changed || needs_snapshot {
-                // Host/pause changes must not be lost like disposable physics deltas.
-                let _ = tx.send(room_status.clone()).await;
-            }
-            if needs_snapshot {
-                if let Some(ref ss) = snapshot_str {
-                    let _ = tx.send(ss.clone()).await;
+                // Host/pause changes and snapshots must not be lost like disposable
+                // deltas, but we never wait on a player: if their queue is full the
+                // resync is retried next frame, so one stalled connection can't
+                // hold up the room or anyone else in it.
+                let mut must_send = vec![room_status.clone()];
+                if needs_snapshot { must_send.extend(snapshot_str.clone()); }
+                for msg in must_send {
+                    if tx.try_send(msg).is_err() {
+                        retry.push(id.clone());
+                        break;
+                    }
                 }
-            } else if !game_finished && !room_paused {
-                let _ = tx.try_send(delta_str.clone());
+            } else if !frame.was_finished && !frame.paused && tx.try_send(delta_str.clone()).is_err() {
+                dropped += 1;
             }
         }
+        drop(clients);
+        if !retry.is_empty() {
+            self.slow_client_retries.fetch_add(retry.len() as u64, Ordering::Relaxed);
+            self.pending_snapshots.lock().await.extend(retry);
+        }
+        dropped
     }
+}
+
+pub struct RegistryConfig {
+    pub empty_ttl: Duration,
+    pub max_rooms: usize,
+    /// Runtime the room game loops are spawned on (the sim thread pool).
+    pub sim: tokio::runtime::Handle,
+    /// Runtime the per-room state providers run on (the publish thread pool).
+    pub publish: tokio::runtime::Handle,
 }
 
 pub struct RoomRegistry {
     rooms: Mutex<HashMap<String, Arc<Room>>>,
     db: Arc<Database>,
     empty_ttl: Duration,
+    max_rooms: usize,
+    sim: tokio::runtime::Handle,
+    publish: tokio::runtime::Handle,
 }
 
 impl RoomRegistry {
-    pub fn new(db: Arc<Database>, empty_ttl: Duration) -> Arc<Self> {
-        Arc::new(Self { rooms: Mutex::new(HashMap::new()), db, empty_ttl })
+    pub fn new(db: Arc<Database>, config: RegistryConfig) -> Arc<Self> {
+        Arc::new(Self {
+            rooms: Mutex::new(HashMap::new()), db,
+            empty_ttl: config.empty_ttl, max_rooms: config.max_rooms, sim: config.sim, publish: config.publish,
+        })
     }
+
+    pub fn max_rooms(&self) -> usize { self.max_rooms }
+    pub fn empty_ttl(&self) -> Duration { self.empty_ttl }
 
     /// Create the always-on rooms and the background reaper. Call once at startup.
     pub async fn start(self: &Arc<Self>) {
@@ -222,7 +475,7 @@ impl RoomRegistry {
     async fn insert(&self, room: Room) -> Arc<Room> {
         let room = Arc::new(room);
         self.rooms.lock().await.insert(room.id.clone(), room.clone());
-        spawn_room_loop(Arc::downgrade(&room), self.db.clone());
+        spawn_room_loops(&self.sim, &self.publish, &room, self.db.clone());
         room
     }
 
@@ -231,7 +484,7 @@ impl RoomRegistry {
         if name.is_empty() {
             return Err("Room name required".into());
         }
-        if self.rooms.lock().await.len() >= MAX_ROOMS {
+        if self.rooms.lock().await.len() >= self.max_rooms {
             return Err("Server room limit reached — try again later".into());
         }
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -270,14 +523,32 @@ impl RoomRegistry {
     }
 }
 
-/// Each room is simulated on its own server task, stopping once the room is gone.
-fn spawn_room_loop(room: Weak<Room>, db: Arc<Database>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(16));
-        loop {
-            interval.tick().await;
-            let Some(room) = room.upgrade() else { break };
-            room.tick(&db).await;
+/// Start a room's game loop (sim pool) and state provider (publish pool).
+/// Both stop on their own once the room is removed.
+fn spawn_room_loops(sim: &tokio::runtime::Handle, publish: &tokio::runtime::Handle, room: &Arc<Room>, db: Arc<Database>) {
+    let weak: Weak<Room> = Arc::downgrade(room);
+    sim.spawn({
+        let weak = weak.clone();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(16));
+            loop {
+                interval.tick().await;
+                let Some(room) = weak.upgrade() else { break };
+                if let Some(frame) = room.sim_tick().await {
+                    // Latest-wins hand-off: never waits for the state provider.
+                    room.frames.send_replace(Some(frame));
+                }
+            }
+        }
+    });
+
+    let mut frames = room.frames.subscribe();
+    publish.spawn(async move {
+        // Ends when the room (and so the frame sender) is dropped.
+        while frames.changed().await.is_ok() {
+            let Some(frame) = frames.borrow_and_update().clone() else { continue };
+            let Some(room) = weak.upgrade() else { break };
+            room.publish_frame(&frame, &db).await;
         }
     });
 }
@@ -287,7 +558,21 @@ mod tests {
     use super::*;
 
     fn registry(ttl: Duration) -> Arc<RoomRegistry> {
-        RoomRegistry::new(Arc::new(Database::open(":memory:").unwrap()), ttl)
+        registry_with(ttl, MAX_ROOMS, tokio::runtime::Handle::current())
+    }
+
+    fn registry_with(empty_ttl: Duration, max_rooms: usize, sim: tokio::runtime::Handle) -> Arc<RoomRegistry> {
+        let publish = tokio::runtime::Handle::current();
+        RoomRegistry::new(Arc::new(Database::open(":memory:").unwrap()), RegistryConfig { empty_ttl, max_rooms, sim, publish })
+    }
+
+    fn pools(sim_threads: usize, publish_threads: usize) -> (crate::sim::SimRuntime, crate::sim::SimRuntime, Arc<RoomRegistry>) {
+        let sim = crate::sim::SimRuntime::new(crate::sim::THREAD_PREFIX, sim_threads).unwrap();
+        let publish = crate::sim::SimRuntime::new(crate::sim::PUBLISH_PREFIX, publish_threads).unwrap();
+        let registry = RoomRegistry::new(Arc::new(Database::open(":memory:").unwrap()), RegistryConfig {
+            empty_ttl: EMPTY_ROOM_TTL, max_rooms: MAX_ROOMS, sim: sim.handle(), publish: publish.handle(),
+        });
+        (sim, publish, registry)
     }
 
     /// Simulate a connected client: register a channel and a player in the room.
@@ -374,12 +659,12 @@ mod tests {
 
     #[tokio::test]
     async fn create_enforces_room_limit() {
-        let registry = registry(EMPTY_ROOM_TTL);
+        let registry = registry_with(EMPTY_ROOM_TTL, 6, tokio::runtime::Handle::current());
         registry.start().await;
-        for i in 0..MAX_ROOMS - 2 {
+        for i in 0..4 {
             registry.create(&format!("Room {i}"), false).await.unwrap();
         }
-        assert_eq!(registry.all().await.len(), MAX_ROOMS);
+        assert_eq!(registry.all().await.len(), 6);
         let err = registry.create("One too many", false).await.err().unwrap();
         assert!(err.contains("limit"), "{err}");
     }
@@ -578,5 +863,142 @@ mod tests {
         room.tick(&db).await;
         assert_eq!(db.highest_wave(&profile), 3);
         assert_eq!(room.wave_profiles.lock().await["p1"].1, 3);
+    }
+
+    // ---- Metrics & parallel simulation ----
+
+    #[test]
+    fn tick_metrics_track_average_max_and_overruns() {
+        let mut m = TickMetrics::default();
+        let t0 = Instant::now();
+        m.record(Duration::from_millis(2), 0, "room-sim-0".into(), t0);
+        m.record(Duration::from_millis(20), 3, "room-sim-1".into(), t0);
+        assert_eq!(m.ticks, 2);
+        assert_eq!(m.overruns, 1, "only the 20ms tick is over the 16.7ms budget");
+        assert_eq!(m.dropped_deltas, 3);
+        assert_eq!(m.last_thread, "room-sim-1");
+        assert_eq!(m.recent_max_ns(), 20_000_000);
+        assert!(m.ewma_ns > 2_000_000.0 && m.ewma_ns < 20_000_000.0);
+        // Two windows later the old spike has aged out.
+        m.record(Duration::from_millis(1), 0, "room-sim-0".into(), t0 + MAX_WINDOW);
+        m.record(Duration::from_millis(1), 0, "room-sim-0".into(), t0 + MAX_WINDOW * 2);
+        assert_eq!(m.recent_max_ns(), 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn idle_rooms_record_no_ticks() {
+        let db = Database::open(":memory:").unwrap();
+        let room = Room::new("r".into(), "Idle".into(), false, false);
+        room.tick(&db).await;
+        assert_eq!(room.metrics.lock().unwrap().ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn ops_snapshot_reports_room_and_tick_health() {
+        let db = Database::open(":memory:").unwrap();
+        let room = Room::new("r".into(), "Ops".into(), true, false);
+        let _rx = connect(&room, "p1").await;
+        room.tick(&db).await;
+        room.tick(&db).await;
+        let s = room.ops_snapshot().await;
+        assert_eq!(s["name"], "Ops");
+        assert_eq!(s["verifiedOnly"], true);
+        assert_eq!(s["connected"], 1);
+        assert_eq!(s["players"], 1);
+        assert_eq!(s["hostId"], "p1");
+        assert_eq!(s["tick"]["count"], 2);
+        assert_eq!(s["tick"]["budgetUs"], 16_667);
+        assert!(s["tick"]["lastThread"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn room_loops_run_on_the_sim_pool_in_parallel() {
+        let (sim, publish, registry) = pools(4, 2);
+        let mut rooms = Vec::new();
+        let mut receivers = Vec::new();
+        for i in 0..12 {
+            let room = registry.create(&format!("Load {i}"), false).await.unwrap();
+            receivers.push(connect(&room, &format!("p{i}")).await);
+            rooms.push(room);
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        for room in &rooms {
+            let m = room.metrics.lock().unwrap();
+            assert!(m.ticks >= 10, "{} only ticked {} times", room.name, m.ticks);
+            assert!(m.last_thread.starts_with(crate::sim::THREAD_PREFIX), "ran on {}", m.last_thread);
+        }
+        let busy_threads = sim.snapshot().iter().filter(|t| t.ticks > 0).count();
+        assert!(busy_threads >= 2, "expected work spread over several sim threads, got {busy_threads}");
+        for room in &rooms {
+            let p = room.publish_metrics.lock().unwrap();
+            assert!(p.ticks >= 10, "{} published {} frames", room.name, p.ticks);
+            assert!(p.last_thread.starts_with(crate::sim::PUBLISH_PREFIX), "published on {}", p.last_thread);
+        }
+        assert!(publish.snapshot().iter().any(|t| t.ticks > 0));
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_player_never_slows_the_game_loop_or_other_players() {
+        let (_sim, _publish, registry) = pools(2, 2);
+        let room = registry.create("Laggy", false).await.unwrap();
+        // A player whose connection never drains: a 1-slot channel nobody reads.
+        let (stuck_tx, _stuck_rx) = mpsc::channel(1);
+        room.game.lock().await.add_player("stuck", "stuck");
+        room.clients.lock().await.insert("stuck".into(), stuck_tx);
+        room.pending_snapshots.lock().await.insert("stuck".into());
+        let mut healthy = connect(&room, "healthy").await;
+
+        let mut received = 0;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            while healthy.try_recv().is_ok() { received += 1; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let sim_ticks = room.metrics.lock().unwrap().ticks;
+        assert!(sim_ticks >= 35, "game loop must keep ~60 Hz regardless of players, got {sim_ticks}");
+        assert!(room.metrics.lock().unwrap().overruns == 0, "game ticks never wait on the network");
+        assert!(received >= 20, "healthy player kept receiving updates, got {received}");
+        assert!(room.slow_client_retries.load(Ordering::Relaxed) >= 1, "stalled player was retried, not waited on");
+    }
+
+    #[tokio::test]
+    async fn a_slow_state_provider_skips_frames_instead_of_delaying_the_game() {
+        let db = Database::open(":memory:").unwrap();
+        let room = Room::new("r".into(), "R".into(), false, false);
+        let mut rx = connect(&room, "p1").await;
+        // Five game ticks happen before the provider gets a turn.
+        let mut latest = None;
+        for _ in 0..5 { latest = room.sim_tick().await; }
+        room.publish_frame(latest.as_ref().unwrap(), &db).await;
+        let first = room.sim_tick().await.unwrap();
+        room.publish_frame(&first, &db).await;
+        assert_eq!(room.metrics.lock().unwrap().ticks, 6);
+        assert_eq!(room.publish_metrics.lock().unwrap().ticks, 2);
+        assert_eq!(room.skipped_frames.load(Ordering::Relaxed), 0, "first publish has no baseline; 5 -> 6 is contiguous");
+        for _ in 0..3 { latest = room.sim_tick().await; }
+        room.publish_frame(latest.as_ref().unwrap(), &db).await;
+        assert_eq!(room.skipped_frames.load(Ordering::Relaxed), 2);
+        assert!(drain(&mut rx).iter().any(|m| m["type"] == "snapshot"));
+    }
+
+    #[tokio::test]
+    async fn room_list_and_ops_read_cached_stats_without_the_game_lock() {
+        let db = Database::open(":memory:").unwrap();
+        let room = Room::new("r".into(), "R".into(), false, false);
+        let _rx = connect(&room, "p1").await;
+        room.tick(&db).await;
+        let held = room.game.lock().await; // the game loop is mid-tick
+        let summary = tokio::time::timeout(Duration::from_millis(200), room.summary(false)).await
+            .expect("room list must not wait for the game lock");
+        let ops = tokio::time::timeout(Duration::from_millis(200), room.ops_snapshot()).await
+            .expect("ops status must not wait for the game lock");
+        drop(held);
+        assert_eq!(summary["wave"], 1);
+        assert_eq!(ops["players"], 1);
+        assert_eq!(ops["hostId"], "p1");
+        assert_eq!(ops["publish"]["count"], 1);
     }
 }

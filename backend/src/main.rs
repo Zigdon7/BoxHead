@@ -6,6 +6,8 @@ mod delta;
 mod social;
 mod db;
 mod rooms;
+mod sim;
+mod ops;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +15,7 @@ use tokio::sync::Mutex;
 use axum::{
     Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{State, Query},
+    extract::{State, Query, Path},
     response::{IntoResponse, Html},
     routing::{get, post},
     Json,
@@ -25,7 +27,8 @@ use tokio::sync::mpsc;
 use crate::types::*;
 use crate::social::SocialState;
 use crate::db::Database;
-use crate::rooms::{RoomRegistry, OPEN_ROOM_ID};
+use crate::rooms::{RegistryConfig, RoomRegistry, OPEN_ROOM_ID};
+use crate::sim::SimRuntime;
 
 // Bounded channel: capacity = a few ticks of headroom.
 // If a client falls behind, we skip deltas rather than buffer indefinitely.
@@ -47,8 +50,19 @@ async fn main() {
     let google_client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();
     let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
 
-    // Every room is simulated server-side on its own 60 Hz task.
-    let rooms = RoomRegistry::new(db.clone(), rooms::empty_room_ttl_from_env());
+    // Room game loops run in parallel on a dedicated simulation pool. Each room's
+    // state provider (diff + serialize + send) runs on a separate publish pool, so
+    // network work never lands on a game thread. Both are separate from the
+    // runtime serving HTTP and WebSockets.
+    let sim = Arc::new(SimRuntime::new(sim::THREAD_PREFIX, sim::threads_from_env()).expect("Failed to start simulation threads"));
+    let publish = Arc::new(SimRuntime::new(sim::PUBLISH_PREFIX, sim::publish_threads_from_env()).expect("Failed to start state provider threads"));
+    println!("Simulation pool: {} threads · State provider pool: {} threads", sim.size(), publish.size());
+    let rooms = RoomRegistry::new(db.clone(), RegistryConfig {
+        empty_ttl: rooms::empty_room_ttl_from_env(),
+        max_rooms: rooms::max_rooms_from_env(),
+        sim: sim.handle(),
+        publish: publish.handle(),
+    });
     rooms.start().await;
 
     let state = Arc::new(AppState {
@@ -70,14 +84,13 @@ async fn main() {
     });
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    start_ops_api(&port, state.rooms.clone(), sim.clone(), publish.clone()).await;
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/admin", get(admin_panel))
-        .route("/admin/restart", post(admin_restart))
-        .route("/admin/status", get(admin_status))
         .route("/api/rooms", get(rooms_list).post(rooms_create))
+        .route("/api/rooms/{id}/replay", post(room_replay))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/email/register", post(email_register))
         .route("/api/auth/email/login", post(email_login))
@@ -96,6 +109,25 @@ async fn main() {
         .unwrap();
     println!("Server listening on port {}", port);
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Serve the internal ops API (for the dashboard service) on its own,
+/// localhost-by-default address. Disabled unless `BOXHEAD_OPS_TOKEN` is set.
+async fn start_ops_api(port: &str, rooms: Arc<RoomRegistry>, sim: Arc<SimRuntime>, publish: Arc<SimRuntime>) {
+    let token = std::env::var("BOXHEAD_OPS_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        println!("Ops API disabled (set BOXHEAD_OPS_TOKEN to enable the dashboard)");
+        return;
+    }
+    let addr = std::env::var("BOXHEAD_OPS_ADDR").unwrap_or_else(|_| ops::DEFAULT_OPS_ADDR.to_string());
+    let server_id = std::env::var("BOXHEAD_SERVER_ID").unwrap_or_else(|_| format!("game-{port}"));
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => panic!("Could not bind ops API on {addr}: {e}"),
+    };
+    println!("Ops API listening on {addr} as {server_id}");
+    let app = ops::router(ops::OpsState::new(token.trim().to_string(), server_id, rooms, sim, publish));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 }
 
 async fn ws_handler(
@@ -283,150 +315,30 @@ async fn rooms_create(
     }
 }
 
-// --- Admin panel ---
-
-async fn admin_panel() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BoxHead Admin</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 20px; }
-  h1 { font-size: 28px; margin-bottom: 30px; color: #fff; }
-  .card { background: #16213e; border-radius: 12px; padding: 24px; width: 100%; max-width: 500px; margin-bottom: 20px; }
-  .card h2 { font-size: 16px; color: #8888aa; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 1px; }
-  .stat { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1a1a3e; }
-  .stat:last-child { border-bottom: none; }
-  .stat-label { color: #8888aa; }
-  .stat-value { font-weight: bold; }
-  .stat-value.alive { color: #4caf50; }
-  .stat-value.dead { color: #e53935; }
-  .stat-value.wave { color: #ffb400; }
-  button { background: #e53935; color: #fff; border: none; padding: 14px 32px; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; width: 100%; transition: background 0.2s; }
-  button:hover { background: #c62828; }
-  button:disabled { background: #555; cursor: not-allowed; }
-  button.success { background: #4caf50; }
-  .msg { text-align: center; margin-top: 12px; font-size: 14px; min-height: 20px; }
-</style>
-</head><body>
-<h1>BoxHead Admin</h1>
-<div class="card" id="status-card"><h2>Server Status</h2><div id="status">Loading...</div></div>
-<div class="card">
-  <h2>Actions</h2>
-  <button id="restart-btn" onclick="restart()">Restart Game</button>
-  <div class="msg" id="msg"></div>
-</div>
-<script>
-async function refreshStatus() {
-  try {
-    const r = await fetch('/admin/status');
-    const s = await r.json();
-    const gameState = s.game_over ? '<span class="dead">GAME OVER (paused)</span>'
-      : s.connected === 0 ? '<span class="dead">IDLE (no players)</span>'
-      : '<span class="alive">RUNNING</span>';
-    document.getElementById('status').innerHTML =
-      '<div class="stat"><span class="stat-label">Connected</span><span class="stat-value">' + s.connected + '</span></div>' +
-      '<div class="stat"><span class="stat-label">Players</span><span class="stat-value">' + s.players + '</span></div>' +
-      '<div class="stat"><span class="stat-label">Alive</span><span class="stat-value alive">' + s.alive + '</span></div>' +
-      '<div class="stat"><span class="stat-label">Wave</span><span class="stat-value wave">' + s.wave + '</span></div>' +
-      '<div class="stat"><span class="stat-label">Zombies</span><span class="stat-value">' + s.zombies + '</span></div>' +
-      '<div class="stat"><span class="stat-label">State</span><span class="stat-value">' + gameState + '</span></div>';
-  } catch (e) { document.getElementById('status').textContent = 'Error fetching status'; }
-}
-async function restart() {
-  const btn = document.getElementById('restart-btn');
-  btn.disabled = true;
-  try {
-    const r = await fetch('/admin/restart', { method: 'POST' });
-    const d = await r.json();
-    document.getElementById('msg').textContent = d.message;
-    btn.classList.add('success');
-    btn.textContent = 'Restarted!';
-    setTimeout(() => { btn.classList.remove('success'); btn.textContent = 'Restart Game'; btn.disabled = false; document.getElementById('msg').textContent = ''; }, 2000);
-    refreshStatus();
-  } catch (e) { document.getElementById('msg').textContent = 'Failed to restart'; btn.disabled = false; }
-}
-refreshStatus();
-setInterval(refreshStatus, 2000);
-</script>
-</body></html>"#)
-}
-
-async fn admin_restart(
+/// "Play again" after a squad is overrun. Same access rules as joining, and it
+/// only restarts rounds that have actually ended. Operator restarts live in the
+/// ops API used by the dashboard service.
+async fn room_replay(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let requested = params.get("startingWave").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
-    let unlocked = params.get("profileId")
+    let Some(room) = state.rooms.get(&id).await else {
+        return Json(serde_json::json!({ "ok": false, "error": "Room not found" }));
+    };
+    let verified = state.db.session_is_verified(body["token"].as_str());
+    if !rooms::can_join(room.verified_only, verified) {
+        return Json(serde_json::json!({ "ok": false, "error": "Verified accounts only" }));
+    }
+    if !room.game.lock().await.is_game_over() {
+        return Json(serde_json::json!({ "ok": false, "error": "Round is still active" }));
+    }
+    let requested = body["startingWave"].as_u64().unwrap_or(1).clamp(1, 999) as u32;
+    let unlocked = body["profileId"].as_str()
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .map(|id| state.db.highest_wave(id)).unwrap_or(1);
-
-    // A player's "Play again" targets their own room; the admin panel restarts every room.
-    let targets = match params.get("roomId") {
-        Some(id) => match state.rooms.get(id).await {
-            Some(room) => {
-                let verified = state.db.session_is_verified(params.get("token").map(String::as_str));
-                if !rooms::can_join(room.verified_only, verified) {
-                    return Json(serde_json::json!({ "ok": false, "error": "Verified accounts only" }));
-                }
-                vec![room]
-            }
-            None => return Json(serde_json::json!({ "ok": false, "error": "Room not found" })),
-        },
-        None => state.rooms.all().await,
-    };
-
-    for room in targets {
-        // The menu's replay control cannot reset somebody else's active round.
-        if params.contains_key("profileId") && !room.game.lock().await.is_game_over() {
-            return Json(serde_json::json!({ "ok": false, "error": "Round is still active" }));
-        }
-        room.restart(requested, unlocked).await;
-    }
-
-    Json(serde_json::json!({ "message": "Game restarted", "ok": true }))
-}
-
-async fn admin_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let (mut players, mut alive, mut zombies, mut connected, mut max_wave) = (0, 0, 0, 0, 1);
-    let mut any_running = false;
-    let mut room_list = Vec::new();
-    for room in state.rooms.all().await {
-        let game = room.game.lock().await;
-        let room_players = game.players().len();
-        let room_alive = game.players().values().filter(|p| p.health > 0.0).count();
-        let room_zombies = game.zombies().len();
-        let (wave, game_over, paused) = (game.wave(), game.is_game_over(), game.is_paused());
-        let host_id = game.host_id().map(str::to_owned);
-        drop(game);
-        let room_connected = room.clients.lock().await.len();
-
-        players += room_players;
-        alive += room_alive;
-        zombies += room_zombies;
-        connected += room_connected;
-        if room_connected > 0 {
-            max_wave = max_wave.max(wave);
-            any_running |= !game_over;
-        }
-        room_list.push(serde_json::json!({
-            "id": room.id, "name": room.name, "verified_only": room.verified_only,
-            "players": room_players, "connected": room_connected, "alive": room_alive,
-            "zombies": room_zombies, "wave": wave, "game_over": game_over,
-            "paused": paused, "host_id": host_id,
-        }));
-    }
-
-    Json(serde_json::json!({
-        "players": players,
-        "connected": connected,
-        "alive": alive,
-        "zombies": zombies,
-        "wave": max_wave,
-        "game_over": connected > 0 && !any_running,
-        "rooms": room_list,
-    }))
+    room.restart(requested, unlocked).await;
+    Json(serde_json::json!({ "ok": true }))
 }
 
 // --- Config API ---

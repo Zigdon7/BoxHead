@@ -3,6 +3,7 @@ dist/
 .env
 .DS_Store
 backend/target/
+dashboard/target/
 frontend/node_modules/
 frontend/dist/
 *.db
