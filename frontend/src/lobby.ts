@@ -23,19 +23,19 @@ export function resolveSelectedRoom(rooms: RoomInfo[], selectedId: string): stri
   return rooms.some(r => r.id === selectedId && r.canJoin) ? selectedId : OPEN_ROOM_ID;
 }
 
+/** Lobby status line. Official (server-run) lobbies get a badge in the UI instead of text. */
 export function roomStatusText(room: RoomInfo): string {
-  const status = room.players === 0 ? 'empty'
-    : room.gameOver ? 'overrun'
-    : room.paused ? 'paused'
-    : `wave ${room.wave}`;
-  return `${room.players} online · ${status}${room.permanent ? ' · official' : ''}`;
+  if (room.players === 0) return 'Waiting for players';
+  if (room.gameOver) return 'Overrun · waiting for a restart';
+  if (room.paused) return `Paused · Wave ${room.wave}`;
+  return `In progress · Wave ${room.wave}`;
 }
 
 export function verifyStatusText(verified: boolean, clientThinksSignedIn: boolean): string {
-  if (verified) return '✔ Verified account: you can join every lobby.';
+  if (verified) return 'Verified account. You can join every lobby.';
   return clientThinksSignedIn
-    ? 'Your session has expired. Sign in again to unlock verified lobbies.'
-    : 'Playing as a guest (unverified). Sign in to unlock verified lobbies.';
+    ? 'Your session has expired. Sign in again to join verified lobbies.'
+    : 'Playing as a guest. Sign in to join verified lobbies.';
 }
 
 /** Online friends first, then alphabetical by handle. */

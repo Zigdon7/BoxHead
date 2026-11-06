@@ -60,20 +60,20 @@ describe('resolveSelectedRoom', () => {
 
 describe('roomStatusText', () => {
   it('describes empty lobbies', () => {
-    expect(roomStatusText(room())).toBe('0 online · empty');
+    expect(roomStatusText(room())).toBe('Waiting for players');
   });
 
   it('shows the live wave for active lobbies', () => {
-    expect(roomStatusText(room({ players: 3, wave: 7 }))).toBe('3 online · wave 7');
+    expect(roomStatusText(room({ players: 3, wave: 7 }))).toBe('In progress · Wave 7');
   });
 
   it('prioritises overrun over paused', () => {
-    expect(roomStatusText(room({ players: 2, gameOver: true, paused: true }))).toBe('2 online · overrun');
-    expect(roomStatusText(room({ players: 2, paused: true }))).toBe('2 online · paused');
+    expect(roomStatusText(room({ players: 2, gameOver: true, paused: true }))).toBe('Overrun · waiting for a restart');
+    expect(roomStatusText(room({ players: 2, paused: true, wave: 4 }))).toBe('Paused · Wave 4');
   });
 
-  it('marks official server-run lobbies', () => {
-    expect(roomStatusText(room({ permanent: true }))).toBe('0 online · empty · official');
+  it('leaves the official marker to the UI badge', () => {
+    expect(roomStatusText(room({ permanent: true }))).toBe('Waiting for players');
   });
 });
 

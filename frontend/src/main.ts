@@ -1,4 +1,5 @@
 import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite } from './sprites';
+import { theme, withAlpha, font } from './theme';
 import {
   RoomInfo, Friend, OPEN_ROOM_ID, partitionRooms, resolveSelectedRoom, roomStatusText,
   verifyStatusText, sortFriends, friendsSummary, defaultCallsign, accountLabel,
@@ -129,11 +130,12 @@ let damageFlashAlpha = 0;
 let healFlashAlpha = 0;
 let waveBannerText = '';
 let waveBannerSub = '';
-let waveBannerColor = '#ffb400';
+let waveBannerColor = theme.accent;
 let waveBannerTimer = 0;
 let armoryOpen = false;
 let hotbarMeleeBtnRect = { x: 0, y: 0, w: 0, h: 0 };
 let hotbarArmoryBtnRect = { x: 0, y: 0, w: 0, h: 0 };
+let hotbarDashBtnRect = { x: 0, y: 0, w: 0, h: 0 };
 let hotbarWeaponRects: { slot: number; x: number; y: number; w: number; h: number }[] = [];
 let hotbarTacticalRects: { item: number; x: number; y: number; w: number; h: number }[] = [];
 
@@ -141,12 +143,12 @@ function addScreenShake(intensity: number) {
   screenShakeAmount = Math.min(22, Math.max(screenShakeAmount, intensity));
 }
 
-function pushFeedEvent(text: string, color = '#e0e0e0') {
+function pushFeedEvent(text: string, color = theme.textSecondary) {
   eventFeed.unshift({ text, color, time: performance.now() });
   if (eventFeed.length > 6) eventFeed.pop();
 }
 
-function spawnFloatingText(x: number, y: number, text: string, color = '#fff', size = 14) {
+function spawnFloatingText(x: number, y: number, text: string, color = theme.text, size = 14) {
   floatingTexts.push({
     x: x + (Math.random() - 0.5) * 14,
     y: y - 10,
@@ -291,9 +293,14 @@ let accountVerified = false;
 let selectedRoomId = localStorage.getItem('boxhead_room') || OPEN_ROOM_ID;
 let currentRoomId = selectedRoomId;
 let currentRoomName = 'Arena';
-const verifiedRoomListEl = document.getElementById('verifiedRoomList')!;
-const openRoomListEl = document.getElementById('openRoomList')!;
+const roomListEl = document.getElementById('roomList')!;
+roomListEl.addEventListener('scroll', () => updateRoomListFade(roomListEl), { passive: true });
+type LobbyFilter = 'all' | 'verified' | 'open';
+let lobbyFilter: LobbyFilter = 'all';
 const deployBtn = document.getElementById('deployBtn') as HTMLButtonElement;
+const deployLabel = document.getElementById('deployLabel')!;
+const lobbyWaveSelect = document.querySelector('#menuBrowser [data-wave-select]') as HTMLSelectElement;
+const lobbyWaveHint = document.getElementById('lobbyWaveHint')!;
 const verifyStatusEl = document.getElementById('verifyStatus')!;
 const roomErrorMsg = document.getElementById('roomErrorMsg')!;
 const roomNameInput = document.getElementById('roomNameInput') as HTMLInputElement;
@@ -311,14 +318,38 @@ function renderRoomItem(room: RoomInfo): HTMLButtonElement {
   item.type = 'button';
   item.className = 'room-item' + (room.id === selectedRoomId ? ' selected' : '');
   item.disabled = !room.canJoin;
-  item.title = room.canJoin ? `Select ${room.name} (double-click to deploy)` : 'Sign in to join verified lobbies';
+  item.title = room.canJoin ? `Select ${room.name} (double-click to join)` : 'Sign in to join verified lobbies';
+  const title = document.createElement('span');
+  title.className = 'room-title';
+  if (!room.canJoin) title.append(svgIcon('i-lock'));
   const name = document.createElement('span');
   name.className = 'room-name';
-  name.textContent = (room.canJoin ? '' : '🔒 ') + room.name;
+  name.textContent = room.name;
+  title.append(name);
+  // Badges: who can join (a rule, not an endorsement), then Official for lobbies the server runs.
+  const kind = document.createElement('span');
+  kind.className = 'badge';
+  kind.append(svgIcon(room.verifiedOnly ? 'i-shield-check' : 'i-globe'), room.verifiedOnly ? 'Verified only' : 'Public');
+  title.append(kind);
+  if (room.permanent) {
+    const official = document.createElement('span');
+    official.className = 'badge badge--strong';
+    official.title = 'Run by the game server; always available';
+    official.append(svgIcon('i-star'), 'Official');
+    title.append(official);
+  }
+  // Status: a dot (green = match running, red = overrun) and one line of text.
   const meta = document.createElement('span');
-  meta.className = 'room-meta';
-  meta.textContent = roomStatusText(room);
-  item.append(name, meta);
+  meta.className = 'room-meta' + (room.players > 0 ? ' room-meta--live' : '');
+  const dot = document.createElement('span');
+  // Filled white = a match is running, red = overrun, hollow = waiting.
+  dot.className = 'status-dot ' + (room.players > 0 ? (room.gameOver ? 'over' : 'live') : 'idle');
+  meta.append(dot, room.canJoin ? roomStatusText(room) : 'Sign in to join');
+  const count = document.createElement('span');
+  count.className = 'room-count';
+  // Only lobbies with people in them show a count; the status line already says the rest are waiting.
+  if (room.players > 0) count.append(svgIcon('i-users'), `${room.players} ${room.players === 1 ? 'player' : 'players'}`);
+  item.append(title, meta, count);
   item.addEventListener('click', () => selectRoom(room.id));
   item.addEventListener('dblclick', () => { selectRoom(room.id); deploy(); });
   return item;
@@ -333,6 +364,12 @@ function renderRoomList(container: HTMLElement, list: RoomInfo[], emptyText: str
   } else {
     container.replaceChildren(...list.map(renderRoomItem));
   }
+  updateRoomListFade(container);
+}
+
+/** Fade the list's bottom edge while more lobbies are scrolled out of view. */
+function updateRoomListFade(container: HTMLElement) {
+  container.classList.toggle('has-more', container.scrollTop + container.clientHeight < container.scrollHeight - 4);
 }
 
 function renderRooms() {
@@ -346,10 +383,27 @@ function renderRooms() {
   roomVerifiedLabel.title = accountVerified ? 'Only verified accounts can join' : 'Sign in to host verified lobbies';
 
   const { verified, open } = partitionRooms(rooms);
-  renderRoomList(verifiedRoomListEl, verified, 'No verified lobbies yet.');
-  renderRoomList(openRoomListEl, open, 'No open lobbies yet.');
+  // Lobbies with players first, so running matches are easy to find.
+  const shown = (lobbyFilter === 'verified' ? verified : lobbyFilter === 'open' ? open : [...verified, ...open]).slice().sort((a, b) => b.players - a.players);
+  renderRoomList(roomListEl, shown, lobbyFilter === 'all' ? 'No lobbies yet' : lobbyFilter === 'open' ? 'No public lobbies yet' : 'No verified lobbies yet');
+  document.querySelectorAll<HTMLButtonElement>('[data-lobby-filter]').forEach(btn => {
+    const filter = btn.dataset.lobbyFilter as LobbyFilter;
+    const count = filter === 'verified' ? verified.length : filter === 'open' ? open.length : rooms.length;
+    const countEl = document.createElement('span');
+    countEl.className = 'seg-count';
+    countEl.textContent = String(count);
+    btn.replaceChildren(filter === 'all' ? 'All' : filter === 'verified' ? 'Verified only' : 'Public', countEl);
+    btn.setAttribute('aria-pressed', String(filter === lobbyFilter));
+  });
   const selected = rooms.find(r => r.id === selectedRoomId);
-  deployBtn.textContent = selected ? `DEPLOY TO ${selected.name}` : 'DEPLOY';
+  // The starting wave only matters when you start a match, i.e. join an empty lobby.
+  const inProgress = !!selected && selected.players > 0;
+  // Joining a running match drops you in at its current wave, so the button says so.
+  deployLabel.textContent = !selected ? 'Join' : inProgress ? `Join ${selected.name} · Wave ${selected.wave}` : `Join ${selected.name}`;
+  lobbyWaveSelect.disabled = inProgress;
+  lobbyWaveHint.textContent = !selected ? 'Pick a lobby to join.'
+    : inProgress ? `${selected.name} is on Wave ${selected.wave}: you'll join the match in progress.`
+    : `${selected.name} is empty: its match starts at the wave you pick.`;
 }
 
 async function refreshRooms() {
@@ -379,6 +433,7 @@ async function createRoom() {
     selectedRoomId = data.room.id;
     localStorage.setItem('boxhead_room', selectedRoomId);
     await refreshRooms();
+    deploy();
   } catch {
     roomErrorMsg.textContent = 'Network error';
   }
@@ -386,6 +441,29 @@ async function createRoom() {
 
 document.getElementById('refreshRoomsBtn')!.addEventListener('click', () => void refreshRooms());
 document.getElementById('createRoomBtn')!.addEventListener('click', () => void createRoom());
+document.querySelectorAll<HTMLButtonElement>('[data-lobby-filter]').forEach(btn => btn.addEventListener('click', () => {
+  lobbyFilter = btn.dataset.lobbyFilter as LobbyFilter;
+  renderRooms();
+}));
+document.querySelectorAll<HTMLButtonElement>('[data-pw-toggle]').forEach(btn => btn.addEventListener('click', () => {
+  const input = document.getElementById(btn.dataset.pwToggle!) as HTMLInputElement;
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  btn.replaceChildren(svgIcon(show ? 'i-eye-off' : 'i-eye'));
+  btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+}));
+document.getElementById('forgotPwBtn')!.addEventListener('click', () => {
+  const hint = document.getElementById('forgotPwHint')!;
+  hint.hidden = !hint.hidden;
+});
+// Hosting lives behind a toggle so the main path stays: pick a lobby, then Join.
+const hostToggleBtn = document.getElementById('hostToggleBtn')!;
+hostToggleBtn.addEventListener('click', () => {
+  const form = document.getElementById('hostForm')!;
+  const open = form.classList.toggle('hidden') === false;
+  hostToggleBtn.setAttribute('aria-expanded', String(open));
+  if (open) roomNameInput.focus();
+});
 roomNameInput.addEventListener('keydown', e => { if (e.key === 'Enter') void createRoom(); });
 setInterval(() => { if (currentScreen === 'menu' && menuView === 'browser') void refreshRooms(); }, 5000);
 
@@ -419,9 +497,16 @@ let currentScreen: Screen = 'menu';
 
 function updateAuthDOM() {
   signInBtn.classList.toggle('hidden', isLoggedIn);
+  document.getElementById('signInHint')!.classList.toggle('hidden', isLoggedIn);
+  friendsBtn.classList.toggle('hidden', !isLoggedIn);
   authSectionIn.classList.toggle('hidden', !isLoggedIn);
+  updateAccountSummary();
   if (isLoggedIn) {
-    loggedInStatus.textContent = `Signed in as ${accountLabel(authHandle)}`;
+    // Lead with the callsign other players see; the account handle is secondary.
+    const callsign = playerName.trim() || defaultCallsign(authHandle);
+    loggedInStatus.textContent = callsign;
+    loggedInStatus.title = accountLabel(authHandle);
+    document.getElementById('accountAvatar')!.textContent = callsign.charAt(0).toUpperCase() || '?';
   }
 }
 
@@ -444,20 +529,18 @@ function renderWaveOptions() {
     for (let value = 1; value <= highestWave; value++) {
       const option = document.createElement('option');
       option.value = String(value);
-      option.textContent = `Wave ${value}${value === highestWave && value > 1 ? ' (highest)' : ''}`;
+      option.textContent = `Wave ${value}${value === highestWave && value > 1 ? ' (best)' : ''}`;
       select.append(option);
     }
     select.value = String(startingWave);
   }
-  document.querySelectorAll('[data-wave-status]').forEach(el => {
-    el.textContent = `Highest reached: ${highestWave} · Saved for this browser`;
-  });
 }
 function rememberWave(reached: number) {
   if (!Number.isInteger(reached) || reached <= highestWave) return;
   highestWave = reached;
   localStorage.setItem('boxhead_highest_wave', String(highestWave));
   renderWaveOptions();
+  updateAccountSummary();
 }
 for (const select of waveSelects) select.addEventListener('change', () => {
   startingWave = Math.max(1, Math.min(highestWave, Number(select.value) || 1));
@@ -485,12 +568,25 @@ function renderRoomControls() {
   const host = roomHostId === myId && !!myId;
   roomControls.classList.toggle('hidden', !playing);
   pauseButton.disabled = !host;
-  pauseButton.textContent = host ? (serverPaused ? 'Resume [P]' : 'Pause [P]') : 'Host controls pause';
-  pauseButton.title = host ? 'Pause or resume the entire round' : 'Only the first connected player can pause';
+  const pauseKey = document.createElement('kbd');
+  pauseKey.className = 'kbd';
+  pauseKey.textContent = 'P';
+  pauseButton.replaceChildren(svgIcon(serverPaused ? 'i-play' : 'i-pause'), pauseKey);
+  const pauseLabel = host ? (serverPaused ? 'Resume (P)' : 'Pause the round (P)') : 'Only the host can pause';
+  pauseButton.title = pauseLabel;
+  pauseButton.setAttribute('aria-label', pauseLabel);
   pauseOverlay.hidden = !serverPaused || !playing;
-  pauseOverlay.style.display = serverPaused && playing ? 'grid' : 'none';
+  pauseOverlay.style.display = serverPaused && playing ? 'flex' : 'none';
   resumeButton.hidden = !host;
-  document.getElementById('pauseMessage')!.textContent = host ? 'You are the host. Everyone’s game is paused.' : 'Paused by the host. Waiting for them to resume.';
+  document.getElementById('leaveMatchBtn')!.classList.toggle('btn-block', !host);
+  // The host leaving unpauses the match and hands host to the next player.
+  document.getElementById('leaveHint')!.textContent = host
+    ? 'If you leave, the match resumes for your squad.'
+    : 'If you leave, your squad plays on without you.';
+  const hostName = (roomHostId && players[roomHostId]?.name) || 'the host';
+  document.getElementById('pauseMessage')!.textContent = host
+    ? 'You paused the match for everyone. Only you can resume it.'
+    : `Paused by ${hostName} (host). Only the host can resume the match.`;
 }
 function requestPause() {
   if (currentScreen !== 'playing' || roomHostId !== myId || ws?.readyState !== WebSocket.OPEN) return;
@@ -514,9 +610,35 @@ function setScreen(scr: Screen) {
   if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); void refreshRooms(); }
   if (scr === 'gameover') {
     gameOverWave.textContent = finalWave.toString();
-    gameOverScore.textContent = Math.floor(finalScore).toString();
-    gameOverKills.textContent = finalKills.toString();
-    gameOverCombo.textContent = `${finalMaxCombo}x`;
+    const orDash = (n: number, text: string) => (n > 0 ? text : '—');
+    gameOverScore.textContent = orDash(finalScore, Math.floor(finalScore).toLocaleString('en-US'));
+    gameOverKills.textContent = orDash(finalKills, `${finalKills}`);
+    gameOverCombo.textContent = orDash(finalMaxCombo, `×${finalMaxCombo}`);
+    renderSquadResults();
+  }
+}
+
+/** Game over: everyone's result, best score first, your row highlighted. */
+function renderSquadResults() {
+  const table = document.getElementById('gameOverSquad') as HTMLTableElement;
+  const list = Object.values(players).sort((a, b) => b.score - a.score);
+  table.replaceChildren();
+  // Co-op: everyone's result sits beside your death recap, in a wider panel.
+  const squad = list.length >= 2;
+  document.getElementById('gameOverDetails')!.classList.toggle('has-squad', squad);
+  document.getElementById('gameOverSquadCard')!.hidden = !squad;
+  if (!squad) return; // solo rounds: the stat tiles already say it all
+  const head = table.createTHead().insertRow();
+  for (const label of ['Player', 'Score', 'Kills']) {
+    const th = document.createElement('th');
+    th.textContent = label;
+    head.append(th);
+  }
+  const body = table.createTBody();
+  for (const p of list) {
+    const tr = body.insertRow();
+    if (p.id === myId) tr.className = 'me';
+    for (const text of [p.name || p.id.slice(0, 6), Math.floor(p.score).toLocaleString('en-US'), `${p.kills || 0}`]) tr.insertCell().textContent = text;
   }
 }
 
@@ -585,7 +707,7 @@ async function bskyLogin(handle: string, password: string) {
   } catch {
     loginErrorMsg.textContent = 'Network error';
   }
-  bskyLoginBtn.textContent = 'Sign in with Bluesky';
+  bskyLoginBtn.querySelector('span')!.textContent = 'Sign in with Bluesky';
 }
 
 function googleLogin() {
@@ -687,7 +809,8 @@ function renderFriendList(container: HTMLElement, removable: boolean) {
       const remove = document.createElement('button');
       remove.className = 'btn-icon-red';
       remove.title = `Remove ${f.handle}`;
-      remove.textContent = '✕';
+      remove.setAttribute('aria-label', `Remove ${f.handle}`);
+      remove.append(svgIcon('i-close'));
       remove.addEventListener('click', () => void removeFriend(f.user_id));
       row.append(remove);
     }
@@ -695,10 +818,30 @@ function renderFriendList(container: HTMLElement, removable: boolean) {
   }));
 }
 
+/** An icon from the sprite in index.html. */
+function svgIcon(id: string): SVGSVGElement {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'icon');
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', `#${id}`);
+  svg.append(use);
+  return svg;
+}
+
 function updateFriendsDOM() {
   renderFriendList(friendsListContainer, true);
   renderFriendList(homeFriendsList, false);
   homeFriendsSummary.textContent = friendsSummary(friendsList);
+  document.getElementById('friendsBtnLabel')!.textContent = friendsList.length === 0 ? 'Add friends' : 'Friends';
+  updateAccountSummary();
+}
+
+/** One useful line under the account name: best wave and friends online. */
+function updateAccountSummary() {
+  const online = friendsList.filter(f => f.online).length;
+  const friends = friendsList.length === 0 ? '0 friends' : `${online}/${friendsList.length} friends online`;
+  document.getElementById('accountSummary')!.textContent = `Best: Wave ${highestWave} · ${friends}`;
 }
 
 async function addFriend(handle: string) {
@@ -852,7 +995,7 @@ emailLoginBtn.addEventListener('click', () => emailAuth('login'));
 emailRegisterBtn.addEventListener('click', () => emailAuth('register'));
 bskyLoginBtn.addEventListener('click', () => {
   if (bskyHandleEl.value && bskyPassEl.value) {
-    bskyLoginBtn.textContent = 'Signing in...';
+    bskyLoginBtn.querySelector('span')!.textContent = 'Signing in…';
     bskyLogin(bskyHandleEl.value, bskyPassEl.value);
   }
 });
@@ -876,6 +1019,23 @@ friendsBtn.addEventListener('click', () => { friendsOverlay.classList.remove('hi
 closeFriendsBtn.addEventListener('click', () => { friendsOverlay.classList.add('hidden'); friendsOverlay.style.display = 'none'; });
 backToMenuBtn.addEventListener('click', () => {
   if (ws) { ws.close(); ws = null; }
+  setScreen('menu');
+});
+// Leaving a paused match asks for a second click.
+const leaveMatchBtn = document.getElementById('leaveMatchBtn')!;
+const leaveLabel = leaveMatchBtn.querySelector('span')!;
+let leaveConfirmTimer = 0;
+leaveMatchBtn.addEventListener('click', () => {
+  if (!leaveConfirmTimer) {
+    leaveLabel.textContent = 'Click again to leave';
+    leaveConfirmTimer = window.setTimeout(() => { leaveConfirmTimer = 0; leaveLabel.textContent = 'Leave match'; }, 3000);
+    return;
+  }
+  window.clearTimeout(leaveConfirmTimer);
+  leaveConfirmTimer = 0;
+  leaveLabel.textContent = 'Leave match';
+  if (ws) { ws.close(); ws = null; }
+  serverPaused = false;
   setScreen('menu');
 });
 addFriendBtn.addEventListener('click', () => {
@@ -903,25 +1063,57 @@ function closeSettings() {
   settingsListening = null;
 }
 
+// Esc closes the open window, or opens settings during a match. Runs in the
+// capture phase, before the game's own key handling (which closes the armory).
+window.addEventListener('keydown', (e) => {
+  if (e.code !== 'Escape' || settingsListening || e.repeat) return;
+  if (settingsOverlay.style.display === 'flex') { closeSettings(); e.stopPropagation(); return; }
+  if (friendsOverlay.style.display === 'flex') { friendsOverlay.classList.add('hidden'); friendsOverlay.style.display = 'none'; e.stopPropagation(); return; }
+  if (currentScreen === 'menu' && menuView !== 'home') { showMenuView('home'); e.stopPropagation(); return; }
+  if (currentScreen === 'playing' && !armoryOpen) { openSettings(); e.stopPropagation(); }
+}, true);
+
+// Enter presses the open screen's primary button (Play, Join, Sign in, Play again),
+// unless a focused control handles Enter itself.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.repeat || settingsListening) return;
+  const target = e.target as HTMLElement;
+  if (target.closest('button, a, select, textarea') || target === roomNameInput || target.id === 'addFriendInputEl') return;
+  if (settingsOverlay.style.display === 'flex' || friendsOverlay.style.display === 'flex') return;
+  let primary: HTMLButtonElement | null = null;
+  if (currentScreen === 'gameover') primary = playAgainBtn as HTMLButtonElement;
+  else if (currentScreen === 'menu' && menuView === 'home') primary = playBtn as HTMLButtonElement;
+  else if (currentScreen === 'menu' && menuView === 'browser') primary = deployBtn;
+  else if (currentScreen === 'menu' && menuView === 'signin') {
+    primary = (document.getElementById('authTabBsky')!.classList.contains('hidden') ? emailLoginBtn : bskyLoginBtn) as HTMLButtonElement;
+  }
+  if (!primary || primary.disabled) return;
+  e.preventDefault();
+  primary.click();
+});
+
 function renderBindingsGrid() {
   const sections: { title: string; keys: (keyof KeyBindings)[] }[] = [
     { title: 'Movement', keys: ['moveUp', 'moveDown', 'moveLeft', 'moveRight'] },
-    { title: 'Combat & Mobility', keys: ['shoot', 'melee', 'dash'] },
-    { title: 'Weapons', keys: ['weapon1', 'weapon2', 'weapon3', 'weapon4'] },
-    { title: 'Tactical & Armory', keys: ['placeBarrel', 'placeBarricade', 'placeMine', 'toggleShop'] },
+    { title: 'Combat', keys: ['shoot', 'dash'] },
+    { title: 'Weapons', keys: ['melee', 'weapon1', 'weapon2', 'weapon3', 'weapon4'] },
+    { title: 'Gear & armory', keys: ['placeBarrel', 'placeBarricade', 'placeMine', 'toggleShop'] },
   ];
 
-  let html = '';
-  for (const section of sections) {
-    html += `<div class="settings-section-title">${section.title}</div>`;
-    for (const action of section.keys) {
-      const label = BINDING_LABELS[action];
-      const display = keyDisplayName(bindings[action]);
-      html += `<span class="action-label">${label}</span>`;
-      html += `<button class="key-btn" data-action="${action}">${display}</button>`;
-    }
-  }
-  bindingsGrid.innerHTML = html;
+  // Two columns so every binding fits without scrolling on a normal screen. Keys line up in
+  // one column; a fixed alternate (the katana's right-click) sits just left of its key.
+  const altKey: Partial<Record<keyof KeyBindings, string>> = { melee: 'Mouse2' };
+  const fixed = (key: string, alt = false) => `<span class="key-static${alt ? ' key-static--alt' : ''}" title="Fixed key: can't be rebound"><svg class="icon"><use href="#i-lock"/></svg>${key}</span>`;
+  const row = (label: string, key: string, alt = '') =>
+    `<div class="binding-row"><span class="action-label">${label}</span><span class="key-pair">${alt}${key}</span></div>`;
+  const column = (list: typeof sections) => list.map((section) =>
+    `<h4 class="settings-section-title">${section.title}</h4>` + section.keys.map((action) => row(
+      BINDING_LABELS[action],
+      `<button class="key-btn" data-action="${action}">${keyDisplayName(bindings[action])}</button>`,
+      altKey[action] ? fixed(keyDisplayName(altKey[action]!), true) : '')).join('')).join('');
+  const fixedRows = `<h4 class="settings-section-title">Game</h4>` +
+    row('Pause (host only)', fixed('P')) + row('Controls / back', fixed('Esc')) + row('Buy in the armory', fixed('1–6'));
+  bindingsGrid.innerHTML = `<div class="binding-col">${column(sections.slice(0, 2))}${fixedRows}</div><div class="binding-col">${column(sections.slice(2))}</div>`;
 
   bindingsGrid.querySelectorAll('.key-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -975,7 +1167,20 @@ document.getElementById('menuSettingsBtn')!.addEventListener('click', openSettin
 gameSettingsBtn.addEventListener('click', openSettings);
 document.getElementById('closeSettingsBtn')!.addEventListener('click', closeSettings);
 document.getElementById('saveSettingsBtn')!.addEventListener('click', closeSettings);
-document.getElementById('resetBindingsBtn')!.addEventListener('click', () => {
+document.querySelectorAll('[data-open-settings]').forEach(el => el.addEventListener('click', openSettings));
+// Resetting is destructive, so it asks for a second click.
+const resetBindingsBtn = document.getElementById('resetBindingsBtn')!;
+let resetConfirmTimer = 0;
+const resetLabel = resetBindingsBtn.querySelector('span')!;
+resetBindingsBtn.addEventListener('click', () => {
+  if (!resetConfirmTimer) {
+    resetLabel.textContent = 'Click again to reset all keys';
+    resetConfirmTimer = window.setTimeout(() => { resetConfirmTimer = 0; resetLabel.textContent = 'Reset to defaults'; }, 3000);
+    return;
+  }
+  window.clearTimeout(resetConfirmTimer);
+  resetConfirmTimer = 0;
+  resetLabel.textContent = 'Reset to defaults';
   bindings = { ...DEFAULT_BINDINGS };
   saveBindings(bindings);
   renderBindingsGrid();
@@ -989,7 +1194,9 @@ const closeArmoryBtn = document.getElementById('closeArmoryBtn')!;
 
 function toggleArmory(forceState?: boolean) {
   armoryOpen = forceState !== undefined ? forceState : !armoryOpen;
-  if (armoryOpen && currentScreen === 'playing') {
+  // No shopping while downed: the death recap takes the armory's place.
+  const downed = (players[myId]?.health ?? 1) <= 0;
+  if (armoryOpen && currentScreen === 'playing' && !downed) {
     armoryOverlay.style.display = 'flex';
     renderArmoryDOM();
   } else {
@@ -999,23 +1206,23 @@ function toggleArmory(forceState?: boolean) {
 }
 
 closeArmoryBtn.addEventListener('click', () => toggleArmory(false));
+
+/** Taking damage while shopping flashes the armory's frame: the match keeps running. */
+function flashArmoryPanel() {
+  const panel = document.querySelector('#armoryOverlay .panel') as HTMLElement | null;
+  if (!panel) return;
+  panel.classList.remove('is-hit');
+  void panel.offsetWidth; // restart the animation
+  panel.classList.add('is-hit');
+}
+document.querySelectorAll('[data-close-armory]').forEach(el => el.addEventListener('click', () => toggleArmory(false)));
 armoryOverlay.addEventListener('mousedown', (e) => {
   if (e.target === armoryOverlay) {
     toggleArmory(false);
   }
 });
 
-function renderLevelPips(level: number, maxPips = 6): string {
-  let html = '<div class="level-pips">';
-  for (let i = 0; i < maxPips; i++) {
-    html += `<span class="level-pip ${i < level ? 'filled' : ''}"></span>`;
-  }
-  if (level > maxPips) {
-    html += `<span style="font-size:0.65rem;color:#ffb400;margin-left:3px;">+${level - maxPips}</span>`;
-  }
-  html += '</div>';
-  return html;
-}
+const MAX_UPGRADE_LEVEL = 10;
 
 function renderArmoryDOM() {
   if (!armoryOpen) return;
@@ -1023,7 +1230,7 @@ function renderArmoryDOM() {
   if (!p) return;
 
   const credits = Math.floor(p.credits ?? 0);
-  armoryCreditsVal.textContent = `$${credits}`;
+  armoryCreditsVal.textContent = `$${fmtInt(credits)}`;
 
   const dmgLv = p.damageLevel || 0;
   const meleeLv = p.meleeLevel || 0;
@@ -1031,125 +1238,95 @@ function renderArmoryDOM() {
   const meleeCost = 150 + meleeLv * 125;
 
   const slots = p.weaponSlots || [true, false, false, false];
-  const weaponNames = ['Pistol', 'Uzi SMG', 'Combat Shotgun', 'Rocket Launcher'];
+  const weaponNames = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
   const nextLockedIdx = slots.findIndex((unlocked, idx) => idx > 0 && !unlocked);
-  const nextWeaponName = nextLockedIdx !== -1 ? weaponNames[nextLockedIdx] : 'All Firearms Unlocked';
+  const nextWeapon = nextLockedIdx !== -1 ? weaponNames[nextLockedIdx] : '';
+  const unlockedCount = slots.filter(Boolean).length;
 
   const curMeleeDmg = Math.round(45 * (1 + meleeLv * 0.35));
   const nextMeleeDmg = Math.round(45 * (1 + (meleeLv + 1) * 0.35));
-  const nextMeleeHeal = 5 + (meleeLv + 1) * 3;
+  const tac = p.tacticalItems || [0, 0, 0];
 
-  const cards = [
+  // Order matches the number keys that buy them while the armory is open.
+  // Every stat reads "Label current → next".
+  const cards: {
+    id: number; shortcut: string; icon: string; title: string; level: string;
+    maxed: boolean; desc: string; stats: [string, string, string][]; cost: number;
+  }[] = [
     {
-      id: 1,
-      shortcut: '1',
-      icon: '🔫',
-      iconBg: 'rgba(229, 57, 53, 0.2)',
-      iconColor: '#ff5252',
-      title: `Firearm Power (Lv.${dmgLv})`,
-      desc: 'Boosts bullet & explosive damage by +20% and crit chance by +4% per level.',
-      statText: `+${dmgLv * 20}% → +${(dmgLv + 1) * 20}% DMG`,
-      pips: renderLevelPips(dmgLv),
+      id: 1, shortcut: '1', icon: 'i-crosshair', title: 'Firearm power',
+      level: `Level ${Math.min(dmgLv, MAX_UPGRADE_LEVEL)} / ${MAX_UPGRADE_LEVEL}`, maxed: dmgLv >= MAX_UPGRADE_LEVEL,
+      desc: '+20% gun and explosive damage, +4% crit chance.',
+      stats: [
+        ['Bonus damage', `+${dmgLv * 20}%`, `+${(dmgLv + 1) * 20}%`],
+        ['Crit chance', `${Math.min(60, 20 + dmgLv * 4)}%`, `${Math.min(60, 20 + (dmgLv + 1) * 4)}%`],
+      ],
       cost: dmgCost,
     },
     {
-      id: 5,
-      shortcut: '2',
-      icon: '⚔️',
-      iconBg: 'rgba(0, 229, 255, 0.18)',
-      iconColor: '#00e5ff',
-      title: `Plasma Katana (Lv.${meleeLv})`,
-      desc: 'Sharpens melee cleave (+35% DMG, +10% reach) and increases vampiric lifesteal on kill.',
-      statText: `${curMeleeDmg} → ${nextMeleeDmg} DMG • +${nextMeleeHeal}HP/Kill`,
-      pips: renderLevelPips(meleeLv),
-      cost: meleeCost,
+      id: 5, shortcut: '2', icon: 'i-sword', title: 'Katana',
+      level: `Level ${Math.min(meleeLv, MAX_UPGRADE_LEVEL)} / ${MAX_UPGRADE_LEVEL}`, maxed: meleeLv >= MAX_UPGRADE_LEVEL,
+      desc: 'Harder, wider swings that heal you on each kill.',
+      stats: [['Damage', `${curMeleeDmg}`, `${nextMeleeDmg}`]], cost: meleeCost,
     },
     {
-      id: 2,
-      shortcut: '3',
-      icon: '🛡️',
-      iconBg: 'rgba(0, 230, 118, 0.18)',
-      iconColor: '#00e676',
-      title: 'Nano-Armor & Medkit',
-      desc: 'Permanently increases Max HP by +25 and immediately restores +60 Health.',
-      statText: `HP ${Math.ceil(p.health)}/${p.maxHealth} → +25 Max & +60 Heal`,
-      pips: '',
-      cost: 150,
+      id: 2, shortcut: '3', icon: 'i-shield', title: 'Armor & medkit', level: 'Repeatable', maxed: false,
+      desc: '+25 max health, and heals 60 right away.',
+      stats: [['Max health', `${p.maxHealth}`, `${p.maxHealth + 25}`]], cost: 150,
     },
     {
-      id: 3,
-      shortcut: '4',
-      icon: '🔋',
-      iconBg: 'rgba(255, 180, 0, 0.18)',
-      iconColor: '#ffd54f',
-      title: 'Expanded Magazine',
-      desc: 'Increases Max Ammo capacity by +25 and completely refills your reserve.',
-      statText: `Ammo ${Math.floor(p.ammo)}/${p.maxAmmo} → ${p.maxAmmo + 25} Full`,
-      pips: '',
-      cost: 125,
+      id: 3, shortcut: '4', icon: 'i-ammo', title: 'Bigger magazine', level: 'Repeatable', maxed: false,
+      desc: '+25 ammo capacity, and refills your reserve.',
+      stats: [['Ammo capacity', `${p.maxAmmo}`, `${p.maxAmmo + 25}`]], cost: 125,
     },
     {
-      id: 4,
-      shortcut: '5',
-      icon: '💣',
-      iconBg: 'rgba(41, 182, 246, 0.18)',
-      iconColor: '#29b6f6',
-      title: 'Tactical Munitions Pack',
-      desc: 'Field resupply of +2 Explosive Barrels, +2 Steel Barricades, and +2 Claymores.',
-      statText: `Gear: ${(p.tacticalItems?.[0] || 0)}B / ${(p.tacticalItems?.[1] || 0)}W / ${(p.tacticalItems?.[2] || 0)}M (+2 All)`,
-      pips: '',
+      id: 4, shortcut: '5', icon: 'i-crate', title: 'Gear resupply', level: 'Repeatable', maxed: false,
+      desc: '+2 of each placeable you drop from the hotbar.',
+      stats: [
+        ['Barrels', `${tac[0]}`, `${tac[0] + 2}`],
+        ['Barricades', `${tac[1]}`, `${tac[1] + 2}`],
+        ['Claymores', `${tac[2]}`, `${tac[2] + 2}`],
+      ],
       cost: 140,
     },
     {
-      id: 6,
-      shortcut: '6',
-      icon: '🚀',
-      iconBg: 'rgba(206, 147, 216, 0.18)',
-      iconColor: '#ce93d8',
-      title: nextLockedIdx !== -1 ? `Unlock ${nextWeaponName}` : 'Arsenal Complete',
-      desc:
-        nextLockedIdx !== -1
-          ? `Immediately unlocks & equips the ${nextWeaponName}. Uses your shared ammo reserve.`
-          : 'All firearms are unlocked. Use Expanded Magazine to refill ammunition.',
-      statText: nextLockedIdx !== -1 ? `UNLOCK SLOT [${nextLockedIdx + 1}]` : 'ARSENAL COMPLETE',
-      pips: renderLevelPips(slots.filter(Boolean).length, 4),
-      cost: 250,
+      id: 6, shortcut: '6', icon: nextLockedIdx !== -1 ? ['i-pistol', 'i-uzi', 'i-shotgun', 'i-rocket'][nextLockedIdx] : 'i-crosshair',
+      title: nextWeapon ? `Unlock ${nextWeapon}` : 'Arsenal complete',
+      level: `Guns ${unlockedCount} / 4`, maxed: nextLockedIdx === -1,
+      desc: nextWeapon ? `Unlocks and equips the ${nextWeapon}. Shares your ammo.` : 'Every weapon is unlocked.',
+      stats: [['Weapons', `${unlockedCount}`, `${unlockedCount + 1}`]], cost: 250,
     },
   ];
 
-  armoryGrid.innerHTML = cards
-    .map((c) => {
-      const canBuy = credits >= c.cost && !(c.id === 6 && nextLockedIdx === -1) && !(c.id === 1 && dmgLv >= 10) && !(c.id === 5 && meleeLv >= 10);
-      return `
-      <div class="shop-card ${canBuy ? 'affordable' : 'locked'}">
-        <div>
-          <div class="shop-card-top">
-            <div style="display:flex; align-items:center; gap:10px;">
-              <div class="shop-icon" style="background:${c.iconBg}; color:${c.iconColor}; border:1px solid ${c.iconColor}44;">
-                ${c.icon}
-              </div>
-              <div>
-                <div class="shop-title">${c.title}</div>
-                ${c.pips}
-              </div>
-            </div>
-            <span class="shop-shortcut">[${c.shortcut}]</span>
+  armoryGrid.innerHTML = cards.map((c) => {
+    const canBuy = !c.maxed && credits >= c.cost;
+    const stats = c.stats.map(([label, cur, next]) =>
+      `<span class="shop-stat"><span class="shop-stat-label">${label}</span> ${c.maxed ? cur : `${cur} → ${next}`}</span>`).join('');
+    // The price sits on the card; the button says whether you can buy it, or how far off you are.
+    let buy: string;
+    if (c.maxed) {
+      buy = `<button class="btn btn-sm shop-buy-btn maxed" disabled><svg class="icon"><use href="#i-check"/></svg><span>Maxed out</span></button>`;
+    } else if (canBuy) {
+      buy = `<button class="btn btn-sm shop-buy-btn btn-money-solid" data-upgrade-id="${c.id}"><span>Buy</span><kbd class="kbd">${c.shortcut}</kbd></button>`;
+    } else {
+      const pct = Math.round((credits / c.cost) * 100);
+      buy = `<button class="btn btn-sm shop-buy-btn cant-buy" data-upgrade-id="${c.id}" disabled title="Not enough credits"><svg class="icon"><use href="#i-lock"/></svg><span>Need $${fmtInt(c.cost - credits)} more</span><kbd class="kbd">${c.shortcut}</kbd><span class="progress" style="width:${pct}%"></span></button>`;
+    }
+    const level = `<span class="badge">${c.level}</span>`;
+    return `
+      <div class="shop-card">
+        <div class="shop-card-top">
+          <span class="shop-icon"><svg class="icon"><use href="#${c.icon}"/></svg></span>
+          <div>
+            <div class="shop-title">${c.title}</div>
+            <div class="shop-level">${level}${c.maxed ? '' : `<span class="shop-price${canBuy ? '' : ' shop-price--short'}">$${fmtInt(c.cost)}</span>`}</div>
           </div>
-          <p class="shop-desc" style="margin-top:8px;">${c.desc}</p>
         </div>
-        <div style="display:flex; flex-direction:column; gap:8px;">
-          <div class="shop-stat-row">
-            <span>${c.statText}</span>
-          </div>
-          <button class="shop-buy-btn ${canBuy ? 'can-buy' : 'cant-buy'}" data-upgrade-id="${c.id}">
-            <span>${canBuy ? 'PURCHASE' : 'NEED CREDITS'}</span>
-            <span>$${c.cost}</span>
-          </button>
-        </div>
-      </div>
-    `;
-    })
-    .join('');
+        <p class="shop-desc">${c.desc}</p>
+        <div class="shop-stat-row">${stats}</div>
+        <div class="shop-buy">${buy}</div>
+      </div>`;
+  }).join('');
 
   armoryGrid.querySelectorAll('.shop-buy-btn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
@@ -1404,21 +1581,21 @@ const DEFAULT_BINDINGS: KeyBindings = {
 };
 
 const BINDING_LABELS: Record<keyof KeyBindings, string> = {
-  moveUp: 'Move Up',
-  moveDown: 'Move Down',
-  moveLeft: 'Move Left',
-  moveRight: 'Move Right',
+  moveUp: 'Move up',
+  moveDown: 'Move down',
+  moveLeft: 'Move left',
+  moveRight: 'Move right',
   shoot: 'Shoot',
-  melee: 'Melee Swing',
-  dash: 'i-Frame Dash',
-  weapon1: 'Slot 1 (Pistol)',
-  weapon2: 'Slot 2 (Uzi)',
-  weapon3: 'Slot 3 (Shotgun)',
-  weapon4: 'Slot 4 (Rocket)',
-  placeBarrel: 'Place Barrel',
-  placeBarricade: 'Place Barricade',
-  placeMine: 'Place Claymore',
-  toggleShop: 'Toggle Armory',
+  melee: 'Katana',
+  dash: 'Dash',
+  weapon1: 'Pistol',
+  weapon2: 'Uzi',
+  weapon3: 'Shotgun',
+  weapon4: 'Rocket',
+  placeBarrel: 'Place barrel',
+  placeBarricade: 'Place barricade',
+  placeMine: 'Place claymore',
+  toggleShop: 'Open armory',
 };
 
 function loadBindings(): KeyBindings {
@@ -1437,9 +1614,9 @@ let bindings = loadBindings();
 let doubleTapDash = localStorage.getItem('boxhead_doubletap_dash') !== 'false';
 
 function keyDisplayName(code: string): string {
-  if (code === 'Mouse0') return 'LMB';
-  if (code === 'Mouse1') return 'MMB';
-  if (code === 'Mouse2') return 'RMB';
+  if (code === 'Mouse0') return 'Left click';
+  if (code === 'Mouse1') return 'Middle click';
+  if (code === 'Mouse2') return 'Right click';
   if (code.startsWith('Key')) return code.slice(3);
   if (code.startsWith('Digit')) return code.slice(5);
   if (code === 'ShiftLeft' || code === 'ShiftRight') return 'Shift';
@@ -1532,7 +1709,7 @@ function resetGameState() {
   toggleArmory(false);
 }
 
-function triggerWaveBanner(title: string, subtitle: string, color = '#ffb400') {
+function triggerWaveBanner(title: string, subtitle: string, color = theme.accent) {
   waveBannerText = title;
   waveBannerSub = subtitle;
   waveBannerColor = color;
@@ -1593,8 +1770,8 @@ function connectToServer() {
         finalScore = 0;
         setScreen('gameover');
       } else {
-        triggerWaveBanner(`WAVE ${init.wave}`, 'SURVIVE THE HORDE', '#e53935');
-        pushFeedEvent(`Deployed to ${currentRoomName} — Wave ${init.wave}`, '#64b5f6');
+        triggerWaveBanner(`Wave ${init.wave}`, 'Survive the horde', theme.accent);
+        pushFeedEvent(`Joined ${currentRoomName} · Wave ${init.wave}`, theme.you);
       }
     } else if (data.type === 'snapshot') {
       const snap = data as SnapshotState;
@@ -1703,11 +1880,12 @@ function applyDelta(delta: DeltaState) {
               const lost = Math.round(existing.health - diff.health);
               damageFlashAlpha = 0.55;
               addScreenShake(8);
-              spawnFloatingText(predictedX, predictedY - 18, `-${lost} HP`, '#ff1744', 16);
+              spawnFloatingText(predictedX, predictedY - 18, `-${lost} HP`, theme.accent, 16);
+              if (armoryOpen) flashArmoryPanel();
             } else if (diff.health > existing.health) {
               const gained = Math.round(diff.health - existing.health);
               healFlashAlpha = 0.35;
-              spawnFloatingText(predictedX, predictedY - 18, `+${gained} HP`, '#00e676', 15);
+              spawnFloatingText(predictedX, predictedY - 18, `+${gained} HP`, theme.health, 15);
             }
             myShopStateChanged = true;
           }
@@ -1723,7 +1901,7 @@ function applyDelta(delta: DeltaState) {
             const prevCredits = existing.credits ?? 0;
             const deltaCredits = Math.round(diff.credits - prevCredits);
             if (deltaCredits >= 25) {
-              spawnFloatingText(predictedX + 12, predictedY - 28, `+$${deltaCredits}`, '#00e676', 14);
+              spawnFloatingText(predictedX + 12, predictedY - 28, `+$${deltaCredits}`, theme.money, 14);
             }
             myShopStateChanged = true;
           }
@@ -1732,7 +1910,7 @@ function applyDelta(delta: DeltaState) {
         if (diff.ammo !== undefined) {
           if (id === myId && diff.ammo > existing.ammo) {
             const gained = Math.round(diff.ammo - existing.ammo);
-            spawnFloatingText(predictedX, predictedY - 26, `+${gained} AMMO`, '#ffd54f', 13);
+            spawnFloatingText(predictedX, predictedY - 26, `+${gained} ammo`, theme.text, 13);
           }
           existing.ammo = diff.ammo;
           if (id === myId) myShopStateChanged = true;
@@ -1744,11 +1922,11 @@ function applyDelta(delta: DeltaState) {
         if (diff.weapon !== undefined) existing.weapon = diff.weapon;
         if (diff.weaponSlots !== undefined) {
           if (id === myId) {
-            const weaponNames = ['Pistol', 'Uzi', 'Shotgun', 'Rocket Launcher'];
+            const weaponNames = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
             for (let s = 1; s < 4; s++) {
               if (diff.weaponSlots[s] && !existing.weaponSlots[s]) {
-                spawnFloatingText(predictedX, predictedY - 34, `UNLOCKED ${weaponNames[s].toUpperCase()}!`, '#ce93d8', 16);
-                pushFeedEvent(`Unlocked ${weaponNames[s]}!`, '#ce93d8');
+                spawnFloatingText(predictedX, predictedY - 34, `Unlocked ${weaponNames[s]}`, theme.you, 16);
+                pushFeedEvent(`Unlocked the ${weaponNames[s]}`, theme.you);
               }
             }
             myShopStateChanged = true;
@@ -1757,19 +1935,12 @@ function applyDelta(delta: DeltaState) {
         }
         if (diff.combo !== undefined) {
           if (id === myId && diff.combo > existing.combo) {
-            if (diff.combo === 5) {
-              pushFeedEvent('5x COMBO! +$35, +15 Ammo & +1 Barrel', '#ffd54f');
-              spawnFloatingText(predictedX, predictedY - 38, '5x STREAK! +$35 & BARREL', '#ffd54f', 15);
-            } else if (diff.combo === 10) {
-              pushFeedEvent('10x OVERDRIVE! +$75, Rapid Fire + Claymore!', '#ff6d00');
-              spawnFloatingText(predictedX, predictedY - 40, '10x OVERDRIVE! RAPID FIRE', '#ff6d00', 17);
-            } else if (diff.combo % 15 === 0) {
-              pushFeedEvent(`${diff.combo}x JUGGERNAUT! +$120, +2 Barricades & +Max Ammo`, '#e040fb');
-              spawnFloatingText(predictedX, predictedY - 42, `${diff.combo}x STREAK! +$120`, '#e040fb', 17);
-            } else if (diff.combo % 10 === 0) {
-              pushFeedEvent(`${diff.combo}x STREAK! +$75, +1 Claymore & +15 HP`, '#ff5252');
-            } else if (diff.combo % 5 === 0) {
-              pushFeedEvent(`${diff.combo}x STREAK! +$35, +15 Ammo & +1 Barrel`, '#ffd54f');
+            const c = diff.combo;
+            if (c % 5 === 0) {
+              // Milestone credits stack (server rules): every 5th kill +$35, every 10th +$60 more, every 15th +$100 more.
+              const bonus = 35 + (c % 10 === 0 ? 60 : 0) + (c % 15 === 0 ? 100 : 0);
+              pushFeedEvent(c === 10 ? `Overdrive! +$${bonus}, rapid fire` : `${c}× combo: +$${bonus}`, theme.money);
+              spawnFloatingText(predictedX, predictedY - 38, c === 10 ? 'Overdrive: rapid fire' : `${c}× combo +$${bonus}`, theme.money, c >= 10 ? 17 : 15);
             }
           }
           existing.combo = diff.combo;
@@ -1783,16 +1954,16 @@ function applyDelta(delta: DeltaState) {
         }
         if (diff.damageLevel !== undefined) {
           if (id === myId && diff.damageLevel > existing.damageLevel) {
-            spawnFloatingText(predictedX, predictedY - 36, `FIREARM POWER LV.${diff.damageLevel}!`, '#ffab00', 16);
-            pushFeedEvent(`Upgraded Firearm Power to Lv.${diff.damageLevel}`, '#ffab00');
+            spawnFloatingText(predictedX, predictedY - 36, `Firearm power level ${diff.damageLevel}`, theme.you, 16);
+            pushFeedEvent(`Firearm power: level ${diff.damageLevel}`, theme.you);
             myShopStateChanged = true;
           }
           existing.damageLevel = diff.damageLevel;
         }
         if (diff.meleeLevel !== undefined) {
           if (id === myId && diff.meleeLevel > (existing.meleeLevel || 0)) {
-            spawnFloatingText(predictedX, predictedY - 36, `KATANA EDGE LV.${diff.meleeLevel}!`, '#00e5ff', 16);
-            pushFeedEvent(`Upgraded Plasma Katana to Lv.${diff.meleeLevel}`, '#00e5ff');
+            spawnFloatingText(predictedX, predictedY - 36, `Katana level ${diff.meleeLevel}`, theme.you, 16);
+            pushFeedEvent(`Katana: level ${diff.meleeLevel}`, theme.you);
             myShopStateChanged = true;
           }
           existing.meleeLevel = diff.meleeLevel;
@@ -1830,8 +2001,8 @@ function applyDelta(delta: DeltaState) {
             spawnFloatingText(
               existing.pos.x,
               existing.pos.y - 12,
-              isCrit ? `CRIT! -${dmg}` : `-${dmg}`,
-              isCrit ? '#ffab00' : '#ffffff',
+              isCrit ? `Crit -${dmg}` : `-${dmg}`,
+              isCrit ? theme.money : theme.text,
               isCrit ? 15 : 12
             );
           }
@@ -1846,7 +2017,7 @@ function applyDelta(delta: DeltaState) {
       if (z) {
         const dmg = Math.max(10, Math.round(z.health));
         spawnBlood(z.pos.x, z.pos.y, 14, true);
-        spawnFloatingText(z.pos.x, z.pos.y - 14, `-${dmg}`, '#ff5252', 14);
+        spawnFloatingText(z.pos.x, z.pos.y - 14, `-${dmg}`, theme.text, 15);
       }
       zombieMap.delete(id);
     }
@@ -1915,10 +2086,10 @@ function applyDelta(delta: DeltaState) {
       if (pl) {
         if (pl.type === 'barrel') {
           spawnExplosion(pl.pos.x, pl.pos.y, 115, '#ff3d00');
-          pushFeedEvent('Explosive Barrel Detonated! 💥', '#ff6d00');
+          pushFeedEvent('Barrel detonated', theme.textSecondary);
         } else if (pl.type === 'mine') {
           spawnExplosion(pl.pos.x, pl.pos.y, 95, '#ffab00');
-          pushFeedEvent('Claymore Triggered! 💥', '#ffd54f');
+          pushFeedEvent('Claymore triggered', theme.textSecondary);
         }
       }
       placeableMap.delete(id);
@@ -1928,15 +2099,18 @@ function applyDelta(delta: DeltaState) {
   // Wave & Wave Break transitions
   if (delta.waveBreakTimer !== undefined) {
     if (waveBreakTimer <= 0 && delta.waveBreakTimer > 0) {
-      triggerWaveBanner(`WAVE ${wave} CLEARED!`, '+$100 BONUS, +25 HP & TACTICAL RESUPPLY — PRESS [B] FOR ARMORY', '#00e676');
-      pushFeedEvent(`Wave ${wave} Cleared! +$100 Credits & Resupply.`, '#00e676');
+      // The server pays 100 + 30 per wave number for a clear.
+      const clearBonus = 100 + wave * 30;
+      triggerWaveBanner(`Wave ${wave} cleared`, `+$${clearBonus} · +25 HP · gear resupplied`, theme.text);
+      pushFeedEvent(`Wave ${wave} cleared: +$${clearBonus}`, theme.money);
     }
     waveBreakTimer = delta.waveBreakTimer;
   }
   if (delta.wave !== undefined) {
     if (delta.wave > wave) {
-      triggerWaveBanner(`WAVE ${delta.wave}`, 'HOSTILES INBOUND — SURVIVE THE HORDE', '#e53935');
-      pushFeedEvent(`Wave ${delta.wave} Started!`, '#ff5252');
+      waveBreakTimer = 0;
+      triggerWaveBanner(`Wave ${delta.wave}`, 'Hostiles inbound', theme.accent);
+      pushFeedEvent(`Wave ${delta.wave} started`, theme.textSecondary);
     }
     wave = delta.wave;
     rememberWave(wave);
@@ -2136,6 +2310,16 @@ window.addEventListener('mousedown', (e) => {
       triggerMeleeAttack();
       maybeSendInput();
       setTimeout(() => { input.melee = false; }, 80);
+      return;
+    }
+    // Hotbar Dash slot
+    if (
+      e.clientX >= hotbarDashBtnRect.x &&
+      e.clientX <= hotbarDashBtnRect.x + hotbarDashBtnRect.w &&
+      e.clientY >= hotbarDashBtnRect.y &&
+      e.clientY <= hotbarDashBtnRect.y + hotbarDashBtnRect.h
+    ) {
+      tryTriggerDash();
       return;
     }
     // Check if clicking hotbar Armory button
@@ -2569,7 +2753,7 @@ function drawAmmoPickups() {
     ctx.strokeRect(sx - 12, sy - 8, 24, 16);
 
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 10px monospace';
+    ctx.font = font(10, 700);
     ctx.textAlign = 'center';
     ctx.fillText('AMMO', sx, sy + 4);
 
@@ -2774,11 +2958,13 @@ function drawVisualEffects(dt: number) {
 
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.font = `bold ${ft.size}px monospace`;
+    ctx.font = font(ft.size, 800);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = 'rgba(0,0,0,0.75)';
-    ctx.fillText(ft.text, sx + 1, sy + 1);
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 3.5;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+    ctx.strokeText(ft.text, sx, sy);
     ctx.fillStyle = ft.color;
     ctx.fillText(ft.text, sx, sy);
     ctx.restore();
@@ -2886,19 +3072,19 @@ function drawPlayers(dt: number, state: GameState) {
       ctx.save();
       ctx.translate(sx, sy);
       ctx.globalAlpha = 0.5 + 0.2 * Math.sin(performance.now() / 400);
-      ctx.fillStyle = '#ff5252';
-      ctx.font = 'bold 24px sans-serif';
+      ctx.fillStyle = theme.accent;
+      ctx.font = font(24, 700);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('\u2620', 0, 0);
       ctx.globalAlpha = 1;
       const displayName = p.name || p.id.slice(0, 6);
-      ctx.fillStyle = '#ff8888';
-      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = theme.text;
+      ctx.font = font(12, 700);
       ctx.fillText(displayName, 0, -24);
-      ctx.fillStyle = '#aaa';
-      ctx.font = '10px sans-serif';
-      ctx.fillText('Stand near to revive', 0, 22);
+      ctx.fillStyle = theme.textSecondary;
+      ctx.font = font(11, 600);
+      ctx.fillText('Stand close to revive', 0, 22);
       ctx.restore();
       continue;
     }
@@ -2986,567 +3172,682 @@ function drawPlayers(dt: number, state: GameState) {
     ctx.restore();
 
     const displayName = p.name || p.id.slice(0, 6);
-    ctx.fillStyle = isMe ? '#64B5F6' : '#eee';
-    ctx.font = 'bold 11px sans-serif';
+    ctx.font = font(12, 700);
+    const tagW = ctx.measureText(displayName).width + 12;
+    hudRoundRect(sx - tagW / 2, sy - 52, tagW, 17, 8.5);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fill();
+    ctx.fillStyle = isMe ? theme.you : theme.text;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
-    ctx.fillText(displayName, sx, sy - 36);
+    ctx.fillText(displayName, sx, sy - 37);
 
     const maxHp = p.maxHealth || 100;
     const barW = 36;
-    ctx.fillStyle = '#222';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
     ctx.fillRect(sx - barW / 2 - 1, sy - 32, barW + 2, 6);
-    ctx.fillStyle = '#c62828';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
     ctx.fillRect(sx - barW / 2, sy - 31, barW, 4);
-    ctx.fillStyle = p.health / maxHp > 0.3 ? '#4CAF50' : '#FF9800';
+    ctx.fillStyle = p.health / maxHp > 0.3 ? theme.health : theme.accent;
     ctx.fillRect(sx - barW / 2, sy - 31, barW * Math.max(0, Math.min(1, p.health / maxHp)), 4);
+    // Your dash charges, where you're looking.
+    if (isMe) {
+      for (let i = 0; i < DASH_MAX_CHARGES; i++) {
+        ctx.beginPath();
+        ctx.arc(sx - (DASH_MAX_CHARGES - 1) * 5 + i * 10, sy + 28, 3, 0, Math.PI * 2);
+        if (i < dashCharges) {
+          ctx.fillStyle = theme.you;
+          ctx.fill();
+        } else {
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = withAlpha(theme.text, 0.35);
+          ctx.stroke();
+        }
+      }
+    }
   }
+}
+
+// ============ HUD (canvas) ============
+// Every panel uses the shared design tokens (theme.ts): one panel style, one
+// type scale (11px caps labels, 12–13px details, 15–20px values) and the same
+// color meanings as the menus (red = enemies/damage, green = health,
+// gold = money, blue = you/selected, neutral = everything else).
+// Layout: controls + combo top-left · wave top-center · squad + feed top-right ·
+// vitals strip above the hotbar at the bottom · minimap bottom-right.
+const HUD = {
+  margin: 16,
+  radius: 10,
+  pad: 14,
+  gap: 8,
+  fill: withAlpha(theme.surface, 0.93),
+  border: theme.border,
+  track: 'rgba(255, 255, 255, 0.10)',
+  /** Height of the HTML pause/settings buttons at the top-left. */
+  controlsH: 40,
+  sideW: 208,
+};
+
+type CtxWithTracking = CanvasRenderingContext2D & { letterSpacing?: string };
+const fmtInt = (n: number) => Math.floor(n).toLocaleString('en-US');
+
+function hudRoundRect(x: number, y: number, w: number, h: number, r: number) {
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') ctx.roundRect(x, y, w, h, r);
+  else ctx.rect(x, y, w, h);
+}
+
+function hudPanel(x: number, y: number, w: number, h: number, opts: { fill?: string; border?: string; borderWidth?: number } = {}) {
+  hudRoundRect(x + 0.5, y + 0.5, w - 1, h - 1, HUD.radius);
+  ctx.fillStyle = opts.fill ?? HUD.fill;
+  ctx.fill();
+  ctx.lineWidth = opts.borderWidth ?? 1;
+  ctx.strokeStyle = opts.border ?? HUD.border;
+  ctx.stroke();
+}
+
+interface HudTextOpts {
+  size?: number; weight?: number; color?: string; align?: CanvasTextAlign;
+  baseline?: CanvasTextBaseline; caps?: boolean; maxWidth?: number;
+}
+
+/** Draws text in the UI typeface; returns the drawn width. */
+function hudText(text: string, x: number, y: number, o: HudTextOpts = {}): number {
+  const c = ctx as CtxWithTracking;
+  ctx.font = font(o.size ?? 13, o.weight ?? 600);
+  ctx.fillStyle = o.color ?? theme.text;
+  ctx.textAlign = o.align ?? 'left';
+  ctx.textBaseline = o.baseline ?? 'alphabetic';
+  const tracked = o.caps && 'letterSpacing' in c;
+  if (tracked) c.letterSpacing = '0.08em';
+  let s = o.caps ? text.toUpperCase() : text;
+  if (o.maxWidth && ctx.measureText(s).width > o.maxWidth) {
+    while (s.length > 1 && ctx.measureText(`${s}…`).width > o.maxWidth) s = s.slice(0, -1);
+    s = `${s.trimEnd()}…`;
+  }
+  ctx.fillText(s, x, y);
+  const width = ctx.measureText(s).width;
+  if (tracked) c.letterSpacing = '0px';
+  return width;
+}
+
+/** 12px uppercase label (the HUD's minimum text size). */
+function hudLabel(text: string, x: number, y: number, align: CanvasTextAlign = 'left', color = theme.textSecondary): number {
+  return hudText(text, x, y, { size: 13, weight: 700, color, align, caps: true });
+}
+
+function hudBar(x: number, y: number, w: number, h: number, pct: number, color: string) {
+  hudRoundRect(x, y, w, h, h / 2);
+  ctx.fillStyle = HUD.track;
+  ctx.fill();
+  const p = Math.max(0, Math.min(1, pct));
+  if (p > 0) {
+    hudRoundRect(x, y, Math.max(h, w * p), h, h / 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+}
+
+/** Keycap matching the HTML .kbd. `align` says which edge x is. Returns its width. */
+function hudKeycap(label: string, x: number, y: number, align: 'left' | 'right' | 'center' = 'left', h = 18): number {
+  ctx.font = font(11, 600);
+  const w = Math.max(h, ctx.measureText(label).width + 10);
+  const left = align === 'left' ? x : align === 'right' ? x - w : x - w / 2;
+  hudRoundRect(left + 0.5, y + 0.5, w - 1, h - 1, 4);
+  ctx.fillStyle = theme.surfaceRaised;
+  ctx.fill();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = theme.borderStrong;
+  ctx.stroke();
+  hudText(label, left + w / 2, y + h / 2 + 0.5, { size: 11, weight: 600, color: theme.text, align: 'center', baseline: 'middle' });
+  return w;
+}
+
+function hudTagWidth(text: string): number {
+  ctx.font = font(11, 700);
+  return ctx.measureText(text).width + 10;
+}
+
+/** Small rounded tag, e.g. "OVERDRIVE", "×2" or a price. Returns its width. */
+function hudTag(text: string, xRight: number, y: number, color: string, o: { fill?: string; border?: string } = {}): number {
+  ctx.font = font(11, 700);
+  const w = ctx.measureText(text).width + 10;
+  hudRoundRect(xRight - w + 0.5, y + 0.5, w - 1, 17, 8.5);
+  ctx.fillStyle = o.fill ?? withAlpha(color, 0.16);
+  ctx.fill();
+  if (o.border) {
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = o.border;
+    ctx.stroke();
+  }
+  hudText(text, xRight - w / 2, y + 13, { size: 11, weight: 700, color, align: 'center' });
+  return w;
+}
+
+// Line icons for the hotbar (24px grid, 2px stroke), matching the HTML icon set.
+const HOTBAR_ICONS: Record<string, Path2D> = {
+  katana: new Path2D('M20 4l-1 5-9 9-4-4 9-9zM7 13l4 4M4.5 19.5 7 17'),
+  pistol: new Path2D('M3 7h17v4h-8l-1.5 2.5H8L7 19H4l1-6.5L3 11z'),
+  uzi: new Path2D('M3 8h17v4h-7v7h-3v-7H7l-1 3H3zM15 8V5'),
+  shotgun: new Path2D('M2 10h20v3H9l-2 5H4l1-5H2z'),
+  rocket: new Path2D('M2 9.5h14l5 2.5-5 2.5H2zM7 14.5V18'),
+  barrel: new Path2D('M7 3h10v18H7zM7 8h10M7 16h10'),
+  barricade: new Path2D('M3 8h18v8H3zM8 8l-3 8M13 8l-3 8M18 8l-3 8'),
+  claymore: new Path2D('M4 17a8 7 0 0 1 16 0zM12 10V6M9 7l3-2 3 2'),
+  armory: new Path2D('M5 8h14l-1 12H6zM9 8a3 3 0 0 1 6 0'),
+  lock: new Path2D('M7 11h10v8H7zM9 11V8.5a3 3 0 0 1 6 0V11'),
+  dash: new Path2D('M5 6l6 6-6 6M13 6l6 6-6 6'),
+};
+
+function drawIcon(icon: Path2D, cx: number, cy: number, size: number, color: string) {
+  ctx.save();
+  ctx.translate(cx - size / 2, cy - size / 2);
+  ctx.scale(size / 24, size / 24);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.stroke(icon);
+  ctx.restore();
 }
 
 function drawMinimap(state: GameState) {
-  const mmW = 185;
+  const pad = 8;
+  const mmW = HUD.sideW - pad * 2;
   const mmH = mmW * (staticMapHeight / staticMapWidth);
-  const mmX = canvas.width - mmW - 15;
-  const mmY = canvas.height - mmH - 15;
+  const panelW = mmW + pad * 2;
+  const panelH = mmH + pad * 2;
+  const px = canvas.width - HUD.margin - panelW;
+  const py = canvas.height - HUD.margin - panelH;
+  const mmX = px + pad;
+  const mmY = py + pad;
   const scaleX = mmW / staticMapWidth;
   const scaleY = mmH / staticMapHeight;
+  const dot = (x: number, y: number, size: number, color: string) => {
+    ctx.fillStyle = color;
+    ctx.fillRect(mmX + x * scaleX - size / 2, mmY + y * scaleY - size / 2, size, size);
+  };
 
-  ctx.fillStyle = 'rgba(10, 12, 18, 0.8)';
-  ctx.fillRect(mmX - 3, mmY - 3, mmW + 6, mmH + 6);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(mmX - 3, mmY - 3, mmW + 6, mmH + 6);
-
-  ctx.fillStyle = '#262930';
+  hudPanel(px, py, panelW, panelH);
+  ctx.save();
+  hudRoundRect(mmX, mmY, mmW, mmH, 6);
+  ctx.clip();
+  ctx.fillStyle = theme.field;
   ctx.fillRect(mmX, mmY, mmW, mmH);
-
-  ctx.fillStyle = '#555';
+  ctx.fillStyle = theme.borderStrong;
   for (const w of staticWalls) {
     ctx.fillRect(mmX + w.x * scaleX, mmY + w.y * scaleY, Math.max(1, w.w * scaleX), Math.max(1, w.h * scaleY));
   }
-
   for (let i = 0; i < staticAmmoSpawns.length; i++) {
-    if (!ammoAvailability.get(`ammo_${i}`)) continue;
-    const pickup = staticAmmoSpawns[i];
-    ctx.fillStyle = '#ffb400';
-    ctx.fillRect(mmX + pickup.x * scaleX - 2, mmY + pickup.y * scaleY - 2, 4, 4);
+    if (ammoAvailability.get(`ammo_${i}`)) dot(staticAmmoSpawns[i].x, staticAmmoSpawns[i].y, 3, theme.textSecondary);
   }
+  for (const pl of state.placeables) dot(pl.pos.x, pl.pos.y, 3, theme.textMuted);
+  for (const d of state.drops) dot(d.pos.x, d.pos.y, 3, d.type === 'health' ? theme.health : theme.textSecondary);
 
-  for (const pl of state.placeables) {
-    ctx.fillStyle = pl.type === 'barrel' ? '#ff3d00' : pl.type === 'barricade' ? '#8d6e63' : '#ff1744';
-    ctx.fillRect(mmX + pl.pos.x * scaleX - 1.5, mmY + pl.pos.y * scaleY - 1.5, 3, 3);
-  }
-
-  for (const d of state.drops) {
-    ctx.fillStyle = d.type === 'ammo' ? '#ffb400' : d.type === 'health' ? '#4CAF50' : '#9C27B0';
-    ctx.fillRect(mmX + d.pos.x * scaleX - 1, mmY + d.pos.y * scaleY - 1, 3, 3);
-  }
-
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
   ctx.lineWidth = 1;
   ctx.strokeRect(mmX + camX * scaleX, mmY + camY * scaleY, canvas.width * scaleX, canvas.height * scaleY);
 
-  for (const z of state.zombies) {
-    ctx.fillStyle = z.type === 'devil' ? '#e53935' : z.type === 'brute' ? '#ff6d00' : '#4CAF50';
-    ctx.fillRect(mmX + z.pos.x * scaleX - 1, mmY + z.pos.y * scaleY - 1, 2.5, 2.5);
-  }
-
+  for (const z of state.zombies) dot(z.pos.x, z.pos.y, 3, theme.accent);
   for (const id in state.players) {
-    const p = state.players[id];
-    ctx.fillStyle = id === myId ? '#29b6f6' : '#F44336';
-    ctx.fillRect(mmX + p.pos.x * scaleX - 2.5, mmY + p.pos.y * scaleY - 2.5, 5, 5);
+    if (id !== myId) dot(state.players[id].pos.x, state.players[id].pos.y, 5, theme.text);
   }
+  const me = state.players[myId];
+  if (me) dot(me.pos.x, me.pos.y, 6, theme.you);
+  ctx.restore();
 }
 
+/** Shared geometry for the hotbar and the vitals strip that sits on it. */
+function hotbarLayout() {
+  const gap = 6;
+  const groupGap = 17;
+  const fixed = gap * 6 + groupGap * 3;
+  // Ten equal slots, centred between the status card (bottom left) and the minimap (bottom right).
+  const room = canvas.width - 2 * (HUD.margin + HUD.sideW + 24);
+  const slotW = Math.max(54, Math.min(78, Math.floor((room - fixed) / 10)));
+  const slotH = 66;
+  const totalW = slotW * 10 + fixed;
+  return { slotW, slotH, gap, groupGap, totalW, x: Math.round((canvas.width - totalW) / 2), y: canvas.height - HUD.margin - slotH };
+}
+
+/** Height of the desktop status card (bottom left). */
+const STATUS_CARD_H = 132;
+
+/**
+ * Vitals. Desktop: a status card in the bottom-left corner (health, ammo, credits)
+ * that mirrors the minimap, so the bottom centre holds only the hotbar.
+ * Touch screens keep a slim strip under the wave header.
+ */
 function drawHUD(state: GameState) {
   const p = state.players[myId];
   if (!p) return;
+  if (isMobile) { drawVitalsStrip(p); return; }
 
-  // Top-left Tactical Operative Card
-  const cardX = 12;
-  const cardY = 12;
-  const cardW = 300;
-  const cardH = 128;
+  const w = HUD.sideW;
+  const h = STATUS_CARD_H;
+  const x = HUD.margin;
+  const y = canvas.height - HUD.margin - h;
+  const pad = HUD.pad;
+  const right = x + w - pad;
+  hudPanel(x, y, w, h);
 
-  ctx.fillStyle = 'rgba(12, 14, 22, 0.85)';
-  ctx.fillRect(cardX, cardY, cardW, cardH);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(cardX, cardY, cardW, cardH);
-
-  // Left accent bar
-  ctx.fillStyle = '#e53935';
-  ctx.fillRect(cardX, cardY, 4, cardH);
-
-  // Row 1: SCORE (High Score Ranking) & CREDITS (Spendable $)
-  ctx.textBaseline = 'top';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#ffb400';
-  ctx.font = 'bold 14px monospace';
-  ctx.fillText(`SCORE: ${Math.floor(p.score)}`, cardX + 14, cardY + 9);
-
-  // Credits pill on top-right of card
-  const creditsText = `$${Math.floor(p.credits ?? 0)}`;
-  ctx.font = 'bold 14px monospace';
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#00e676';
-  ctx.fillText(`CREDITS: ${creditsText}`, cardX + cardW - 12, cardY + 9);
-
-  // Row 2: Kills & Upgrade Levels
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#90a4ae';
-  ctx.font = 'bold 10px monospace';
-  const dmgBonus = (p.damageLevel || 0) * 20;
-  const katanaLv = p.meleeLevel || 0;
-  ctx.fillText(
-    `KILLS: ${p.kills || 0}  •  GUN +${dmgBonus}%  •  KATANA LV.${katanaLv}`,
-    cardX + 14,
-    cardY + 28
-  );
-
-  // Health Bar
+  // Health: the heaviest element.
   const maxHp = p.maxHealth || 100;
-  const hpPct = Math.max(0, Math.min(1, p.health / maxHp));
-  const barX = cardX + 14;
-  const barW = cardW - 26;
+  const hpPct = p.health / maxHp;
+  const lowHp = hpPct <= 0.3;
+  hudLabel('Health', x + pad, y + 30, 'left', lowHp ? theme.accent : theme.textSecondary);
+  const hpTotalW = hudText(` / ${maxHp}`, right, y + 30, { size: 13, weight: 600, color: theme.textMuted, align: 'right' });
+  hudText(`${Math.ceil(Math.max(0, p.health))}`, right - hpTotalW, y + 30, { size: 18, weight: 800, color: lowHp ? theme.accent : theme.text, align: 'right' });
+  ctx.save();
+  if (lowHp) ctx.globalAlpha = 0.65 + 0.35 * Math.sin(performance.now() / 120); // pulse when low
+  hudBar(x + pad, y + 40, w - pad * 2, 10, hpPct, lowHp ? theme.accent : theme.health);
+  ctx.restore();
 
-  ctx.fillStyle = 'rgba(255,255,255,0.08)';
-  ctx.fillRect(barX, cardY + 46, barW, 16);
-  ctx.fillStyle = hpPct > 0.35 ? '#43a047' : '#e53935';
-  ctx.fillRect(barX, cardY + 46, barW * hpPct, 16);
-  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-  ctx.strokeRect(barX, cardY + 46, barW, 16);
-
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 11px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText(`HP ${Math.ceil(p.health)}/${maxHp}`, barX + 6, cardY + 48);
-
-  // Ammo Bar
-  const isPistol = p.weapon === 'pistol';
-  const maxAmmo = p.maxAmmo || 40;
-  const ammoPct = isPistol ? 1 : Math.max(0, Math.min(1, p.ammo / maxAmmo));
-
-  ctx.fillStyle = 'rgba(255,255,255,0.08)';
-  ctx.fillRect(barX, cardY + 68, barW, 14);
-  ctx.fillStyle = isPistol ? '#546e7a' : '#ffb300';
-  ctx.fillRect(barX, cardY + 68, barW * ammoPct, 14);
-  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-  ctx.strokeRect(barX, cardY + 68, barW, 14);
-
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 10px monospace';
-  ctx.fillText(isPistol ? 'AMMO: \u221E (PISTOL)' : `AMMO: ${Math.floor(p.ammo)}/${maxAmmo}`, barX + 6, cardY + 70);
-
-  // Dash Stamina Pips (3 charges)
-  ctx.fillStyle = '#90a4ae';
-  ctx.font = 'bold 11px monospace';
-  ctx.fillText('DASH', barX, cardY + 92);
-
-  const pipW = 46;
-  const pipH = 10;
-  const pipGap = 5;
-  const pipStartX = barX + 40;
-  const pipY = cardY + 92;
-  for (let i = 0; i < DASH_MAX_CHARGES; i++) {
-    const px = pipStartX + i * (pipW + pipGap);
-    ctx.fillStyle = 'rgba(255,255,255,0.1)';
-    ctx.fillRect(px, pipY, pipW, pipH);
-    if (i < dashCharges) {
-      ctx.fillStyle = '#29b6f6';
-      ctx.fillRect(px, pipY, pipW, pipH);
-    } else if (i === dashCharges && dashRechargeTimer > 0) {
-      const fill = 1 - dashRechargeTimer / DASH_RECHARGE_TIME;
-      ctx.fillStyle = '#0277bd';
-      ctx.fillRect(px, pipY, pipW * fill, pipH);
-    }
-    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(px, pipY, pipW, pipH);
+  // Ammo: the pistol never runs dry, so it shows ∞; other guns get a thin bar.
+  hudLabel('Ammo', x + pad, y + 78);
+  if (p.weapon === 'pistol') {
+    hudText('∞', right, y + 82, { size: 24, weight: 700, align: 'right' });
+  } else {
+    const maxAmmo = p.maxAmmo || 40;
+    const ammoPct = p.ammo / maxAmmo;
+    const lowAmmo = ammoPct <= 0.25;
+    const ammoTotalW = hudText(` / ${maxAmmo}`, right, y + 78, { size: 13, weight: 600, color: theme.textMuted, align: 'right' });
+    hudText(`${Math.floor(p.ammo)}`, right - ammoTotalW, y + 78, { size: 18, weight: 800, color: lowAmmo ? theme.accent : theme.text, align: 'right' });
+    hudBar(x + pad, y + 86, w - pad * 2, 4, ammoPct, lowAmmo ? theme.accent : theme.textSecondary);
   }
 
-  ctx.fillStyle = dashIframeTimer > 0 ? '#29b6f6' : '#78909c';
-  ctx.font = 'bold 10px monospace';
-  ctx.textAlign = 'right';
-  ctx.fillText(dashIframeTimer > 0 ? 'i-FRAME!' : '[SHIFT]', cardX + cardW - 12, cardY + 92);
+  // Credits: what the armory spends.
+  hudLabel('Credits', x + pad, y + 118);
+  hudText(`$${fmtInt(p.credits ?? 0)}`, right, y + 118, { size: 18, weight: 800, color: theme.money, align: 'right' });
+}
+
+/** Touch layout: one slim strip under the wave header. */
+function drawVitalsStrip(p: Player) {
+  const h = 40;
+  const w = Math.min(hotbarLayout().totalW, canvas.width - HUD.margin * 2);
+  const x = Math.round((canvas.width - w) / 2);
+  const y = HUD.margin + 66;
+  const pad = HUD.pad;
+  const base = y + 26;
+  hudPanel(x, y, w, h);
+  const inner = w - pad * 2;
+  const ammoX = x + pad + Math.round(inner * 0.52);
+  const creditsX = ammoX + Math.round(inner * 0.25);
+  ctx.fillStyle = HUD.border;
+  ctx.fillRect(ammoX - 12, y + 9, 1, h - 18);
+  ctx.fillRect(creditsX - 12, y + 9, 1, h - 18);
+  const maxHp = p.maxHealth || 100;
+  const hpPct = p.health / maxHp;
+  const lowHp = hpPct <= 0.3;
+  const labelW = hudLabel('Health', x + pad, base - 1, 'left', lowHp ? theme.accent : theme.textSecondary);
+  const valueRight = ammoX - 26;
+  const totalW = hudText(` / ${maxHp}`, valueRight, base, { size: 13, weight: 600, color: theme.textMuted, align: 'right' });
+  const valueW = hudText(`${Math.ceil(Math.max(0, p.health))}`, valueRight - totalW, base, { size: 18, weight: 800, color: lowHp ? theme.accent : theme.text, align: 'right' });
+  const barX = x + pad + labelW + 12;
+  hudBar(barX, y + h / 2 - 5, valueRight - totalW - valueW - 14 - barX, 10, hpPct, lowHp ? theme.accent : theme.health);
+  const ammoLabelW = hudLabel('Ammo', ammoX, base - 1);
+  if (p.weapon === 'pistol') {
+    hudText('∞', ammoX + ammoLabelW + 12, base + 2, { size: 24, weight: 700 });
+  } else {
+    const vw = hudText(`${Math.floor(p.ammo)}`, ammoX + ammoLabelW + 12, base, { size: 18, weight: 800 });
+    hudText(` / ${p.maxAmmo || 40}`, ammoX + ammoLabelW + 12 + vw, base, { size: 13, weight: 600, color: theme.textMuted });
+  }
+  const creditsLabelW = hudLabel('Credits', creditsX, base - 1);
+  hudText(`$${fmtInt(p.credits ?? 0)}`, creditsX + creditsLabelW + 12, base, { size: 18, weight: 800, color: theme.money });
 }
 
 function drawWaveHeader(state: GameState) {
   const w = 340;
-  const h = 54;
-  const x = (canvas.width - w) / 2;
-  const y = 12;
+  const x = Math.round((canvas.width - w) / 2);
+  const y = HUD.margin;
+  const pad = HUD.pad;
+  const onBreak = state.waveBreakTimer > 0;
+  hudPanel(x, y, w, onBreak ? 84 : 58);
 
-  ctx.fillStyle = 'rgba(12, 14, 22, 0.82)';
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeStyle = state.waveBreakTimer > 0 ? 'rgba(0, 230, 118, 0.5)' : 'rgba(229, 57, 53, 0.4)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(x, y, w, h);
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-
-  if (state.waveBreakTimer > 0) {
-    ctx.fillStyle = '#00e676';
-    ctx.font = 'bold 14px monospace';
-    ctx.fillText(`WAVE ${state.wave} COMPLETE — NEXT IN ${state.waveBreakTimer.toFixed(1)}s`, x + w / 2, y + 8);
-
-    const pct = Math.max(0, Math.min(1, state.waveBreakTimer / WAVE_BREAK_DURATION));
-    ctx.fillStyle = 'rgba(255,255,255,0.1)';
-    ctx.fillRect(x + 16, y + 30, w - 32, 12);
-    ctx.fillStyle = '#00e676';
-    ctx.fillRect(x + 16, y + 30, (w - 32) * pct, 12);
-
-    ctx.fillStyle = '#111';
-    ctx.font = 'bold 9px monospace';
-    ctx.fillText('PRESS [B] TO SPEND $ CREDITS IN ARMORY', x + w / 2, y + 31);
+  if (onBreak) {
+    hudText(`Wave ${state.wave} cleared`, x + pad, y + 27, { size: 16, weight: 800, caps: true });
+    hudText(`Next wave in ${Math.ceil(state.waveBreakTimer)}s`, x + w - pad, y + 27, { size: 13, weight: 700, color: theme.textSecondary, align: 'right' });
+    hudBar(x + pad, y + 37, w - pad * 2, 8, state.waveBreakTimer / WAVE_BREAK_DURATION, theme.textSecondary);
+    // "[B] Open the armory", centered
+    const hint = 'Open the armory';
+    const keyLabel = keyDisplayName(bindings.toggleShop);
+    ctx.font = font(12, 600);
+    const hintW = ctx.measureText(hint).width;
+    ctx.font = font(11, 700);
+    const keyW = Math.max(18, ctx.measureText(keyLabel).width + 10);
+    const startX = x + (w - (keyW + 8 + hintW)) / 2;
+    hudKeycap(keyLabel, startX, y + 55, 'left');
+    hudText(hint, startX + keyW + 8, y + 68, { size: 12, weight: 600, color: theme.textSecondary });
   } else {
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 15px monospace';
-    ctx.fillText(`WAVE ${state.wave}   •   HOSTILES: ${state.zombies.length}`, x + w / 2, y + 8);
-
     const target = Math.max(1, state.waveTarget);
-    const pct = Math.max(0, Math.min(1, state.waveKills / target));
-    ctx.fillStyle = 'rgba(255,255,255,0.1)';
-    ctx.fillRect(x + 16, y + 30, w - 32, 14);
-    ctx.fillStyle = '#e53935';
-    ctx.fillRect(x + 16, y + 30, (w - 32) * pct, 14);
-    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-    ctx.strokeRect(x + 16, y + 30, w - 32, 14);
-
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 10px monospace';
-    ctx.fillText(`${state.waveKills} / ${target} KILLS`, x + w / 2, y + 32);
+    // Progress counts up, and the bar fills as the squad's kills land.
+    const kills = Math.min(target, Math.max(0, state.waveKills));
+    hudText(`Wave ${state.wave}`, x + pad, y + 27, { size: 16, weight: 800, caps: true });
+    const unitW = hudText(` / ${target} kills`, x + w - pad, y + 27, { size: 13, weight: 600, color: theme.textSecondary, align: 'right' });
+    hudText(`${kills}`, x + w - pad - unitW, y + 27, { size: 16, weight: 800, align: 'right' });
+    ctx.save();
+    if (target - kills <= 3) ctx.globalAlpha = 0.7 + 0.3 * Math.sin(performance.now() / 150); // almost cleared
+    hudBar(x + pad, y + 37, w - pad * 2, 8, kills / target, theme.text);
+    ctx.restore();
   }
 }
 
 function drawComboHUD(state: GameState) {
   const p = state.players[myId];
-  if (!p || !p.combo || p.combo <= 0) return;
+  // A combo starts paying out at ×2, so there is nothing to show before then.
+  if (!p || !p.combo || p.combo < 2) return;
 
-  const x = 12;
-  const y = 148;
-  const w = 220;
-  const h = 54;
+  const x = HUD.margin;
+  const y = HUD.margin + HUD.controlsH + HUD.gap;
+  const w = 260;
+  const h = 64;
+  const pad = HUD.pad;
+  const overdrive = p.combo >= 10;
+  const bonus = Math.round((Math.min(5.0, 1.0 + (p.combo - 1) * 0.2) - 1) * 100);
+  hudPanel(x, y, w, h, { border: overdrive ? theme.money : HUD.border });
 
-  const isOverdrive = p.combo >= 10;
-  const color = p.combo >= 20 ? '#e040fb' : isOverdrive ? '#ff6d00' : '#ffd54f';
-  const mult = Math.min(5.0, 1.0 + (p.combo - 1) * 0.2).toFixed(1);
+  const labelW = hudLabel('Combo', x + pad, y + 22);
+  hudText(`×${p.combo}`, x + pad + labelW + 6, y + 22, { size: 13, weight: 800 });
+  if (overdrive) hudTag('OVERDRIVE', x + w - pad, y + 9, theme.money);
+  const bonusW = hudText(`+${bonus}%`, x + pad, y + 46, { size: 20, weight: 800, color: theme.money });
+  hudText('rewards', x + pad + bonusW + 6, y + 46, { size: 12, weight: 600, color: theme.textSecondary });
+  hudBar(x + pad, y + 53, w - pad * 2, 4, (p.comboTimer || 0) / COMBO_DURATION, theme.money);
+}
 
-  ctx.fillStyle = 'rgba(12, 14, 22, 0.85)';
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.strokeRect(x, y, w, h);
+/**
+ * Teammates off screen: a name chip pinned to the edge of a safe frame (clear of
+ * every HUD panel), with a chevron pointing toward them. Red while they're downed.
+ */
+function drawTeammateMarkers(state: GameState) {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const top = HUD.margin + 92;
+  const bottom = canvas.height - HUD.margin - (isMobile ? 0 : STATUS_CARD_H) - 30;
+  const left = HUD.margin + 24;
+  const right = canvas.width - HUD.margin - 24;
+  // Side panels the chips must also clear (x, y, w, h): squad list, minimap, combo meter.
+  const squadH = 38 + Object.keys(state.players).length * 30 + 4;
+  const mapH = (HUD.sideW - 16) * (staticMapHeight / staticMapWidth) + 16;
+  const sideX = canvas.width - HUD.margin - HUD.sideW;
+  const avoid: [number, number, number, number][] = [
+    [sideX, HUD.margin, HUD.sideW, squadH],
+    [sideX, canvas.height - HUD.margin - mapH, HUD.sideW, mapH],
+    [HUD.margin, HUD.margin + HUD.controlsH + HUD.gap, 260, 64],
+  ];
+  for (const id in state.players) {
+    if (id === myId) continue;
+    const p = state.players[id];
+    const sx = p.pos.x - camX;
+    const sy = p.pos.y - camY;
+    if (sx >= 0 && sx <= canvas.width && sy >= 0 && sy <= canvas.height) continue;
+    const dx = sx - cx;
+    const dy = sy - cy;
+    const t = Math.min(
+      (dx > 0 ? right - cx : cx - left) / Math.max(1e-6, Math.abs(dx)),
+      (dy > 0 ? bottom - cy : cy - top) / Math.max(1e-6, Math.abs(dy)),
+    );
+    const mx = cx + dx * t;
+    let my = cy + dy * t;
+    for (const [rx, ry, rw, rh] of avoid) {
+      if (mx > rx - 60 && mx < rx + rw + 60 && my > ry - 20 && my < ry + rh + 20) my = my < cy ? ry + rh + 26 : ry - 26;
+    }
+    const angle = Math.atan2(sy - my, sx - mx);
+    const down = p.health <= 0;
+    const color = down ? theme.accent : theme.text;
 
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillStyle = color;
-  ctx.font = 'bold 20px monospace';
-  ctx.fillText(`${p.combo}x COMBO`, x + 12, y + 7);
-
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 11px monospace';
-  ctx.fillText(`${mult}x REWARD`, x + w - 10, y + 11);
-
-  if (isOverdrive) {
-    ctx.fillStyle = '#ff6d00';
-    ctx.font = 'bold 9px monospace';
-    ctx.fillText('⚡ OVERDRIVE', x + w - 10, y + 24);
+    const name = p.name || p.id.slice(0, 6);
+    ctx.font = font(12, 700);
+    const w = ctx.measureText(name).width + 38;
+    const h = 24;
+    const lx = Math.max(left - 16, Math.min(right + 16 - w, mx - w / 2));
+    const ly = Math.max(top - 16, Math.min(bottom + 16 - h, my - h / 2));
+    hudPanel(lx, ly, w, h, { fill: theme.surface, border: down ? theme.accent : theme.borderStrong });
+    // A chevron inside the chip points the way.
+    ctx.save();
+    ctx.translate(lx + 15, ly + h / 2);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.moveTo(-3, -5);
+    ctx.lineTo(3, 0);
+    ctx.lineTo(-3, 5);
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    ctx.restore();
+    hudText(name, lx + 28, ly + 16, { size: 12, weight: 700, color });
   }
+}
 
-  // Timer bar
-  const pct = Math.max(0, Math.min(1, (p.comboTimer || 0) / COMBO_DURATION));
-  ctx.fillStyle = 'rgba(255,255,255,0.12)';
-  ctx.fillRect(x + 12, y + 36, w - 24, 8);
-  ctx.fillStyle = color;
-  ctx.fillRect(x + 12, y + 36, (w - 24) * pct, 8);
+/** A soft shade behind the bottom bar keeps it readable over a busy floor. */
+function drawHudBackdrop() {
+  const h = 180;
+  const g = ctx.createLinearGradient(0, canvas.height - h, 0, canvas.height);
+  g.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  g.addColorStop(1, 'rgba(0, 0, 0, 0.45)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, canvas.height - h, canvas.width, h);
 }
 
 function drawWaveBanner(dt: number) {
-  if (waveBannerTimer <= 0) return;
+  if (waveBannerTimer <= 0 || serverPaused) return;
   waveBannerTimer -= dt;
 
-  const alpha = waveBannerTimer < 0.6 ? waveBannerTimer / 0.6 : Math.min(1, (3.2 - waveBannerTimer) * 4);
-  const cy = canvas.height * 0.24;
+  // Full strength, then a quick fade: in over 0.15 s, out over the last 0.3 s.
+  const alpha = waveBannerTimer < 0.3 ? waveBannerTimer / 0.3 : Math.min(1, (3.2 - waveBannerTimer) / 0.15);
+  const cy = Math.round(canvas.height * 0.26);
 
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-  ctx.fillStyle = 'rgba(10, 12, 18, 0.78)';
-  ctx.fillRect(0, cy - 36, canvas.width, 72);
-  ctx.strokeStyle = waveBannerColor;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(0, cy - 36);
-  ctx.lineTo(canvas.width, cy - 36);
-  ctx.moveTo(0, cy + 36);
-  ctx.lineTo(canvas.width, cy + 36);
-  ctx.stroke();
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = waveBannerColor;
-  ctx.font = '900 28px sans-serif';
-  ctx.fillText(waveBannerText, canvas.width / 2, cy - 8);
-
-  ctx.fillStyle = '#f5f5f5';
-  ctx.font = 'bold 13px monospace';
-  ctx.fillText(waveBannerSub, canvas.width / 2, cy + 18);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+  ctx.fillRect(0, cy - 46, canvas.width, 92);
+  hudText(waveBannerText, canvas.width / 2, cy + 8, { size: 42, weight: 900, color: waveBannerColor, align: 'center', caps: true });
+  hudText(waveBannerSub, canvas.width / 2, cy + 32, { size: 13, weight: 700, color: theme.text, align: 'center', caps: true });
   ctx.restore();
+}
+
+interface HotbarSlot {
+  key: string;
+  icon: Path2D;
+  name: string;
+  /** Corner tag: a count like "×2", or the active gun's ammo. */
+  tag?: string;
+  /** Charges shown as dots in the corner (Dash). */
+  pips?: { filled: number; total: number };
+  /** Selected (equipped weapon, swinging katana, dashing): blue fill and border. */
+  active?: boolean;
+  /** Its panel is open (Armory): blue outline only, so it isn't mistaken for the equipped weapon. */
+  open?: boolean;
+  disabled?: boolean;
+  locked?: boolean;
+  /** 0–1 cooldown, drawn as a fill that drains from the top. */
+  cooldown?: number;
+}
+
+function drawHotbarSlot(x: number, y: number, w: number, h: number, s: HotbarSlot) {
+  // Locked weapons are dashed tiles: visibly not yours yet.
+  if (s.locked) ctx.setLineDash([5, 4]);
+  hudPanel(x, y, w, h, {
+    fill: s.active ? withAlpha(theme.you, 0.16) : HUD.fill,
+    border: s.active || s.open ? theme.you : s.locked ? theme.borderStrong : HUD.border,
+    borderWidth: s.active || s.open ? 2 : 1,
+  });
+  ctx.setLineDash([]);
+  if (s.cooldown && s.cooldown > 0) {
+    ctx.save();
+    hudRoundRect(x, y, w, h, HUD.radius);
+    ctx.clip();
+    ctx.fillStyle = withAlpha(theme.you, 0.18);
+    ctx.fillRect(x, y + h * (1 - s.cooldown), w, h * s.cooldown);
+    ctx.restore();
+  }
+  const dim = !!(s.locked || s.disabled);
+  ctx.save();
+  if (dim) ctx.globalAlpha = 0.4;
+  hudKeycap(s.key, x + 6, y + 6);
+  if (s.pips) {
+    for (let i = 0; i < s.pips.total; i++) {
+      const cx = x + w - 10 - (s.pips.total - 1 - i) * 11;
+      ctx.beginPath();
+      ctx.arc(cx, y + 15, 3.5, 0, Math.PI * 2);
+      if (i < s.pips.filled) {
+        ctx.fillStyle = theme.you;
+        ctx.fill();
+      } else {
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = theme.borderStrong;
+        ctx.stroke();
+      }
+    }
+  } else if (s.tag && !s.locked) {
+    hudTag(s.tag, x + w - 6, y + 6, theme.text);
+  }
+  drawIcon(s.icon, x + w / 2, y + 37, 30, s.active ? theme.you : theme.text);
+  ctx.restore();
+  // The padlock sits in the corner where counts go, at full strength.
+  if (s.locked) drawIcon(HOTBAR_ICONS.lock, x + w - 15, y + 15, 16, theme.textSecondary);
+  // Names stay readable on dimmed slots.
+  hudText(s.name, x + w / 2, y + 60, { size: 13, weight: 700, color: dim ? theme.textMuted : theme.text, align: 'center', maxWidth: w - 8 });
 }
 
 function drawWeaponAndTacticalBar(state: GameState) {
   const p = state.players[myId];
   if (!p) return;
 
-  const meleeW = 86;
-  const slotW = 64;
-  const armoryW = 76;
-  const slotH = 56;
-  const gap = 5;
-  // Layout: [MELEE] + 10px + 4x[WEAPONS] + 10px + 3x[TACTICAL] + 10px + [ARMORY]
-  const totalW = meleeW + 10 + slotW * 4 + gap * 3 + 10 + slotW * 3 + gap * 2 + 10 + armoryW;
-  const barX = (canvas.width - totalW) / 2;
-  const barY = canvas.height - slotH - 12;
+  const { slotW, slotH, gap, groupGap, x: barX, y: barY } = hotbarLayout();
+  let x = barX;
+  const groupDivider = () => {
+    ctx.fillStyle = HUD.border;
+    ctx.fillRect(Math.round(x - groupGap / 2), barY + 12, 1, slotH - 24);
+  };
 
-  // 1. Prominent On-Screen KATANA MELEE Button
-  const mX = barX;
-  hotbarMeleeBtnRect = { x: mX, y: barY, w: meleeW, h: slotH };
-  const meleeKey = keyDisplayName(bindings.melee);
-  const meleeLv = p.meleeLevel || 0;
-  const meleeDmg = Math.round(45 * (1 + meleeLv * 0.35));
-  const meleeHeal = 5 + meleeLv * 3;
-  const isSwinging = meleeSwingTime > 0;
-  const cdRatio = Math.max(0, Math.min(1, meleeCooldownTimer / MELEE_COOLDOWN));
+  // Katana (melee)
+  hotbarMeleeBtnRect = { x, y: barY, w: slotW, h: slotH };
+  drawHotbarSlot(x, barY, slotW, slotH, {
+    key: keyDisplayName(bindings.melee), icon: HOTBAR_ICONS.katana, name: 'Katana',
+    active: meleeSwingTime > 0, cooldown: meleeCooldownTimer / MELEE_COOLDOWN,
+  });
+  x += slotW + gap;
 
-  ctx.fillStyle = isSwinging ? 'rgba(0, 229, 255, 0.35)' : 'rgba(10, 24, 34, 0.88)';
-  ctx.fillRect(mX, barY, meleeW, slotH);
+  // Dash: one dot per charge; the fill drains as the next charge comes back.
+  hotbarDashBtnRect = { x, y: barY, w: slotW, h: slotH };
+  drawHotbarSlot(x, barY, slotW, slotH, {
+    key: keyDisplayName(bindings.dash), icon: HOTBAR_ICONS.dash, name: 'Dash',
+    pips: { filled: dashCharges, total: DASH_MAX_CHARGES },
+    active: dashIframeTimer > 0, disabled: dashCharges === 0,
+    cooldown: dashCharges < DASH_MAX_CHARGES ? dashRechargeTimer / DASH_RECHARGE_TIME : 0,
+  });
+  x += slotW + groupGap;
+  groupDivider();
 
-  // Cooldown progress overlay
-  if (cdRatio > 0) {
-    ctx.fillStyle = 'rgba(0, 229, 255, 0.18)';
-    ctx.fillRect(mX, barY + slotH * (1 - cdRatio), meleeW, slotH * cdRatio);
-  }
-
-  ctx.strokeStyle = isSwinging ? '#ffffff' : '#00e5ff';
-  ctx.lineWidth = isSwinging ? 2.5 : 1.8;
-  ctx.strokeRect(mX, barY, meleeW, slotH);
-
-  ctx.fillStyle = '#00e5ff';
-  ctx.font = 'bold 9px monospace';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillText(`[${meleeKey}/RMB]`, mX + 4, barY + 4);
-
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 11px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText('⚔ KATANA', mX + meleeW / 2, barY + 19);
-
-  ctx.fillStyle = '#80deea';
-  ctx.font = 'bold 9px monospace';
-  ctx.fillText(`${meleeDmg} DMG • +${meleeHeal}♥`, mX + meleeW / 2, barY + 37);
-
-  // 2. Firearm Slots (1-4)
-  const weapStartX = mX + meleeW + 10;
+  // Firearms (1–4); the equipped one shows its ammo in the corner.
   const weapons = ['pistol', 'uzi', 'shotgun', 'rocketLauncher'];
   const names = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
+  const icons = [HOTBAR_ICONS.pistol, HOTBAR_ICONS.uzi, HOTBAR_ICONS.shotgun, HOTBAR_ICONS.rocket];
+  const weaponKeys = [bindings.weapon1, bindings.weapon2, bindings.weapon3, bindings.weapon4];
   const slots = p.weaponSlots || [true, false, false, false];
-  const dmgMult = 1 + (p.damageLevel || 0) * 0.2;
   hotbarWeaponRects = [];
-
   for (let i = 0; i < 4; i++) {
-    const x = weapStartX + i * (slotW + gap);
     hotbarWeaponRects.push({ slot: i + 1, x, y: barY, w: slotW, h: slotH });
-    const unlocked = slots[i];
-    const active = p.weapon === weapons[i];
-
-    ctx.fillStyle = active
-      ? 'rgba(25, 118, 210, 0.82)'
-      : unlocked
-      ? 'rgba(12, 14, 22, 0.8)'
-      : 'rgba(12, 14, 22, 0.45)';
-    ctx.fillRect(x, barY, slotW, slotH);
-
-    ctx.strokeStyle = active ? '#64B5F6' : unlocked ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.1)';
-    ctx.lineWidth = active ? 2 : 1;
-    ctx.strokeRect(x, barY, slotW, slotH);
-
-    ctx.fillStyle = active ? '#fff' : unlocked ? '#aaa' : '#555';
-    ctx.font = 'bold 10px monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
-    ctx.fillText(`${i + 1}`, x + 5, barY + 4);
-
-    if (unlocked) {
-      ctx.fillStyle = active ? '#fff' : '#ddd';
-      ctx.font = 'bold 11px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(names[i], x + slotW / 2, barY + 19);
-
-      const dmg = Math.round((WEAPON_STATS[weapons[i]]?.damage ?? 0) * dmgMult);
-      ctx.fillStyle = '#ffb400';
-      ctx.font = 'bold 9px monospace';
-      ctx.fillText(`${dmg} DMG`, x + slotW / 2, barY + 37);
-    } else {
-      ctx.fillStyle = '#555';
-      ctx.font = 'bold 12px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('LOCKED', x + slotW / 2, barY + 25);
-    }
+    const equipped = p.weapon === weapons[i];
+    drawHotbarSlot(x, barY, slotW, slotH, {
+      key: keyDisplayName(weaponKeys[i]), icon: icons[i], name: names[i], active: equipped, locked: !slots[i],
+      tag: equipped ? (weapons[i] === 'pistol' ? '∞' : `${Math.floor(p.ammo)}`) : undefined,
+    });
+    x += slotW + gap;
   }
+  x += groupGap - gap;
+  groupDivider();
 
-  // 3. Tactical slots (Barrel, Barricade, Claymore)
-  const tacStartX = weapStartX + 4 * slotW + 3 * gap + 10;
+  // Gear (barrel, barricade, claymore) with a count in the corner
   const tacItems = p.tacticalItems || [0, 0, 0];
-  const tacLabels = ['Barrel', 'Wall', 'Mine'];
-  const tacKeys = [
-    keyDisplayName(bindings.placeBarrel),
-    keyDisplayName(bindings.placeBarricade),
-    keyDisplayName(bindings.placeMine),
-  ];
-  const tacColors = ['#ff5252', '#8d6e63', '#ffab00'];
+  const tacLabels = ['Barrel', 'Barricade', 'Claymore'];
+  const tacIcons = [HOTBAR_ICONS.barrel, HOTBAR_ICONS.barricade, HOTBAR_ICONS.claymore];
+  const tacKeys = [bindings.placeBarrel, bindings.placeBarricade, bindings.placeMine];
   hotbarTacticalRects = [];
-
   for (let t = 0; t < 3; t++) {
-    const x = tacStartX + t * (slotW + gap);
     hotbarTacticalRects.push({ item: t + 1, x, y: barY, w: slotW, h: slotH });
     const count = tacItems[t] || 0;
-
-    ctx.fillStyle = count > 0 ? 'rgba(18, 20, 30, 0.85)' : 'rgba(12, 14, 22, 0.45)';
-    ctx.fillRect(x, barY, slotW, slotH);
-    ctx.strokeStyle = count > 0 ? tacColors[t] : 'rgba(255,255,255,0.1)';
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(x, barY, slotW, slotH);
-
-    ctx.fillStyle = count > 0 ? tacColors[t] : '#666';
-    ctx.font = 'bold 10px monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
-    ctx.fillText(`[${tacKeys[t]}]`, x + 4, barY + 4);
-
-    ctx.fillStyle = count > 0 ? '#fff' : '#666';
-    ctx.font = 'bold 11px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(tacLabels[t], x + slotW / 2, barY + 19);
-
-    ctx.fillStyle = count > 0 ? '#00e676' : '#555';
-    ctx.font = 'bold 11px monospace';
-    ctx.fillText(`x${count}`, x + slotW / 2, barY + 37);
+    drawHotbarSlot(x, barY, slotW, slotH, {
+      key: keyDisplayName(tacKeys[t]), icon: tacIcons[t], name: tacLabels[t], tag: `×${count}`, disabled: count === 0,
+    });
+    x += slotW + gap;
   }
+  x += groupGap - gap;
+  groupDivider();
 
-  // 4. Armory Shop Button
-  const armX = tacStartX + 3 * slotW + 2 * gap + 10;
-  hotbarArmoryBtnRect = { x: armX, y: barY, w: armoryW, h: slotH };
-  const shopKey = keyDisplayName(bindings.toggleShop);
-
-  ctx.fillStyle = armoryOpen ? 'rgba(255, 180, 0, 0.9)' : 'rgba(20, 34, 24, 0.88)';
-  ctx.fillRect(armX, barY, armoryW, slotH);
-  ctx.strokeStyle = armoryOpen ? '#ffd54f' : '#00e676';
-  ctx.lineWidth = armoryOpen ? 2.5 : 1.8;
-  ctx.strokeRect(armX, barY, armoryW, slotH);
-
-  ctx.fillStyle = armoryOpen ? '#111' : '#ffb400';
-  ctx.font = 'bold 10px monospace';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillText(`[${shopKey}]`, armX + 4, barY + 4);
-
-  ctx.fillStyle = armoryOpen ? '#111' : '#fff';
-  ctx.font = 'bold 11px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText('Armory', armX + armoryW / 2, barY + 19);
-
-  ctx.fillStyle = armoryOpen ? '#111' : '#00e676';
-  ctx.font = 'bold 10px monospace';
-  ctx.fillText(`$${Math.floor(p.credits ?? 0)}`, armX + armoryW / 2, barY + 37);
+  // Armory
+  hotbarArmoryBtnRect = { x, y: barY, w: slotW, h: slotH };
+  drawHotbarSlot(x, barY, slotW, slotH, {
+    key: keyDisplayName(bindings.toggleShop), icon: HOTBAR_ICONS.armory, name: 'Armory', open: armoryOpen,
+  });
 }
 
+/** Squad status: name, health and score columns, so you can see who needs help. */
 function drawScoreboardAndFeed(state: GameState) {
   const playerList = Object.values(state.players).sort((a, b) => b.score - a.score);
   if (playerList.length === 0) return;
 
-  const rowH = 22;
-  const headerH = 28;
-  const padX = 12;
-  const padY = 8;
-  const boardW = isMobile ? 160 : 210;
-  const boardH = headerH + padY * 2 + playerList.length * rowH;
-  const boardX = canvas.width - boardW - 15;
-  const boardY = 12;
-
-  ctx.fillStyle = 'rgba(12, 14, 22, 0.78)';
-  ctx.fillRect(boardX, boardY, boardW, boardH);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(boardX, boardY, boardW, boardH);
-
-  ctx.fillStyle = '#90a4ae';
-  ctx.font = 'bold 11px sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillText('OPERATIVE', boardX + padX, boardY + 8);
-  ctx.textAlign = 'right';
-  ctx.fillText('SCORE', boardX + boardW - padX, boardY + 8);
-
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-  ctx.beginPath();
-  ctx.moveTo(boardX + 6, boardY + headerH);
-  ctx.lineTo(boardX + boardW - 6, boardY + headerH);
-  ctx.stroke();
+  const rowH = 30;
+  const headH = 38;
+  const pad = 12;
+  const w = isMobile ? 200 : HUD.sideW;
+  const h = headH + playerList.length * rowH + 4;
+  const x = canvas.width - HUD.margin - w;
+  const y = HUD.margin;
+  const scoreColW = 40;
+  const healthColW = 48;
+  const healthX = x + w - pad - scoreColW - 10 - healthColW;
+  hudPanel(x, y, w, h);
+  hudLabel('Player', x + pad, y + 24);
+  hudLabel('HP', healthX, y + 24);
+  hudLabel('Score', x + w - pad, y + 24, 'right');
+  ctx.fillStyle = HUD.border;
+  ctx.fillRect(x + 1, y + headH - 4, w - 2, 1);
 
   for (let i = 0; i < playerList.length; i++) {
     const p = playerList[i];
-    const y = boardY + headerH + padY + i * rowH;
+    const ry = y + headH + i * rowH;
     const isMe = p.id === myId;
-    const dead = p.health <= 0;
-
+    const down = p.health <= 0;
     if (isMe) {
-      ctx.fillStyle = 'rgba(33, 150, 243, 0.18)';
-      ctx.fillRect(boardX + 2, y - 2, boardW - 4, rowH);
+      hudRoundRect(x + 4, ry, w - 8, rowH - 4, 6);
+      ctx.fillStyle = withAlpha(theme.you, 0.14);
+      ctx.fill();
+      ctx.fillStyle = theme.you;
+      ctx.fillRect(x + 4, ry + 5, 3, rowH - 14);
     }
-
-    ctx.fillStyle = dead ? '#666' : isMe ? '#64B5F6' : '#ddd';
-    ctx.font = isMe ? 'bold 12px sans-serif' : '12px sans-serif';
-    ctx.textAlign = 'left';
-    const name = p.name || p.id.slice(0, 6);
-    ctx.fillText(name.length > 12 ? name.slice(0, 11) + '…' : name, boardX + padX, y + 2);
-
-    ctx.fillStyle = dead ? '#666' : '#ffb400';
-    ctx.font = 'bold 12px monospace';
-    ctx.textAlign = 'right';
-    ctx.fillText(`${Math.floor(p.score)}`, boardX + boardW - padX, y + 2);
+    hudText(p.name || p.id.slice(0, 6), x + pad, ry + 18, {
+      size: 13, weight: isMe ? 700 : 600, color: down ? theme.textMuted : isMe ? theme.you : theme.text, maxWidth: healthX - 8 - (x + pad),
+    });
+    if (down) {
+      hudTag('DOWN', healthX + hudTagWidth('DOWN'), ry + 4, theme.accent);
+    } else {
+      const hpPct = p.health / (p.maxHealth || 100);
+      hudBar(healthX, ry + 9, healthColW, 6, hpPct, hpPct <= 0.3 ? theme.accent : theme.health);
+    }
+    hudText(fmtInt(p.score), x + w - pad, ry + 18, { size: 13, weight: 700, color: down ? theme.textMuted : theme.text, align: 'right' });
   }
 
-  // Event / Killstreak Feed below scoreboard
+  // Event feed below the squad panel (hidden while paused)
   const now = performance.now();
-  let feedY = boardY + boardH + 10;
   for (let i = eventFeed.length - 1; i >= 0; i--) {
-    const ev = eventFeed[i];
-    const age = (now - ev.time) / 1000;
-    if (age > 6) {
-      eventFeed.splice(i, 1);
-      continue;
-    }
+    if ((now - eventFeed[i].time) / 1000 > 6) eventFeed.splice(i, 1);
   }
-  for (let i = 0; i < eventFeed.length; i++) {
-    const ev = eventFeed[i];
+  if (serverPaused) return;
+  let feedY = y + h + HUD.gap;
+  for (const ev of eventFeed) {
     const age = (now - ev.time) / 1000;
-    const alpha = age > 4.5 ? 1 - (age - 4.5) / 1.5 : 1;
-
     ctx.save();
-    ctx.globalAlpha = Math.max(0, alpha);
-    ctx.fillStyle = 'rgba(12, 14, 22, 0.72)';
-    ctx.fillRect(boardX, feedY, boardW, 22);
+    ctx.globalAlpha = Math.max(0, age > 4.5 ? 1 - (age - 4.5) / 1.5 : 1);
+    hudPanel(x, feedY, w, 30);
+    hudRoundRect(x + 8, feedY + 9, 3, 12, 1.5);
     ctx.fillStyle = ev.color;
-    ctx.fillRect(boardX, feedY, 3, 22);
-    ctx.font = 'bold 10px monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(ev.text.slice(0, 28), boardX + 8, feedY + 11);
+    ctx.fill();
+    hudText(ev.text, x + 18, feedY + 19, { size: 12, weight: 600, maxWidth: w - 26 });
     ctx.restore();
-    feedY += 25;
+    feedY += 30 + 6;
   }
 }
 
@@ -3614,7 +3915,7 @@ function drawMobileControls() {
     ctx.fill();
 
     ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-    ctx.font = '10px sans-serif';
+    ctx.font = font(10, 700);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('MOVE', joyBaseX, joyBaseY);
@@ -3632,7 +3933,7 @@ function drawMobileControls() {
   ctx.lineWidth = 2;
   ctx.stroke();
   ctx.fillStyle = '#fff';
-  ctx.font = 'bold 11px sans-serif';
+  ctx.font = font(11, 700);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText('⚔ KATANA', meleeX, meleeY);
@@ -3649,51 +3950,74 @@ function drawMobileControls() {
   ctx.lineWidth = 1.5;
   ctx.stroke();
   ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-  ctx.font = 'bold 10px sans-serif';
+  ctx.font = font(10, 700);
   ctx.fillText('WEAPON', weapX, weapY - 5);
-  ctx.font = '9px sans-serif';
+  ctx.font = font(10, 600);
   ctx.fillText('▶▶', weapX, weapY + 9);
 }
 
+// Death recap: who downed you and the last hits, shown while downed and on game over.
 const deathRecap = document.createElement('section');
 deathRecap.id = 'deathRecap';
-deathRecap.style.cssText = 'background:rgba(24,12,16,.96);border:1px solid #a94442;border-radius:10px;padding:16px;color:#eee;font:13px monospace;width:min(440px,90vw);box-sizing:border-box;max-height:32vh;overflow:auto;';
+deathRecap.className = 'recap';
 let recapKey = '';
+let recapShowAll = false;
+const RECAP_ROWS = 3;
 function updateDeathRecap() {
   const player = players[myId];
   const visible = player && player.health <= 0 && (currentScreen === 'playing' || currentScreen === 'gameover');
   deathRecap.hidden = !visible;
-  if (!visible) { recapKey = ''; return; }
+  if (!visible) { recapKey = ''; recapShowAll = false; return; }
+  if (armoryOpen) toggleArmory(false);
   const over = currentScreen === 'gameover';
-  const parent = over ? gameOverOverlay.querySelector('.menu-panel')! : document.body;
-  if (deathRecap.parentElement !== parent) {
-    if (over) parent.insertBefore(deathRecap, parent.lastElementChild);
-    else parent.appendChild(deathRecap);
-  }
-  deathRecap.style.width = over ? '100%' : 'min(440px,90vw)';
-  deathRecap.style.position = over ? 'static' : 'fixed';
-  deathRecap.style.left = over ? '' : '50%';
-  deathRecap.style.top = over ? '' : '20px';
-  deathRecap.style.transform = over ? '' : 'translateX(-50%)';
-  deathRecap.style.zIndex = '20';
+  const parent = over ? document.getElementById('gameOverDetails')! : document.body;
+  if (deathRecap.parentElement !== parent) parent.appendChild(deathRecap);
+  deathRecap.classList.toggle('recap--floating', !over);
   const hits = player.damageLog || [];
-  const key = JSON.stringify(hits);
+  const key = `${over}|${JSON.stringify(hits)}|${recapShowAll}`;
   if (key === recapKey) return;
   recapKey = key;
-  deathRecap.replaceChildren();
-  const title = document.createElement('strong');
+
+  const name = (type: string) => type.charAt(0).toUpperCase() + type.slice(1);
   const last = hits[hits.length - 1];
-  const label = (type: string) => type.charAt(0).toUpperCase() + type.slice(1);
-  title.textContent = last ? `DOWNED BY ${label(last.source).toUpperCase()} — melee` : 'DEATH BREAKDOWN';
-  deathRecap.append(title);
-  const summary = document.createElement('p');
-  summary.textContent = last ? 'Recent hits (up to 15 seconds before death). Distances are server-side pixels.' : 'No damage history recorded for this life.';
-  deathRecap.append(summary);
-  for (const hit of [...hits].reverse()) {
-    const row = document.createElement('div');
-    row.style.cssText = 'padding:5px 0;border-top:1px solid #ffffff20';
-    row.textContent = `${last ? (last.time - hit.time).toFixed(1) : '0.0'}s before · ${label(hit.source)} · ${hit.damage} damage · ${Math.round(hit.distance)}px · ${Math.round(hit.healthAfter)} HP left`;
-    deathRecap.append(row);
+  const title = document.createElement('p');
+  title.className = 'recap-title';
+  if (last) {
+    title.append(over ? 'Killed by ' : 'Downed by ');
+    const killer = document.createElement('b');
+    killer.textContent = name(last.source);
+    title.append(killer, ' (melee)');
+  } else {
+    title.textContent = over ? 'Killed' : 'Downed';
+  }
+  deathRecap.replaceChildren(title);
+  if (!last) return;
+
+  const table = document.createElement('table');
+  table.className = 'recap-table';
+  const head = table.createTHead().insertRow();
+  for (const label of ['Time', 'Enemy', 'Damage', 'HP left']) {
+    const th = document.createElement('th');
+    th.textContent = label;
+    head.append(th);
+  }
+  const body = table.createTBody();
+  const rows = [...hits].reverse();
+  for (const hit of recapShowAll ? rows : rows.slice(0, RECAP_ROWS)) {
+    const tr = body.insertRow();
+    const time = tr.insertCell();
+    time.textContent = hit === last ? 'Final hit' : `${(last.time - hit.time).toFixed(1)}s before`;
+    for (const text of [name(hit.source), `${hit.damage}`, `${Math.max(0, Math.round(hit.healthAfter))}`]) tr.insertCell().textContent = text;
+  }
+  deathRecap.append(table);
+  if (rows.length > RECAP_ROWS) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'link recap-more';
+    more.setAttribute('aria-expanded', String(recapShowAll));
+    more.append(recapShowAll ? 'Show fewer' : `Show all ${rows.length} hits`, svgIcon('i-chevron'));
+    more.addEventListener('click', () => { recapShowAll = !recapShowAll; recapKey = ''; updateDeathRecap(); });
+    deathRecap.append(more);
   }
 }
 
@@ -3746,20 +4070,22 @@ function draw() {
       drawVisualEffects(dt);
       drawScreenVignettes(dt);
 
+      drawHudBackdrop();
       if (!isMobile) drawMinimap(state);
       drawHUD(state);
       drawWaveHeader(state);
       drawComboHUD(state);
       drawScoreboardAndFeed(state);
       if (!isMobile) drawWeaponAndTacticalBar(state);
+      drawTeammateMarkers(state);
       drawWaveBanner(dt);
       drawMobileControls();
     } else {
-      ctx.fillStyle = '#fff';
-      ctx.font = '24px sans-serif';
+      ctx.fillStyle = theme.textSecondary;
+      ctx.font = font(18, 600);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText('Deploying to Arena...', canvas.width / 2, canvas.height / 2);
+      ctx.fillText(`Joining ${currentRoomName}…`, canvas.width / 2, canvas.height / 2);
     }
   }
 

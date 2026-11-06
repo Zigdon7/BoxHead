@@ -828,9 +828,13 @@ describe('static client', () => {
     const res = await fetch(base + '/');
     assert.equal(res.status, 200);
     const html = await res.text();
-    for (const id of ['menuHome', 'playBtn', 'signInBtn', 'menuBrowser', 'verifiedRoomList', 'openRoomList',
-      'deployBtn', 'menuSignIn', 'homeFriendsList', 'createRoomBtn']) {
+    for (const id of ['menuHome', 'playBtn', 'signInBtn', 'menuBrowser', 'roomList', 'lobbyWaveSelect',
+      'hostToggleBtn', 'deployBtn', 'menuSignIn', 'homeFriendsList', 'createRoomBtn', 'gameOverDetails']) {
       assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
+    }
+    // One lobby list, filtered by who can join.
+    for (const filter of ['all', 'verified', 'open']) {
+      assert.ok(html.includes(`data-lobby-filter="${filter}"`), `missing the ${filter} lobby filter`);
     }
   });
 });
