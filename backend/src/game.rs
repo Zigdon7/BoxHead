@@ -1829,6 +1829,14 @@ impl Game {
     pub fn is_game_over(&self) -> bool {
         self.game_over
     }
+
+    /// Test hook: drop every player to 0 health so the next update ends the round.
+    #[cfg(test)]
+    pub fn kill_all_players(&mut self) {
+        for player in self.players.values_mut() {
+            player.health = 0.0;
+        }
+    }
 }
 
 #[cfg(test)]

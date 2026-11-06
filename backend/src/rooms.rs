@@ -375,6 +375,11 @@ impl Room {
             frame.wave, frame.wave_kills, frame.wave_target, frame.wave_break_timer,
             &frame.ammo_availability, frame.game_over,
         );
+        // The delta that ends the round is the last one clients get, so it can't be
+        // lost like an ordinary delta. It is computed against the last *published*
+        // frame, so it still carries `gameOver` even if the frame where the round
+        // ended was skipped by the latest-wins hand-off.
+        let ends_round = delta.game_over == Some(true);
         let delta_str = serde_json::to_string(&delta).unwrap();
 
         let snapshot_ids: Vec<String> = {
@@ -412,8 +417,10 @@ impl Room {
                         break;
                     }
                 }
-            } else if !frame.was_finished && !frame.paused && tx.try_send(delta_str.clone()).is_err() {
-                dropped += 1;
+            } else if (!frame.was_finished || ends_round) && !frame.paused && tx.try_send(delta_str.clone()).is_err() {
+                // A full queue drops ordinary deltas; the round-ending one falls back
+                // to a snapshot (which carries gameOver), retried until it fits.
+                if ends_round { retry.push(id.clone()); } else { dropped += 1; }
             }
         }
         drop(clients);
@@ -850,6 +857,52 @@ mod tests {
         for rx in [&mut rx1, &mut rx2] {
             assert!(drain(rx).iter().any(|m| m["type"] == "snapshot"));
         }
+    }
+
+    #[tokio::test]
+    async fn round_end_reaches_clients_even_when_its_frame_is_skipped() {
+        let db = Database::open(":memory:").unwrap();
+        let room = Room::new("r".into(), "R".into(), false, false);
+        let mut rx = connect(&room, "p1").await;
+        room.tick(&db).await;
+        drain(&mut rx);
+
+        room.game.lock().await.kill_all_players();
+        let ending = room.sim_tick().await.unwrap();
+        assert!(ending.game_over && !ending.was_finished, "this frame ends the round");
+        // Under load the latest-wins hand-off skips that frame: the state provider
+        // only ever sees the next one, simulated after the round was already over.
+        let after = room.sim_tick().await.unwrap();
+        assert!(after.was_finished);
+        room.publish_frame(&after, &db).await;
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| m["gameOver"] == true), "client never learned the round ended: {msgs:?}");
+
+        // Once the client knows, the finished round stays quiet.
+        room.tick(&db).await;
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn round_end_is_resent_when_the_client_queue_was_full() {
+        let db = Database::open(":memory:").unwrap();
+        let room = Room::new("r".into(), "R".into(), false, false);
+        let mut rx = connect(&room, "p1").await;
+        room.tick(&db).await;
+        drain(&mut rx);
+
+        // A momentarily backed-up connection: the round-ending delta can't be queued.
+        let tx = room.clients.lock().await["p1"].clone();
+        while tx.try_send("backlog".into()).is_ok() {}
+        room.game.lock().await.kill_all_players();
+        room.tick(&db).await;
+
+        // The client works through its backlog; the round is over, so no deltas follow.
+        while rx.try_recv().is_ok() {}
+        room.tick(&db).await;
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| m["type"] == "snapshot" && m["gameOver"] == true),
+            "client must be resynced into the game-over state: {msgs:?}");
     }
 
     #[tokio::test]

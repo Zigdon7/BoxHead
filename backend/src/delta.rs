@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::*;
 
+/// The wave-break countdown is sent at 0.1 s resolution.
+fn round_break_timer(t: f64) -> f64 {
+    (t * 10.0).round() / 10.0
+}
+
 struct PrevState {
     players: HashMap<String, Player>,
     zombie_map: HashMap<String, Zombie>,
@@ -317,8 +322,12 @@ impl DeltaTracker {
         if wave != prev.wave { delta.wave = Some(wave); }
         if wave_kills != prev.wave_kills { delta.wave_kills = Some(wave_kills); }
         if wave_target != prev.wave_target { delta.wave_target = Some(wave_target); }
-        if (wave_break_timer - prev.wave_break_timer).abs() > 0.05 {
-            delta.wave_break_timer = Some((wave_break_timer * 10.0).round() / 10.0);
+        // Compare with the value clients were last sent (stored rounded), not the previous
+        // frame: at 60 Hz the timer moves ~0.017 a frame, so a frame-to-frame threshold
+        // never fired and clients froze on "next wave in 8s" through the next wave.
+        let break_timer = round_break_timer(wave_break_timer);
+        if break_timer != prev.wave_break_timer {
+            delta.wave_break_timer = Some(break_timer);
         }
 
         // Ammo
@@ -374,7 +383,7 @@ impl DeltaTracker {
             wave,
             wave_kills,
             wave_target,
-            wave_break_timer: (wave_break_timer * 10.0).round() / 10.0,
+            wave_break_timer: round_break_timer(wave_break_timer),
             ammo_pickups: ammo_availability.iter().map(|(id, avail)| {
                 AmmoPickupState { id: id.clone(), available: *avail }
             }).collect(),
@@ -415,7 +424,7 @@ impl DeltaTracker {
             wave,
             wave_kills,
             wave_target,
-            wave_break_timer,
+            wave_break_timer: round_break_timer(wave_break_timer),
             ammo_availability: ammo_availability.clone(),
             game_over,
         });
@@ -425,6 +434,26 @@ impl DeltaTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_break_countdown_reaches_clients() {
+        let mut tracker = DeltaTracker::new();
+        let mut timer: f64 = 0.0;
+        let mut client: f64 = 0.0;
+        let mut sent = 0;
+        // The wave clears on frame 10: an 8 s break counts down at 60 Hz, then ends.
+        for frame in 0..(8 * 60 + 40) {
+            if frame == 10 { timer = 8.0; } else if timer > 0.0 { timer = (timer - 1.0 / 60.0).max(0.0); }
+            let delta = tracker.compute_delta(
+                &HashMap::new(), &[], &[], &[], &[],
+                1, 0, 10, timer, &HashMap::new(), false,
+            );
+            if let Some(t) = delta.wave_break_timer { client = t; sent += 1; }
+            assert!((client - timer).abs() <= 0.051, "frame {frame}: client shows {client}, server has {timer}");
+        }
+        assert_eq!(client, 0.0, "the end of the break must reach clients");
+        assert!(sent <= 90, "about ten updates a second, not one per frame (sent {sent})");
+    }
 
     #[test]
     fn slow_diagonal_brutes_stay_in_sync() {
