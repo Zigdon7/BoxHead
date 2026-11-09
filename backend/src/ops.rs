@@ -95,10 +95,6 @@ async fn status(State(state): State<Arc<OpsState>>, headers: HeaderMap) -> Respo
     })).into_response()
 }
 
-fn starting_wave(body: &Option<Json<serde_json::Value>>) -> u32 {
-    body.as_ref().and_then(|b| b["startingWave"].as_u64()).map(|w| w.clamp(1, 999) as u32).unwrap_or(1)
-}
-
 async fn restart_room(
     State(state): State<Arc<OpsState>>,
     Path(id): Path<String>,
@@ -109,10 +105,10 @@ async fn restart_room(
     let Some(room) = state.rooms.get(&id).await else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "ok": false, "error": "Room not found" }))).into_response();
     };
-    // Operators may pick any wave; the player unlock check does not apply.
-    let wave = starting_wave(&body);
-    room.restart(wave, wave).await;
-    Json(serde_json::json!({ "ok": true, "roomId": id, "startingWave": wave })).into_response()
+    // Clears and restocks the world; players keep their raids.
+    let _ = body;
+    room.restart().await;
+    Json(serde_json::json!({ "ok": true, "roomId": id })).into_response()
 }
 
 async fn restart_all(
@@ -121,10 +117,10 @@ async fn restart_all(
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     if let Err(denied) = authorized(&state, &headers) { return denied; }
-    let wave = starting_wave(&body);
+    let _ = body;
     let rooms = state.rooms.all().await;
-    for room in &rooms { room.restart(wave, wave).await; }
-    Json(serde_json::json!({ "ok": true, "restarted": rooms.len(), "startingWave": wave })).into_response()
+    for room in &rooms { room.restart().await; }
+    Json(serde_json::json!({ "ok": true, "restarted": rooms.len() })).into_response()
 }
 
 #[cfg(test)]
@@ -139,13 +135,5 @@ mod tests {
         assert!(!token_matches("s3cret", "S3CRET"));
         assert!(!token_matches("s3cret", ""));
         assert!(!token_matches("", ""), "an empty configured token never authorizes");
-    }
-
-    #[test]
-    fn starting_wave_is_clamped() {
-        assert_eq!(starting_wave(&None), 1);
-        assert_eq!(starting_wave(&Some(Json(serde_json::json!({ "startingWave": 7 })))), 7);
-        assert_eq!(starting_wave(&Some(Json(serde_json::json!({ "startingWave": 0 })))), 1);
-        assert_eq!(starting_wave(&Some(Json(serde_json::json!({ "startingWave": 5000 })))), 999);
     }
 }

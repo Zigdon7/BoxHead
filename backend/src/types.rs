@@ -19,7 +19,7 @@ pub enum Weapon {
 impl Weapon {
     pub fn damage(&self) -> f64 {
         match self {
-            Weapon::Pistol => 25.0,
+            Weapon::Pistol => 18.0,
             Weapon::Uzi => 15.0,
             Weapon::Shotgun => 80.0,
             Weapon::RocketLauncher => 150.0,
@@ -34,34 +34,6 @@ impl Weapon {
             Weapon::RocketLauncher => crate::map::ROCKET_COOLDOWN,
         }
     }
-
-    pub fn knockback(&self) -> f64 {
-        match self {
-            Weapon::Pistol => 10.0,
-            Weapon::Uzi => 5.0,
-            Weapon::Shotgun => 16.0,
-            Weapon::RocketLauncher => 55.0,
-        }
-    }
-
-    pub fn slot(&self) -> usize {
-        match self {
-            Weapon::Pistol => 0,
-            Weapon::Uzi => 1,
-            Weapon::Shotgun => 2,
-            Weapon::RocketLauncher => 3,
-        }
-    }
-
-    pub fn from_slot(slot: usize) -> Option<Weapon> {
-        match slot {
-            0 => Some(Weapon::Pistol),
-            1 => Some(Weapon::Uzi),
-            2 => Some(Weapon::Shotgun),
-            3 => Some(Weapon::RocketLauncher),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -69,8 +41,9 @@ impl Weapon {
 pub enum DropType {
     Ammo,
     Health,
-    Weapon,
     Tactical,
+    /// Gear or a valuable: goes in your backpack and is kept only if you extract.
+    Loot,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -112,6 +85,8 @@ pub enum ZombieType {
     Crawler,
     Brute,
     Vampire,
+    /// Boss sent after players who camp in one place. Never spawns at random.
+    Abomination,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -125,6 +100,16 @@ pub struct DamageHit {
     pub time: f64,
 }
 
+/// A gun carried into the raid: its kind and how hard it hits.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RaidWeapon {
+    pub kind: Weapon,
+    pub power: u32,
+    pub rarity: crate::gear::Rarity,
+    pub name: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Player {
@@ -132,29 +117,38 @@ pub struct Player {
     pub name: String,
     pub pos: Vector2,
     pub angle: f64,
-    pub score: f64,
-    pub credits: f64,
     pub health: f64,
-    #[serde(rename = "maxHealth")]
     pub max_health: f64,
     pub ammo: f64,
-    #[serde(rename = "maxAmmo")]
     pub max_ammo: f64,
+    /// The gun in hand.
     pub weapon: Weapon,
-    #[serde(rename = "weaponSlots")]
-    pub weapon_slots: [bool; 4],
+    /// Up to two guns (primary, secondary); `active_slot` indexes into this.
+    pub weapons: Vec<RaidWeapon>,
+    pub active_slot: u32,
     pub combo: u32,
-    #[serde(rename = "comboTimer")]
     pub combo_timer: f64,
-    #[serde(rename = "maxCombo")]
     pub max_combo: u32,
     pub kills: u32,
-    #[serde(rename = "tacticalItems")]
     pub tactical_items: [u32; 3],
-    #[serde(rename = "damageLevel")]
-    pub damage_level: u32,
-    #[serde(rename = "meleeLevel")]
-    pub melee_level: u32,
+    /// Cash earned from kills this raid; banked only on extraction.
+    pub bounty: f64,
+    /// Loot picked up this raid; kept only on extraction.
+    pub backpack: Vec<crate::gear::Item>,
+    pub backpack_capacity: u32,
+    pub gear_score: u32,
+    /// Seconds left before the raid ends and you are lost (missing in action).
+    pub raid_time: f64,
+    /// 0..EXTRACT_TIME while standing in an extraction zone.
+    pub extract_progress: f64,
+    /// Seconds until a downed player dies (0 while standing).
+    pub bleedout: f64,
+    /// Seconds spent camping in one spot; at CAMP_LIMIT an Abomination comes for you.
+    pub camp: f64,
+    /// An Abomination is hunting this player right now.
+    pub hunted: bool,
+    /// Seconds spent decrypting the first sealed item in the pack (0 when not at an uplink).
+    pub decrypt: f64,
     #[serde(default)]
     pub damage_log: Vec<DamageHit>,
 }
@@ -170,6 +164,12 @@ pub struct Zombie {
     #[serde(rename = "maxHealth")]
     pub max_health: f64,
     pub speed: f64,
+    /// Elites are bigger and tougher and drop better loot.
+    #[serde(default)]
+    pub elite: bool,
+    /// Set on hunters sent after a camper: the player they're hunting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -218,8 +218,15 @@ pub struct ClientInput {
     pub dash: bool,
     #[serde(default, rename = "placeItem")]
     pub place_item: u8,
-    #[serde(default, rename = "buyUpgrade")]
-    pub buy_upgrade: u8,
+    /// Drop the last item picked up.
+    #[serde(default, rename = "dropItem")]
+    pub drop_item: bool,
+    /// Drop this backpack item (from the inventory screen).
+    #[serde(default, rename = "dropId", skip_serializing_if = "Option::is_none")]
+    pub drop_id: Option<String>,
+    /// Server-side: this input has already been applied once (one-shot actions are spent).
+    #[serde(skip)]
+    pub consumed: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -229,9 +236,21 @@ pub struct DropPickup {
     #[serde(rename = "type")]
     pub drop_type: DropType,
     pub pos: Vector2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<crate::gear::Item>,
 }
 
 // --- Network messages ---
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MapInfo {
+    pub id: String,
+    pub name: String,
+    pub tier: u32,
+    pub min_gear_score: u32,
+    pub raid_secs: f64,
+}
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -239,16 +258,15 @@ pub struct InitPayload {
     #[serde(rename = "type")]
     pub msg_type: String, // "init"
     pub id: String,
+    pub map: MapInfo,
     pub walls: Vec<crate::map::Wall>,
-    #[serde(rename = "mapWidth")]
     pub map_width: f64,
-    #[serde(rename = "mapHeight")]
     pub map_height: f64,
-    #[serde(rename = "ammoSpawnPoints")]
     pub ammo_spawn_points: Vec<AmmoSpawnPoint>,
-    #[serde(rename = "gameOver")]
-    pub game_over: bool,
-    pub wave: u32,
+    pub extracts: Vec<crate::map::ExtractPoint>,
+    pub crates: Vec<crate::map::Point>,
+    pub nests: Vec<crate::map::Point>,
+    pub uplinks: Vec<crate::map::ExtractPoint>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -261,21 +279,13 @@ pub struct SnapshotState {
     pub zombies: Vec<Zombie>,
     pub bullets: Vec<Bullet>,
     pub placeables: Vec<Placeable>,
-    pub wave: u32,
-    #[serde(rename = "waveKills")]
-    pub wave_kills: u32,
-    #[serde(rename = "waveTarget")]
-    pub wave_target: u32,
-    #[serde(rename = "waveBreakTimer")]
-    pub wave_break_timer: f64,
-    #[serde(rename = "ammoPickups")]
     pub ammo_pickups: Vec<AmmoPickupState>,
+    /// Which supply crates are stocked (`crate_N` ids, in init order).
+    pub crates: Vec<AmmoPickupState>,
     pub drops: Vec<DropPickup>,
-    #[serde(rename = "gameOver")]
-    pub game_over: bool,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerDelta {
     pub id: String,
@@ -286,45 +296,50 @@ pub struct PlayerDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub angle: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credits: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "maxHealth")]
     pub max_health: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ammo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "maxAmmo")]
     pub max_ammo: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weapon: Option<Weapon>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "weaponSlots")]
-    pub weapon_slots: Option<[bool; 4]>,
+    pub weapons: Option<Vec<RaidWeapon>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_slot: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub combo: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "comboTimer")]
     pub combo_timer: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "maxCombo")]
     pub max_combo: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kills: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "tacticalItems")]
     pub tactical_items: Option<[u32; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "damageLevel")]
-    pub damage_level: Option<u32>,
+    pub bounty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "meleeLevel")]
-    pub melee_level: Option<u32>,
+    pub backpack: Option<Vec<crate::gear::Item>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "damageLog")]
+    pub backpack_capacity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gear_score: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raid_time: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extract_progress: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bleedout: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camp: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hunted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decrypt: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub damage_log: Option<Vec<DamageHit>>,
 }
 
@@ -337,7 +352,7 @@ pub struct ZombieDelta {
     pub health: Option<f64>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DeltaState {
     #[serde(rename = "type")]
@@ -379,22 +394,10 @@ pub struct DeltaState {
     #[serde(rename = "dropsRemoved")]
     pub drops_removed: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wave: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "waveKills")]
-    pub wave_kills: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "waveTarget")]
-    pub wave_target: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "waveBreakTimer")]
-    pub wave_break_timer: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "ammoPickups")]
     pub ammo_pickups: Option<Vec<AmmoPickupState>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "gameOver")]
-    pub game_over: Option<bool>,
+    pub crates: Option<Vec<AmmoPickupState>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -404,11 +407,48 @@ pub struct ClientMessage {
     pub input: Option<ClientInput>,
     pub name: Option<String>,
     pub token: Option<String>,
-    #[serde(rename = "profileId")]
-    pub profile_id: Option<String>,
-    #[serde(rename = "startingWave")]
-    pub starting_wave: Option<u32>,
     pub paused: Option<bool>,
     #[serde(rename = "roomId")]
     pub room_id: Option<String>,
+    /// Insure the loadout for this raid (join only).
+    pub insure: Option<bool>,
+}
+
+// --- Raid results ---
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RaidResult {
+    /// Reached an extraction point: loot, bounty and loadout are kept.
+    Extracted,
+    /// Downed and not revived: the loadout and everything carried are lost.
+    Killed,
+    /// The raid timer ran out: lost like a death.
+    MissingInAction,
+    /// Left or disconnected mid-raid: lost like a death.
+    Abandoned,
+}
+
+impl RaidResult {
+    pub fn kept_gear(&self) -> bool { *self == RaidResult::Extracted }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RaidOutcome {
+    pub player_id: String,
+    pub name: String,
+    pub result: RaidResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extract_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub killed_by: Option<ZombieType>,
+    pub loot: Vec<crate::gear::Item>,
+    /// What a lost raid cost: the loadout and everything in the pack.
+    /// (`bounty` is what was earned; it's banked only on extraction.)
+    pub lost: Vec<crate::gear::Item>,
+    pub bounty: u32,
+    pub kills: u32,
+    pub max_combo: u32,
+    pub survived_secs: f64,
 }

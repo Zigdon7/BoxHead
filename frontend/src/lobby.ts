@@ -1,41 +1,51 @@
 // Pure lobby / friends presentation logic, kept DOM-free so it can be unit tested.
 
+export interface RoomMap { id: string; name: string; tier: number; minGearScore: number; threat: string; entryFee?: number }
+
+/** A matchmaking pool: players only meet others in the same one. */
+export interface PoolInfo { id: 'steam' | 'bluesky' | 'direct' | 'cross'; label: string }
+
 export interface RoomInfo {
-  id: string; name: string; verifiedOnly: boolean; permanent: boolean;
-  players: number; wave: number; gameOver: boolean; paused: boolean; canJoin: boolean;
+  id: string; name: string; pool: PoolInfo; permanent: boolean;
+  players: number; paused: boolean; canJoin: boolean; map: RoomMap;
 }
+
+/** How the signed-in session matchmakes: its sign-in platform, and whether cross-play is on. */
+export interface Matchmaking { platform: PoolInfo; crossplay: boolean; pool: PoolInfo }
 
 export interface Friend { handle: string; display_name: string; user_id: string; online: boolean; }
 
-export const OPEN_ROOM_ID = 'open';
+/** The always-on raid on the first map, in the player's own pool: where a join without a choice lands. */
+export const OPEN_ROOM_ID = 'outskirts';
 
-/** Split the server's room list into the browser's two sections. */
-export function partitionRooms(rooms: RoomInfo[]): { verified: RoomInfo[]; open: RoomInfo[] } {
-  return {
-    verified: rooms.filter(r => r.verifiedOnly),
-    open: rooms.filter(r => !r.verifiedOnly),
-  };
+/** Keep the remembered selection only while it still exists and is joinable;
+ *  otherwise fall back to the public raid on the same map (or the first map). */
+export function resolveSelectedRoom(rooms: RoomInfo[], selectedId: string, mapId?: string): string {
+  if (rooms.length === 0) return selectedId;
+  const pick = rooms.find(r => r.id === selectedId && r.canJoin && (!mapId || r.map.id === mapId));
+  if (pick) return pick.id;
+  return rooms.find(r => r.permanent && r.canJoin && r.map.id === mapId)?.id ?? OPEN_ROOM_ID;
 }
 
-/** Keep the remembered selection only while it still exists and is joinable. */
-export function resolveSelectedRoom(rooms: RoomInfo[], selectedId: string): string {
-  if (rooms.length === 0) return selectedId;
-  return rooms.some(r => r.id === selectedId && r.canJoin) ? selectedId : OPEN_ROOM_ID;
+/** Lobbies for one map. */
+export function roomsForMap(rooms: RoomInfo[], mapId: string): RoomInfo[] {
+  return rooms.filter(r => r.map.id === mapId);
 }
 
 /** Lobby status line. Official (server-run) lobbies get a badge in the UI instead of text. */
 export function roomStatusText(room: RoomInfo): string {
-  if (room.players === 0) return 'Waiting for players';
-  if (room.gameOver) return 'Overrun · waiting for a restart';
-  if (room.paused) return `Paused · Wave ${room.wave}`;
-  return `In progress · Wave ${room.wave}`;
+  if (room.players === 0) return 'Empty · you deploy alone';
+  if (room.paused) return 'Paused by the host';
+  return `Raid in progress · ${room.players} ${room.players === 1 ? 'player' : 'players'} inside`;
 }
 
-export function verifyStatusText(verified: boolean, clientThinksSignedIn: boolean): string {
-  if (verified) return 'Verified account. You can join every lobby.';
-  return clientThinksSignedIn
-    ? 'Your session has expired. Sign in again to join verified lobbies.'
-    : 'Playing as a guest. Sign in to join verified lobbies.';
+/** One line under the cross-platform switch: who you'll meet. */
+export function matchmakingText(mm: Matchmaking | null): string {
+  if (!mm) return 'Sign in to see who you can play with.';
+  if (mm.crossplay) return 'On: you meet players from Steam, Bluesky, email and Google who also turned it on.';
+  return mm.platform.id === 'direct'
+    ? 'Off: you only meet players who signed in with email or Google.'
+    : `Off: you only meet players who signed in with ${mm.platform.label}.`;
 }
 
 /** Online friends first, then alphabetical by handle. */

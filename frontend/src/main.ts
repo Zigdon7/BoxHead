@@ -1,8 +1,21 @@
-import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite } from './sprites';
+import '@fontsource/barlow/400.css';
+import '@fontsource/barlow/600.css';
+import '@fontsource/barlow-condensed/600.css';
+import '@fontsource/barlow-condensed/700.css';
+import '@fontsource/barlow-condensed/800.css';
+import '@fontsource/share-tech-mono/400.css';
+import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite, drawNestSprite, drawCrateSprite, drawExtractZone } from './sprites';
+import { HideoutView, keyStat } from './hideout';
+import {
+  Hideout, MapSummary, RARITY_COLOR, RARITY_LABEL, KIND_LABEL, KIND_ICON, EXTRACT_TIME, CAMP_LIMIT, CAMP_WARNING,
+  weaponDamageMult, formatClock, formatDistance, nearest, compass, threatLevel, raidTitle, swapCandidate, backpackValue, enemyName, itemEffect,
+  deployRiskText, campWarningText, itemsValue, DECRYPT_SECS, isEncrypted, estimatedValue,
+} from './raid';
+import { COMBO_MAX_MULT } from './constants';
 import { theme, withAlpha, font } from './theme';
 import {
-  RoomInfo, Friend, OPEN_ROOM_ID, partitionRooms, resolveSelectedRoom, roomStatusText,
-  verifyStatusText, sortFriends, friendsSummary, defaultCallsign, accountLabel,
+  RoomInfo, Friend, Matchmaking, OPEN_ROOM_ID, resolveSelectedRoom, roomStatusText,
+  matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel, roomsForMap,
 } from './lobby';
 import {
   Player,
@@ -15,12 +28,14 @@ import {
   InitPayload,
   DropPickup,
   Placeable,
+  Item,
+  ExtractPoint,
+  Point,
+  MapInfo,
+  RaidEnd,
 } from './generated/types';
 import {
   WEAPON_STATS,
-  MAP_WIDTH,
-  MAP_HEIGHT,
-  TUNNEL_WIDTH,
   PLAYER_SPEED,
   PLAYER_RADIUS,
   DASH_SPEED_MULT,
@@ -28,7 +43,6 @@ import {
   DASH_MAX_CHARGES,
   DASH_RECHARGE_TIME,
   COMBO_DURATION,
-  WAVE_BREAK_DURATION,
   MELEE_COOLDOWN,
   MELEE_RANGE,
 } from './constants';
@@ -39,15 +53,10 @@ interface GameState {
   zombies: Zombie[];
   bullets: Bullet[];
   placeables: Placeable[];
-  wave: number;
-  waveKills: number;
-  waveTarget: number;
-  waveBreakTimer: number;
   walls: Wall[];
   ammoPickups: { id: string; pos: { x: number; y: number }; amount: number; respawnAt: number }[];
   mapWidth: number;
   mapHeight: number;
-  gameOver: boolean;
   drops: DropPickup[];
 }
 
@@ -132,9 +141,9 @@ let waveBannerText = '';
 let waveBannerSub = '';
 let waveBannerColor = theme.accent;
 let waveBannerTimer = 0;
-let armoryOpen = false;
+let mapOpen = false;
 let hotbarMeleeBtnRect = { x: 0, y: 0, w: 0, h: 0 };
-let hotbarArmoryBtnRect = { x: 0, y: 0, w: 0, h: 0 };
+let hotbarMapBtnRect = { x: 0, y: 0, w: 0, h: 0 };
 let hotbarDashBtnRect = { x: 0, y: 0, w: 0, h: 0 };
 let hotbarWeaponRects: { slot: number; x: number; y: number; w: number; h: number }[] = [];
 let hotbarTacticalRects: { item: number; x: number; y: number; w: number; h: number }[] = [];
@@ -145,7 +154,7 @@ function addScreenShake(intensity: number) {
 
 function pushFeedEvent(text: string, color = theme.textSecondary) {
   eventFeed.unshift({ text, color, time: performance.now() });
-  if (eventFeed.length > 6) eventFeed.pop();
+  if (eventFeed.length > 4) eventFeed.pop();
 }
 
 function spawnFloatingText(x: number, y: number, text: string, color = theme.text, size = 14) {
@@ -248,7 +257,7 @@ const addFriendEl = document.getElementById('addFriendInputEl') as HTMLInputElem
 
 const mainMenuOverlay = document.getElementById('mainMenuOverlay')!;
 const friendsOverlay = document.getElementById('friendsOverlay')!;
-const gameOverOverlay = document.getElementById('gameOverOverlay')!;
+const resultsOverlay = document.getElementById('resultsOverlay')!;
 
 const emailLoginBtn = document.getElementById('emailLoginBtn')!;
 const emailRegisterBtn = document.getElementById('emailRegisterBtn')!;
@@ -256,11 +265,11 @@ const bskyLoginBtn = document.getElementById('bskyLoginBtn')!;
 const googleLoginBtn = document.getElementById('googleLoginBtn')!;
 const logoutBtn = document.getElementById('logoutBtn')!;
 const playBtn = document.getElementById('playBtn')!;
-const playAgainBtn = document.getElementById('playAgainBtn')!;
+const playAgainBtn = document.getElementById('resultsDeployBtn')!;
 const friendsBtn = document.getElementById('friendsBtn')!;
 const closeFriendsBtn = document.getElementById('closeFriendsBtn')!;
 const addFriendBtn = document.getElementById('addFriendBtn')!;
-const backToMenuBtn = document.getElementById('backToMenuBtn')!;
+const backToMenuBtn = document.getElementById('resultsHideoutBtn')!;
 
 const signInBtn = document.getElementById('signInBtn')!;
 const authSectionIn = document.getElementById('authSectionIn')!;
@@ -272,11 +281,6 @@ const homeFriendsList = document.getElementById('homeFriendsList')!;
 const homeFriendsSummary = document.getElementById('homeFriendsSummary')!;
 const addFriendErrorMsg = document.getElementById('addFriendErrorMsg')!;
 
-const gameOverWave = document.getElementById('gameOverWave')!;
-const gameOverScore = document.getElementById('gameOverScore')!;
-const gameOverKills = document.getElementById('gameOverKills')!;
-const gameOverCombo = document.getElementById('gameOverCombo')!;
-
 function resizeCanvas() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
@@ -285,27 +289,27 @@ resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
 // --- Servers (rooms) ---
-// Every lobby is hosted by the game server. Signed-in (verified) accounts can
-// join any lobby; guests can only join open lobbies. The server enforces this
-// on join — the UI just reflects what the server reports.
+// Every lobby is hosted by the game server. Players are matched by the platform
+// they signed in with (Steam, Bluesky, or email/Google) unless they turn on
+// cross-platform play. The server only lists, and only admits, the player's own
+// pool; the UI just reflects what it reports.
 let rooms: RoomInfo[] = [];
-let accountVerified = false;
+let matchmaking: Matchmaking | null = null;
 let selectedRoomId = localStorage.getItem('boxhead_room') || OPEN_ROOM_ID;
+/** The map chosen on the deploy screen; the lobby list shows only its raids. */
+let deployMapId = localStorage.getItem('boxhead_map') || 'outskirts';
 let currentRoomId = selectedRoomId;
 let currentRoomName = 'Arena';
 const roomListEl = document.getElementById('roomList')!;
 roomListEl.addEventListener('scroll', () => updateRoomListFade(roomListEl), { passive: true });
-type LobbyFilter = 'all' | 'verified' | 'open';
-let lobbyFilter: LobbyFilter = 'all';
 const deployBtn = document.getElementById('deployBtn') as HTMLButtonElement;
 const deployLabel = document.getElementById('deployLabel')!;
-const lobbyWaveSelect = document.querySelector('#menuBrowser [data-wave-select]') as HTMLSelectElement;
-const lobbyWaveHint = document.getElementById('lobbyWaveHint')!;
-const verifyStatusEl = document.getElementById('verifyStatus')!;
+const mapListEl = document.getElementById('mapList')!;
+const crossplayToggle = document.getElementById('crossplayToggle') as HTMLInputElement;
+const crossplayStatus = document.getElementById('crossplayStatus')!;
+const poolLabelEl = document.getElementById('poolLabel')!;
 const roomErrorMsg = document.getElementById('roomErrorMsg')!;
 const roomNameInput = document.getElementById('roomNameInput') as HTMLInputElement;
-const roomVerifiedOnly = document.getElementById('roomVerifiedOnly') as HTMLInputElement;
-const roomVerifiedLabel = document.getElementById('roomVerifiedLabel')!;
 
 function selectRoom(id: string) {
   selectedRoomId = id;
@@ -318,7 +322,7 @@ function renderRoomItem(room: RoomInfo): HTMLButtonElement {
   item.type = 'button';
   item.className = 'room-item' + (room.id === selectedRoomId ? ' selected' : '');
   item.disabled = !room.canJoin;
-  item.title = room.canJoin ? `Select ${room.name} (double-click to join)` : 'Sign in to join verified lobbies';
+  item.title = room.canJoin ? `Select ${room.name} (double-click to deploy)` : 'Sign in to join';
   const title = document.createElement('span');
   title.className = 'room-title';
   if (!room.canJoin) title.append(svgIcon('i-lock'));
@@ -326,10 +330,10 @@ function renderRoomItem(room: RoomInfo): HTMLButtonElement {
   name.className = 'room-name';
   name.textContent = room.name;
   title.append(name);
-  // Badges: who can join (a rule, not an endorsement), then Official for lobbies the server runs.
+  // Badges: who can join (the matchmaking pool), then Official for lobbies the server runs.
   const kind = document.createElement('span');
-  kind.className = 'badge';
-  kind.append(svgIcon(room.verifiedOnly ? 'i-shield-check' : 'i-globe'), room.verifiedOnly ? 'Verified only' : 'Public');
+  kind.className = 'badge badge--pool';
+  kind.append(svgIcon(room.pool.id === 'cross' ? 'i-globe' : 'i-users'), room.pool.label);
   title.append(kind);
   if (room.permanent) {
     const official = document.createElement('span');
@@ -338,12 +342,11 @@ function renderRoomItem(room: RoomInfo): HTMLButtonElement {
     official.append(svgIcon('i-star'), 'Official');
     title.append(official);
   }
-  // Status: a dot (green = match running, red = overrun) and one line of text.
+  // Status: a dot (filled = a raid is running, hollow = empty) and one line of text.
   const meta = document.createElement('span');
   meta.className = 'room-meta' + (room.players > 0 ? ' room-meta--live' : '');
   const dot = document.createElement('span');
-  // Filled white = a match is running, red = overrun, hollow = waiting.
-  dot.className = 'status-dot ' + (room.players > 0 ? (room.gameOver ? 'over' : 'live') : 'idle');
+  dot.className = 'status-dot ' + (room.players > 0 ? 'live' : 'idle');
   meta.append(dot, room.canJoin ? roomStatusText(room) : 'Sign in to join');
   const count = document.createElement('span');
   count.className = 'room-count';
@@ -372,38 +375,47 @@ function updateRoomListFade(container: HTMLElement) {
   container.classList.toggle('has-more', container.scrollTop + container.clientHeight < container.scrollHeight - 4);
 }
 
-function renderRooms() {
-  // Fall back to the open arena if the remembered lobby vanished or is locked.
-  selectedRoomId = resolveSelectedRoom(rooms, selectedRoomId);
-  verifyStatusEl.textContent = verifyStatusText(accountVerified, isLoggedIn);
-  verifyStatusEl.classList.toggle('ok', accountVerified);
-  roomVerifiedOnly.disabled = !accountVerified;
-  if (!accountVerified) roomVerifiedOnly.checked = false;
-  roomVerifiedLabel.classList.toggle('locked', !accountVerified);
-  roomVerifiedLabel.title = accountVerified ? 'Only verified accounts can join' : 'Sign in to host verified lobbies';
+/** Current gear score and map list, from the last hideout load. */
+function currentMap(): MapSummary | undefined { return hideoutView.state?.maps.find(m => m.id === deployMapId); }
 
-  const { verified, open } = partitionRooms(rooms);
-  // Lobbies with players first, so running matches are easy to find.
-  const shown = (lobbyFilter === 'verified' ? verified : lobbyFilter === 'open' ? open : [...verified, ...open]).slice().sort((a, b) => b.players - a.players);
-  renderRoomList(roomListEl, shown, lobbyFilter === 'all' ? 'No lobbies yet' : lobbyFilter === 'open' ? 'No public lobbies yet' : 'No verified lobbies yet');
-  document.querySelectorAll<HTMLButtonElement>('[data-lobby-filter]').forEach(btn => {
-    const filter = btn.dataset.lobbyFilter as LobbyFilter;
-    const count = filter === 'verified' ? verified.length : filter === 'open' ? open.length : rooms.length;
-    const countEl = document.createElement('span');
-    countEl.className = 'seg-count';
-    countEl.textContent = String(count);
-    btn.replaceChildren(filter === 'all' ? 'All' : filter === 'verified' ? 'Verified only' : 'Public', countEl);
-    btn.setAttribute('aria-pressed', String(filter === lobbyFilter));
+function renderRooms() {
+  hideoutView.renderMaps(mapListEl, deployMapId, (m) => {
+    deployMapId = m.id;
+    localStorage.setItem('boxhead_map', m.id);
+    selectedRoomId = resolveSelectedRoom(rooms, '', m.id);
+    renderRooms();
   });
+  const mapRooms = roomsForMap(rooms, deployMapId);
+  // Fall back to the public raid on this map if the remembered one vanished or is locked.
+  selectedRoomId = resolveSelectedRoom(rooms, selectedRoomId, deployMapId);
+  renderMatchmaking();
+
+  // Raids with players first, so running ones are easy to find.
+  const shown = mapRooms.slice().sort((a, b) => b.players - a.players);
+  renderRoomList(roomListEl, shown, 'No raids on this map yet');
   const selected = rooms.find(r => r.id === selectedRoomId);
-  // The starting wave only matters when you start a match, i.e. join an empty lobby.
-  const inProgress = !!selected && selected.players > 0;
-  // Joining a running match drops you in at its current wave, so the button says so.
-  deployLabel.textContent = !selected ? 'Join' : inProgress ? `Join ${selected.name} · Wave ${selected.wave}` : `Join ${selected.name}`;
-  lobbyWaveSelect.disabled = inProgress;
-  lobbyWaveHint.textContent = !selected ? 'Pick a lobby to join.'
-    : inProgress ? `${selected.name} is on Wave ${selected.wave}: you'll join the match in progress.`
-    : `${selected.name} is empty: its match starts at the wave you pick.`;
+  const map = currentMap();
+  const locked = !!map && !map.unlocked;
+  const gs = hideoutView.state?.gearScore ?? 0;
+  const fee = map?.entryFee ?? 0;
+  const broke = (hideoutView.state?.cash ?? 0) < fee;
+  const inRaid = !!hideoutView.state?.inRaid;
+  const noOperator = !!hideoutView.state?.needsOperator;
+  deployBtn.disabled = locked || !selected || inRaid || broke || noOperator;
+  deployLabel.textContent = noOperator ? 'Create an operator in the hideout first' : inRaid ? 'Already deployed' : locked ? `Needs gear score ${map!.minGearScore}` : broke ? `Entry fee $${fmtInt(fee)}: not enough cash`
+    : selected ? `Deploy · ${selected.name}${fee ? ` · $${fmtInt(fee)}` : ''}` : 'Deploy';
+  deployBtn.title = locked ? `Your gear score is ${gs}. Equip better gear in the hideout.` : broke ? 'Sell loot at the trader to raise the entry fee.' : '';
+  // Insurance: a share of the loadout's value, refunded never; returns the gear if you die.
+  const insureCost = hideoutView.state?.insuranceCost ?? 0;
+  const insureToggle = document.getElementById('insureToggle') as HTMLInputElement;
+  const canInsure = insureCost > 0 && (hideoutView.state?.cash ?? 0) >= fee + insureCost;
+  insureToggle.disabled = !canInsure;
+  if (!canInsure) insureToggle.checked = false;
+  document.getElementById('insureText')!.textContent = insureCost > 0
+    ? `Insure my loadout · $${fmtInt(insureCost)}${canInsure ? '' : ' (not enough cash)'}`
+    : 'Insure my loadout (nothing equipped to insure)';
+  document.getElementById('insureLabel')!.classList.toggle('locked', !canInsure);
+  document.getElementById('deployRisk')!.textContent = deployRiskText(hideoutView.state?.loadout ?? {}, fee, insureToggle.checked);
 }
 
 async function refreshRooms() {
@@ -412,10 +424,43 @@ async function refreshRooms() {
     const data = await res.json();
     if (!data.ok) return;
     rooms = data.rooms;
-    accountVerified = !!data.verified;
+    matchmaking = data.matchmaking ?? null;
     renderRooms();
   } catch { /* keep the last list */ }
 }
+
+/** The cross-platform switch and the "Lobbies · Steam" label above the list. */
+function renderMatchmaking() {
+  crossplayToggle.checked = !!matchmaking?.crossplay;
+  crossplayToggle.disabled = !matchmaking || crossplayToggle.dataset.busy === '1';
+  crossplayStatus.textContent = matchmakingText(matchmaking);
+  const label = document.createElement('b');
+  label.textContent = matchmaking ? matchmaking.pool.label : 'Cross-platform';
+  poolLabelEl.replaceChildren('Lobbies · ', label);
+}
+
+crossplayToggle.addEventListener('change', async () => {
+  const enabled = crossplayToggle.checked;
+  crossplayToggle.dataset.busy = '1';
+  crossplayToggle.disabled = true;
+  roomErrorMsg.textContent = '';
+  try {
+    const res = await fetch('/api/matchmaking/crossplay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: authToken, enabled }),
+    });
+    const data = await res.json();
+    if (!data.ok) roomErrorMsg.textContent = data.error || 'Could not change matchmaking';
+    else matchmaking = data.matchmaking;
+  } catch {
+    roomErrorMsg.textContent = 'Network error';
+  }
+  delete crossplayToggle.dataset.busy;
+  // The lobby list changes with the pool: the old selection may no longer be joinable.
+  await refreshRooms();
+  renderMatchmaking();
+});
 
 async function createRoom() {
   roomErrorMsg.textContent = '';
@@ -425,10 +470,10 @@ async function createRoom() {
     const res = await fetch('/api/rooms', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: authToken, name, verifiedOnly: roomVerifiedOnly.checked }),
+      body: JSON.stringify({ token: authToken, name, map: deployMapId }),
     });
     const data = await res.json();
-    if (!data.ok) { roomErrorMsg.textContent = data.error || 'Could not create lobby'; return; }
+    if (!data.ok) { roomErrorMsg.textContent = data.error || 'Could not create the raid'; return; }
     roomNameInput.value = '';
     selectedRoomId = data.room.id;
     localStorage.setItem('boxhead_room', selectedRoomId);
@@ -441,10 +486,6 @@ async function createRoom() {
 
 document.getElementById('refreshRoomsBtn')!.addEventListener('click', () => void refreshRooms());
 document.getElementById('createRoomBtn')!.addEventListener('click', () => void createRoom());
-document.querySelectorAll<HTMLButtonElement>('[data-lobby-filter]').forEach(btn => btn.addEventListener('click', () => {
-  lobbyFilter = btn.dataset.lobbyFilter as LobbyFilter;
-  renderRooms();
-}));
 document.querySelectorAll<HTMLButtonElement>('[data-pw-toggle]').forEach(btn => btn.addEventListener('click', () => {
   const input = document.getElementById(btn.dataset.pwToggle!) as HTMLInputElement;
   const show = input.type === 'password';
@@ -468,17 +509,22 @@ roomNameInput.addEventListener('keydown', e => { if (e.key === 'Enter') void cre
 setInterval(() => { if (currentScreen === 'menu' && menuView === 'browser') void refreshRooms(); }, 5000);
 
 // --- Menu views: home (Play / Sign in), server browser, sign in ---
-type MenuView = 'home' | 'browser' | 'signin';
+type MenuView = 'home' | 'hideout' | 'browser' | 'signin';
 let menuView: MenuView = 'home';
 const menuViews: Record<MenuView, HTMLElement> = {
   home: document.getElementById('menuHome')!,
+  hideout: document.getElementById('menuHideout')!,
   browser: document.getElementById('menuBrowser')!,
   signin: document.getElementById('menuSignIn')!,
 };
 function showMenuView(view: MenuView) {
+  // Everything past the home screen needs an account.
+  if (!isLoggedIn && (view === 'hideout' || view === 'browser')) view = 'signin';
+  if (view !== 'signin') bskyLinkMode = false;
   menuView = view;
   for (const [name, el] of Object.entries(menuViews)) el.classList.toggle('hidden', name !== view);
-  if (view === 'browser') void refreshRooms();
+  if (view === 'browser') { void refreshRooms(); void hideoutView.refresh(); }
+  if (view === 'hideout') void hideoutView.refresh();
 }
 document.querySelectorAll<HTMLElement>('[data-menu-view]').forEach(el =>
   el.addEventListener('click', () => showMenuView(el.dataset.menuView as MenuView)));
@@ -492,7 +538,7 @@ function deploy() {
 deployBtn.addEventListener('click', deploy);
 
 // --- Screen state ---
-type Screen = 'menu' | 'playing' | 'gameover';
+type Screen = 'menu' | 'playing' | 'results';
 let currentScreen: Screen = 'menu';
 
 function updateAuthDOM() {
@@ -510,52 +556,15 @@ function updateAuthDOM() {
   }
 }
 
-// A stable browser profile lets the server persist and enforce wave unlocks.
-function newWaveProfile(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 15) | 64;
-  bytes[8] = (bytes[8] & 63) | 128;
-  const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-}
-const waveProfile = localStorage.getItem('boxhead_wave_profile') || newWaveProfile();
-localStorage.setItem('boxhead_wave_profile', waveProfile);
-let highestWave = Math.max(1, Number(localStorage.getItem('boxhead_highest_wave')) || 1);
-let startingWave = 1;
-const waveSelects = [...document.querySelectorAll<HTMLSelectElement>('[data-wave-select]')];
-function renderWaveOptions() {
-  for (const select of waveSelects) {
-    select.replaceChildren();
-    for (let value = 1; value <= highestWave; value++) {
-      const option = document.createElement('option');
-      option.value = String(value);
-      option.textContent = `Wave ${value}${value === highestWave && value > 1 ? ' (best)' : ''}`;
-      select.append(option);
-    }
-    select.value = String(startingWave);
-  }
-}
-function rememberWave(reached: number) {
-  if (!Number.isInteger(reached) || reached <= highestWave) return;
-  highestWave = reached;
-  localStorage.setItem('boxhead_highest_wave', String(highestWave));
-  renderWaveOptions();
-  updateAccountSummary();
-}
-for (const select of waveSelects) select.addEventListener('change', () => {
-  startingWave = Math.max(1, Math.min(highestWave, Number(select.value) || 1));
-  for (const other of waveSelects) other.value = String(startingWave);
+// There is no guest play: your stash lives on your account.
+const hideoutView = new HideoutView({
+  auth: () => ({ token: authToken }),
+  onSignedOut: () => { clearAuthState(); requireSignIn(); },
+  icon: (id) => svgIcon(id),
+  onChange: (h: Hideout) => { updateAccountSummary(h); if (menuView === 'browser') renderRooms(); },
 });
-async function refreshWaveProgress() {
-  try {
-    const response = await fetch(`/api/progress?profileId=${encodeURIComponent(waveProfile)}`);
-    if (!response.ok) return;
-    const progress = await response.json();
-    rememberWave(progress.highestWave);
-  } catch { /* Keep the last saved options when offline. */ }
-}
-renderWaveOptions();
-void refreshWaveProgress();
+document.getElementById('toDeployBtn')!.addEventListener('click', () => showMenuView('browser'));
+document.getElementById('insureToggle')!.addEventListener('change', () => renderRooms());
 
 let serverPaused = false;
 let roomHostId: string | null = null;
@@ -567,12 +576,13 @@ function renderRoomControls() {
   const playing = currentScreen === 'playing';
   const host = roomHostId === myId && !!myId;
   roomControls.classList.toggle('hidden', !playing);
-  pauseButton.disabled = !host;
+  const solo = Object.keys(players).length <= 1;
+  pauseButton.disabled = !host || (!serverPaused && !solo);
   const pauseKey = document.createElement('kbd');
   pauseKey.className = 'kbd';
   pauseKey.textContent = 'P';
   pauseButton.replaceChildren(svgIcon(serverPaused ? 'i-play' : 'i-pause'), pauseKey);
-  const pauseLabel = host ? (serverPaused ? 'Resume (P)' : 'Pause the round (P)') : 'Only the host can pause';
+  const pauseLabel = serverPaused ? 'Resume (P)' : solo && host ? 'Pause the raid (P)' : 'You can only pause when you are alone in the raid';
   pauseButton.title = pauseLabel;
   pauseButton.setAttribute('aria-label', pauseLabel);
   pauseOverlay.hidden = !serverPaused || !playing;
@@ -581,12 +591,12 @@ function renderRoomControls() {
   document.getElementById('leaveMatchBtn')!.classList.toggle('btn-block', !host);
   // The host leaving unpauses the match and hands host to the next player.
   document.getElementById('leaveHint')!.textContent = host
-    ? 'If you leave, the match resumes for your squad.'
-    : 'If you leave, your squad plays on without you.';
+    ? 'Leaving forfeits your loadout and loot. The raid resumes for everyone else.'
+    : 'Leaving forfeits your loadout and loot. Your squad plays on without you.';
   const hostName = (roomHostId && players[roomHostId]?.name) || 'the host';
   document.getElementById('pauseMessage')!.textContent = host
-    ? 'You paused the match for everyone. Only you can resume it.'
-    : `Paused by ${hostName} (host). Only the host can resume the match.`;
+    ? 'Raid paused, raid clock included. Anyone who joins resumes it.'
+    : `Paused by ${hostName}. Only they can resume the raid.`;
 }
 function requestPause() {
   if (currentScreen !== 'playing' || roomHostId !== myId || ws?.readyState !== WebSocket.OPEN) return;
@@ -598,54 +608,96 @@ resumeButton.addEventListener('click', requestPause);
 function setScreen(scr: Screen) {
   currentScreen = scr;
   mainMenuOverlay.classList.toggle('hidden', scr !== 'menu');
-  gameOverOverlay.classList.toggle('hidden', scr !== 'gameover');
-  if (scr === 'gameover') {
-    gameOverOverlay.style.display = 'flex';
-  } else {
-    gameOverOverlay.style.display = 'none';
-  }
+  resultsOverlay.style.display = scr === 'results' ? 'flex' : 'none';
   friendsOverlay.classList.toggle('hidden', true);
   document.getElementById('gameSettingsBtn')?.classList.toggle('hidden', scr !== 'playing');
+  if (scr !== 'playing') mapOpen = false;
   renderRoomControls();
-  if (scr === 'menu') { updateAuthDOM(); void refreshWaveProgress(); void refreshRooms(); }
-  if (scr === 'gameover') {
-    gameOverWave.textContent = finalWave.toString();
-    const orDash = (n: number, text: string) => (n > 0 ? text : '—');
-    gameOverScore.textContent = orDash(finalScore, Math.floor(finalScore).toLocaleString('en-US'));
-    gameOverKills.textContent = orDash(finalKills, `${finalKills}`);
-    gameOverCombo.textContent = orDash(finalMaxCombo, `×${finalMaxCombo}`);
-    renderSquadResults();
-  }
+  if (scr === 'menu') { updateAuthDOM(); void hideoutView.refresh(); void refreshRooms(); }
+  if (scr === 'results') { renderRaidResults(); void refreshDeployAgain(); }
+  document.getElementById('settingsLeave')!.hidden = scr !== 'playing';
 }
 
-/** Game over: everyone's result, best score first, your row highlighted. */
-function renderSquadResults() {
-  const table = document.getElementById('gameOverSquad') as HTMLTableElement;
-  const list = Object.values(players).sort((a, b) => b.score - a.score);
-  table.replaceChildren();
-  // Co-op: everyone's result sits beside your death recap, in a wider panel.
-  const squad = list.length >= 2;
-  document.getElementById('gameOverDetails')!.classList.toggle('has-squad', squad);
-  document.getElementById('gameOverSquadCard')!.hidden = !squad;
-  if (!squad) return; // solo rounds: the stat tiles already say it all
-  const head = table.createTHead().insertRow();
-  for (const label of ['Player', 'Score', 'Kills']) {
-    const th = document.createElement('th');
-    th.textContent = label;
-    head.append(th);
-  }
-  const body = table.createTBody();
-  for (const p of list) {
-    const tr = body.insertRow();
-    if (p.id === myId) tr.className = 'me';
-    for (const text of [p.name || p.id.slice(0, 6), Math.floor(p.score).toLocaleString('en-US'), `${p.kills || 0}`]) tr.insertCell().textContent = text;
-  }
+/** "Deploy again" only makes sense if you can still enter this map. */
+async function refreshDeployAgain() {
+  const h = await hideoutView.refresh();
+  const map = h?.maps.find(m => m.id === deployMapId);
+  const ok = !!map && map.unlocked && (h?.cash ?? 0) >= (map.entryFee ?? 0);
+  const naked = !!h && !h.loadout.primary && !h.loadout.secondary && !h.loadout.armor && !h.loadout.pack;
+  playAgainBtn.textContent = !ok ? 'Choose a map' : `Deploy again${map!.entryFee ? ` · $${fmtInt(map!.entryFee)}` : ''}${naked ? ' (no gear equipped)' : ''}`;
 }
 
-let finalWave = 1;
-let finalScore = 0;
-let finalKills = 0;
-let finalMaxCombo = 0;
+/** The loadout you deployed with (for telling insured gear apart on the results screen). */
+let deployedLoadout: Hideout['loadout'] = {};
+/** The raid that just ended, as reported by the server. */
+let lastRaidEnd: RaidEnd | null = null;
+
+function lootCard(item: Item): HTMLElement {
+  const card = document.createElement('div');
+  card.className = 'item-card';
+  card.style.setProperty('--rarity', RARITY_COLOR[item.rarity]);
+  const icon = document.createElement('span');
+  icon.className = 'item-icon';
+  icon.append(svgIcon(KIND_ICON[item.kind]));
+  const body = document.createElement('span');
+  body.className = 'item-body';
+  const name = document.createElement('span');
+  name.className = 'item-name';
+  name.textContent = item.name;
+  const meta = document.createElement('span');
+  meta.className = 'item-meta';
+  meta.textContent = `${RARITY_LABEL[item.rarity]} · power ${item.power} · $${fmtInt(item.value)}`;
+  body.append(name, meta);
+  card.append(icon, body);
+  return card;
+}
+
+function renderRaidResults() {
+  const end = lastRaidEnd;
+  if (!end) return;
+  const o = end.outcome;
+  const { title, tagline, kept } = raidTitle(o.result);
+  const titleEl = document.getElementById('resultsTitle')!;
+  titleEl.textContent = title;
+  titleEl.classList.toggle('won', kept);
+  titleEl.classList.toggle('lost', !kept);
+  const killer = o.killedBy ? ` by ${enemyName(o.killedBy)}` : '';
+  document.getElementById('resultsTagline')!.textContent = o.result === 'killed' ? `Killed${killer}. Your loadout and loot are lost` : tagline;
+  document.getElementById('resultsMap')!.textContent = kept && o.extractName ? `${end.map} · out through ${o.extractName}` : end.map;
+  document.getElementById('resultsTime')!.textContent = formatClock(o.survivedSecs);
+  document.getElementById('resultsKills')!.textContent = `${o.kills}`;
+  document.getElementById('resultsBountyLabel')!.textContent = kept ? 'Bounty banked' : 'Bounty lost';
+  document.getElementById('resultsBounty')!.textContent = `$${fmtInt(o.bounty)}`;
+  document.getElementById('resultsLootCount')!.textContent = kept ? `${o.loot.length}` : '—';
+  const lootEl = document.getElementById('resultsLoot')!;
+  // An insured loadout came back: only the pack was lost.
+  const insured = !kept && !!end.settlement?.insured;
+  const loadoutIds = new Set(Object.values(deployedLoadout).filter(Boolean).map(i => i!.id));
+  const shown = kept ? o.loot : insured ? o.lost.filter(i => !loadoutIds.has(i.id)) : o.lost;
+  lootEl.replaceChildren(...shown.map(lootCard));
+  document.getElementById('resultsLootTitle')!.textContent = kept ? 'Loot'
+    : shown.length ? `Lost · $${fmtInt(itemsValue(shown))}` : 'Lost';
+  const settle = end.settlement;
+  let line: string;
+  if (insured) line = 'Your loadout was insured and is back in the hideout. Your pack and bounty are gone.';
+  else if (!kept) line = shown.length
+    ? 'Everything above is gone. Gear in your stash is safe: re-equip in the hideout, or buy from the trader.'
+    : 'You went in with nothing equipped, so nothing was lost.';
+  else if (!settle) line = 'Your stash could not be updated. Check the hideout.';
+  else line = `+$${fmtInt(settle.cashEarned)} banked · ${settle.itemsKept} item${settle.itemsKept === 1 ? '' : 's'} added to your stash`
+    + (settle.bonusCash ? ` (incl. $${fmtInt(settle.bonusCash)} rank and perk bonus)` : '')
+    + (settle.itemsAutoSold ? ` · ${settle.itemsAutoSold} sold because your stash was full` : '') + ` · you now have $${fmtInt(settle.cash)}`;
+  const ops = settle?.ops;
+  if (ops) {
+    const mapName = hideoutView.state?.maps.find(m => m.id === ops.map)?.name ?? end.map;
+    line += ` · ${mapName} Operations +${ops.xpGained} XP`
+      + (ops.rankedUp ? ` · rank ${ops.rank} reached: cheaper entry, bigger bounty` : ops.next === null ? ' (top rank)' : ` (${ops.xp}/${ops.next} to rank ${ops.rank + 1})`);
+  }
+  if (kept && o.loot.length === 0) lootEl.append(Object.assign(document.createElement('p'), { className: 'meta', textContent: 'You extracted with an empty pack.' }));
+  document.getElementById('resultsSettlement')!.textContent = line;
+  document.getElementById('resultsLootCard')!.hidden = false;
+}
+
 // Older builds saved the full sign-in email as the callsign; never broadcast that.
 let playerName = (n => (n.includes('@') ? defaultCallsign(n) : n))(localStorage.getItem('boxhead_name') || 'Operative');
 
@@ -671,8 +723,97 @@ function setAuthState(token: string, handle: string, userId: string, displayName
   localStorage.setItem('boxhead_name', playerName);
   updateAuthDOM();
   refreshFriends();
+  refreshMe();
   void refreshRooms();
   if (menuView === 'signin') showMenuView('home');
+}
+
+/** Send a signed-out player to the sign-in screen with a reason. */
+function requireSignIn() {
+  showMenuView('signin');
+  loginErrorMsg.textContent = 'Sign in to play. Your stash and gear live on your account.';
+}
+
+// --- Linked identities (Steam, Bluesky) on one BoxHead account ---
+let linkedAccounts: { provider: string; handle: string }[] = [];
+let linkError = '';
+/** The Bluesky form is attaching Bluesky to the signed-in account, not signing in. */
+let bskyLinkMode = false;
+
+function refreshMe() {
+  if (!authToken) return;
+  fetch(`/api/auth/me?token=${encodeURIComponent(authToken)}`)
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) { clearAuthState(); return; }
+      linkedAccounts = data.linked || [];
+      renderLinkedAccounts();
+    })
+    .catch(() => {});
+}
+
+function renderLinkedAccounts() {
+  const box = document.getElementById('linkedAccounts')!;
+  box.replaceChildren();
+  if (!isLoggedIn) return;
+  for (const [provider, label] of [['steam', 'Steam'], ['bluesky', 'Bluesky']] as const) {
+    const row = document.createElement('div');
+    row.className = 'linked-row';
+    const acct = linkedAccounts.find(a => a.provider === provider);
+    const text = document.createElement('span');
+    if (acct) {
+      const b = document.createElement('b');
+      b.textContent = acct.handle || 'linked';
+      text.append(`${label}: `, b);
+    } else {
+      text.textContent = `${label}: not linked`;
+    }
+    row.append(text);
+    if (!acct) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'link';
+      btn.textContent = `Link ${label}`;
+      btn.title = `Sign in with ${label} once; after that it opens this same account`;
+      btn.addEventListener('click', () => { linkError = ''; if (provider === 'steam') steamLogin(true); else startBskyLink(); });
+      row.append(btn);
+    }
+    box.append(row);
+  }
+  if (linkError) {
+    const err = document.createElement('p');
+    err.className = 'error-text';
+    err.textContent = linkError;
+    box.append(err);
+  }
+}
+
+function steamLogin(link = false) {
+  loginErrorMsg.textContent = '';
+  const url = `/api/auth/steam/start${link && authToken ? `?link=${encodeURIComponent(authToken)}` : ''}`;
+  const popup = window.open(url, 'steam-login', 'width=820,height=720,menubar=no,toolbar=no');
+  // Popups blocked: do it in this tab (the callback page brings you back).
+  if (!popup) window.location.href = url;
+}
+
+function startBskyLink() {
+  bskyLinkMode = true;
+  showMenuView('signin');
+  bskyLinkMode = true;
+  (document.querySelector('.auth-tab[data-tab="bsky"]') as HTMLElement | null)?.click();
+  document.getElementById('signInSub')!.textContent = 'Link your Bluesky account. After this, signing in with Bluesky opens this same account.';
+  bskyLoginBtn.querySelector('span')!.textContent = 'Link Bluesky';
+}
+
+/** A result from the Steam/Google popup (or the same-tab fallback). */
+function handleAuthResult(d: { ok: boolean; error?: string; linked?: string; token?: string; handle?: string; user_id?: string; display_name?: string }) {
+  if (!d.ok) {
+    if (isLoggedIn) { linkError = d.error || 'Linking failed'; renderLinkedAccounts(); }
+    else loginErrorMsg.textContent = d.error || 'Sign-in failed';
+    return;
+  }
+  if (d.linked) { linkError = ''; refreshMe(); return; }
+  if (d.token) setAuthState(d.token, d.handle || '', d.user_id || '', d.display_name);
 }
 
 function clearAuthState() {
@@ -685,8 +826,10 @@ function clearAuthState() {
   localStorage.removeItem('boxhead_auth_token');
   localStorage.removeItem('boxhead_auth_handle');
   localStorage.removeItem('boxhead_auth_user_id');
-  accountVerified = false;
+  matchmaking = null;
+  linkedAccounts = [];
   updateFriendsDOM();
+  if (menuView === 'hideout' || menuView === 'browser') showMenuView('home');
   void refreshRooms();
 }
 
@@ -696,10 +839,15 @@ async function bskyLogin(handle: string, password: string) {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ handle, password }),
+      body: JSON.stringify({ handle, password, token: bskyLinkMode ? authToken : undefined }),
     });
     const data = await res.json();
-    if (data.ok) {
+    if (data.ok && data.linked) {
+      bskyLinkMode = false;
+      bskyPassEl.value = '';
+      refreshMe();
+      showMenuView('home');
+    } else if (data.ok) {
       setAuthState(data.token, data.handle, data.user_id, data.display_name);
     } else {
       loginErrorMsg.textContent = data.error || 'Login failed';
@@ -707,7 +855,7 @@ async function bskyLogin(handle: string, password: string) {
   } catch {
     loginErrorMsg.textContent = 'Network error';
   }
-  bskyLoginBtn.querySelector('span')!.textContent = 'Sign in with Bluesky';
+  bskyLoginBtn.querySelector('span')!.textContent = bskyLinkMode ? 'Link Bluesky' : 'Sign in with Bluesky';
 }
 
 function googleLogin() {
@@ -747,6 +895,7 @@ async function emailAuth(endpoint: string) {
 
 window.addEventListener('message', (e) => {
   if (e.origin !== window.location.origin) return;
+  if (e.data?.type === 'steam-auth') { handleAuthResult(e.data); return; }
   if (e.data?.type === 'google-auth') {
     if (e.data.ok) {
       setAuthState(e.data.token, e.data.handle, e.data.user_id, e.data.display_name);
@@ -761,14 +910,12 @@ fetch('/api/config')
   .then(data => { (window as any).__GOOGLE_CLIENT_ID = data.google_client_id || ''; })
   .catch(() => {});
 
-if (isLoggedIn) {
-  fetch(`/api/auth/me?token=${encodeURIComponent(authToken)}`)
-    .then(r => r.json())
-    .then(data => {
-      if (!data.ok) clearAuthState();
-    })
-    .catch(() => {});
-}
+if (isLoggedIn) refreshMe();
+// Signed in through Steam in this same tab (popup blocked): pick up the result.
+try {
+  const pending = localStorage.getItem('boxhead_pending_auth');
+  if (pending) { localStorage.removeItem('boxhead_pending_auth'); handleAuthResult(JSON.parse(pending)); }
+} catch { /* ignore */ }
 
 async function refreshFriends() {
   if (!authToken) return;
@@ -837,11 +984,15 @@ function updateFriendsDOM() {
   updateAccountSummary();
 }
 
-/** One useful line under the account name: best wave and friends online. */
-function updateAccountSummary() {
+/** One useful line under the account name: gear score, extracts and friends online. */
+function updateAccountSummary(h: Hideout | null = hideoutView?.state ?? null) {
   const online = friendsList.filter(f => f.online).length;
   const friends = friendsList.length === 0 ? '0 friends' : `${online}/${friendsList.length} friends online`;
-  document.getElementById('accountSummary')!.textContent = `Best: Wave ${highestWave} · ${friends}`;
+  const first = h?.needsOperator ? 'No operator yet: create one in the hideout'
+    : h ? `${h.name ? `Operator: ${h.name} · ` : ''}Gear score ${h.gearScore}` : 'Gear score —';
+  const second = [h && !h.needsOperator ? `${h.extracts} extraction${h.extracts === 1 ? '' : 's'}` : '', friends].filter(Boolean).join(' · ');
+  const line = (text: string) => Object.assign(document.createElement('span'), { className: 'account-summary-line', textContent: text });
+  document.getElementById('accountSummary')!.replaceChildren(line(first), line(second));
 }
 
 async function addFriend(handle: string) {
@@ -881,9 +1032,17 @@ if (isLoggedIn) refreshFriends();
 
 // --- Static data (received once on init) ---
 let staticWalls: Wall[] = [];
-let staticMapWidth = 2400;
-let staticMapHeight = 1800;
+let staticMapWidth = 4640;
+let staticMapHeight = 3360;
 let staticAmmoSpawns: { x: number; y: number; amount: number }[] = [];
+let staticExtracts: ExtractPoint[] = [];
+let staticCrates: Point[] = [];
+let staticNests: Point[] = [];
+/** Terminals that decrypt sealed loot while you stand in their ring. */
+let staticUplinks: ExtractPoint[] = [];
+const UPLINK_COLOR = '#4fe3f7';
+let raidMap: MapInfo | null = null;
+let crateAvailability: Map<string, boolean> = new Map();
 
 // --- Live game state (built from snapshots + deltas) ---
 let players: Record<string, Player> = {};
@@ -891,12 +1050,7 @@ let zombieMap: Map<string, Zombie> = new Map();
 let bulletMap: Map<string, Bullet> = new Map();
 let bulletCreationTime: Map<string, number> = new Map();
 let placeableMap: Map<string, Placeable> = new Map();
-let wave = 1;
-let waveKills = 0;
-let waveTarget = 12;
-let waveBreakTimer = 0;
 let ammoAvailability: Map<string, boolean> = new Map();
-let gameOver = false;
 let dropMap: Map<string, DropPickup> = new Map();
 
 let myId = '';
@@ -1000,19 +1154,16 @@ bskyLoginBtn.addEventListener('click', () => {
   }
 });
 googleLoginBtn.addEventListener('click', googleLogin);
+document.getElementById('steamLoginBtn')!.addEventListener('click', () => steamLogin(false));
 logoutBtn.addEventListener('click', clearAuthState);
-playBtn.addEventListener('click', () => showMenuView('browser'));
+playBtn.addEventListener('click', () => { if (isLoggedIn) showMenuView('hideout'); else requireSignIn(); });
+// Results: deploy straight back into the same raid, or go gear up.
+// Results: deploy straight back in, unless losing your kit locked you out of this map.
 playAgainBtn.addEventListener('click', async () => {
-  try {
-    const response = await fetch(`/api/rooms/${encodeURIComponent(currentRoomId)}/replay`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: authToken, profileId: waveProfile, startingWave }),
-    });
-    const result = await response.json();
-    if (!response.ok || !result.ok) return;
-  } catch { /* ignore */ }
   if (ws) { ws.close(); ws = null; }
+  const h = await hideoutView.refresh();
+  const map = h?.maps.find(m => m.id === deployMapId);
+  if (!map || !map.unlocked || (h && h.cash < (map.entryFee ?? 0))) { setScreen('menu'); showMenuView('browser'); return; }
   connectToServer();
 });
 friendsBtn.addEventListener('click', () => { friendsOverlay.classList.remove('hidden'); friendsOverlay.style.display = 'flex'; });
@@ -1020,6 +1171,24 @@ closeFriendsBtn.addEventListener('click', () => { friendsOverlay.classList.add('
 backToMenuBtn.addEventListener('click', () => {
   if (ws) { ws.close(); ws = null; }
   setScreen('menu');
+  showMenuView('hideout');
+});
+// Leave from Controls (Esc) works in any raid, solo or squad. It asks twice.
+const settingsLeaveBtn = document.getElementById('settingsLeaveBtn')!;
+const settingsLeaveLabel = settingsLeaveBtn.querySelector('span')!;
+let settingsLeaveTimer = 0;
+settingsLeaveBtn.addEventListener('click', () => {
+  if (!settingsLeaveTimer) {
+    settingsLeaveLabel.textContent = 'Click again: lose your gear';
+    settingsLeaveTimer = window.setTimeout(() => { settingsLeaveTimer = 0; settingsLeaveLabel.textContent = 'Leave raid'; }, 3000);
+    return;
+  }
+  window.clearTimeout(settingsLeaveTimer);
+  settingsLeaveTimer = 0;
+  settingsLeaveLabel.textContent = 'Leave raid';
+  leavingRaid = true;
+  closeSettings();
+  if (ws) ws.close();
 });
 // Leaving a paused match asks for a second click.
 const leaveMatchBtn = document.getElementById('leaveMatchBtn')!;
@@ -1027,16 +1196,17 @@ const leaveLabel = leaveMatchBtn.querySelector('span')!;
 let leaveConfirmTimer = 0;
 leaveMatchBtn.addEventListener('click', () => {
   if (!leaveConfirmTimer) {
-    leaveLabel.textContent = 'Click again to leave';
-    leaveConfirmTimer = window.setTimeout(() => { leaveConfirmTimer = 0; leaveLabel.textContent = 'Leave match'; }, 3000);
+    leaveLabel.textContent = 'Click again: lose your gear';
+    leaveConfirmTimer = window.setTimeout(() => { leaveConfirmTimer = 0; leaveLabel.textContent = 'Leave raid'; }, 3000);
     return;
   }
   window.clearTimeout(leaveConfirmTimer);
   leaveConfirmTimer = 0;
-  leaveLabel.textContent = 'Leave match';
-  if (ws) { ws.close(); ws = null; }
+  leaveLabel.textContent = 'Leave raid';
+  // The server settles a mid-raid exit as abandoned; its result arrives before the socket closes.
+  leavingRaid = true;
   serverPaused = false;
-  setScreen('menu');
+  if (ws) ws.close();
 });
 addFriendBtn.addEventListener('click', () => {
   if (addFriendEl.value.trim()) addFriend(addFriendEl.value.trim());
@@ -1069,8 +1239,10 @@ window.addEventListener('keydown', (e) => {
   if (e.code !== 'Escape' || settingsListening || e.repeat) return;
   if (settingsOverlay.style.display === 'flex') { closeSettings(); e.stopPropagation(); return; }
   if (friendsOverlay.style.display === 'flex') { friendsOverlay.classList.add('hidden'); friendsOverlay.style.display = 'none'; e.stopPropagation(); return; }
-  if (currentScreen === 'menu' && menuView !== 'home') { showMenuView('home'); e.stopPropagation(); return; }
-  if (currentScreen === 'playing' && !armoryOpen) { openSettings(); e.stopPropagation(); }
+  if (currentScreen === 'menu' && menuView !== 'home') { showMenuView(menuView === 'browser' ? 'hideout' : 'home'); e.stopPropagation(); return; }
+  if (currentScreen === 'playing' && mapOpen) { mapOpen = false; e.stopPropagation(); return; }
+  if (currentScreen === 'playing' && raidInvOpen) { toggleRaidInventory(false); e.stopPropagation(); return; }
+  if (currentScreen === 'playing') { openSettings(); e.stopPropagation(); }
 }, true);
 
 // Enter presses the open screen's primary button (Play, Join, Sign in, Play again),
@@ -1081,8 +1253,9 @@ window.addEventListener('keydown', (e) => {
   if (target.closest('button, a, select, textarea') || target === roomNameInput || target.id === 'addFriendInputEl') return;
   if (settingsOverlay.style.display === 'flex' || friendsOverlay.style.display === 'flex') return;
   let primary: HTMLButtonElement | null = null;
-  if (currentScreen === 'gameover') primary = playAgainBtn as HTMLButtonElement;
+  if (currentScreen === 'results') primary = backToMenuBtn as HTMLButtonElement;
   else if (currentScreen === 'menu' && menuView === 'home') primary = playBtn as HTMLButtonElement;
+  else if (currentScreen === 'menu' && menuView === 'hideout') primary = document.getElementById('toDeployBtn') as HTMLButtonElement;
   else if (currentScreen === 'menu' && menuView === 'browser') primary = deployBtn;
   else if (currentScreen === 'menu' && menuView === 'signin') {
     primary = (document.getElementById('authTabBsky')!.classList.contains('hidden') ? emailLoginBtn : bskyLoginBtn) as HTMLButtonElement;
@@ -1096,8 +1269,8 @@ function renderBindingsGrid() {
   const sections: { title: string; keys: (keyof KeyBindings)[] }[] = [
     { title: 'Movement', keys: ['moveUp', 'moveDown', 'moveLeft', 'moveRight'] },
     { title: 'Combat', keys: ['shoot', 'dash'] },
-    { title: 'Weapons', keys: ['melee', 'weapon1', 'weapon2', 'weapon3', 'weapon4'] },
-    { title: 'Gear & armory', keys: ['placeBarrel', 'placeBarricade', 'placeMine', 'toggleShop'] },
+    { title: 'Weapons', keys: ['melee', 'weapon1', 'weapon2'] },
+    { title: 'Deployables, pack & map', keys: ['placeBarrel', 'placeBarricade', 'placeMine', 'dropItem', 'inventory', 'toggleMap'] },
   ];
 
   // Two columns so every binding fits without scrolling on a normal screen. Keys line up in
@@ -1112,7 +1285,7 @@ function renderBindingsGrid() {
       `<button class="key-btn" data-action="${action}">${keyDisplayName(bindings[action])}</button>`,
       altKey[action] ? fixed(keyDisplayName(altKey[action]!), true) : '')).join('')).join('');
   const fixedRows = `<h4 class="settings-section-title">Game</h4>` +
-    row('Pause (host only)', fixed('P')) + row('Controls / back', fixed('Esc')) + row('Buy in the armory', fixed('1–6'));
+    row('Pause (solo only)', fixed('P')) + row('Controls / leave', fixed('Esc'));
   bindingsGrid.innerHTML = `<div class="binding-col">${column(sections.slice(0, 2))}${fixedRows}</div><div class="binding-col">${column(sections.slice(2))}</div>`;
 
   bindingsGrid.querySelectorAll('.key-btn').forEach(btn => {
@@ -1186,158 +1359,198 @@ resetBindingsBtn.addEventListener('click', () => {
   renderBindingsGrid();
 });
 
-// ============ Tactical Armory UI (DOM Modal) ============
-const armoryOverlay = document.getElementById('armoryOverlay')!;
-const armoryCreditsVal = document.getElementById('armoryCreditsVal')!;
-const armoryGrid = document.getElementById('armoryGrid')!;
-const closeArmoryBtn = document.getElementById('closeArmoryBtn')!;
-
-function toggleArmory(forceState?: boolean) {
-  armoryOpen = forceState !== undefined ? forceState : !armoryOpen;
-  // No shopping while downed: the death recap takes the armory's place.
-  const downed = (players[myId]?.health ?? 1) <= 0;
-  if (armoryOpen && currentScreen === 'playing' && !downed) {
-    armoryOverlay.style.display = 'flex';
-    renderArmoryDOM();
-  } else {
-    armoryOpen = false;
-    armoryOverlay.style.display = 'none';
-  }
+// ============ Full map (M) ============
+// A big map overlay on the canvas: extracts, nests, crates and your squad.
+function toggleMap(force?: boolean) {
+  mapOpen = force !== undefined ? force : !mapOpen;
+  if (currentScreen !== 'playing') mapOpen = false;
 }
 
-closeArmoryBtn.addEventListener('click', () => toggleArmory(false));
+// ============ Pack screen (I) ============
+// Every item you're carrying, with a drop button for each. The raid keeps running.
+let raidInvOpen = false;
+let raidInvKey = '';
+let pendingDropId: string | null = null;
+const raidInvEl = document.getElementById('raidInventory')!;
+document.getElementById('raidInvClose')!.addEventListener('click', () => toggleRaidInventory(false));
 
-/** Taking damage while shopping flashes the armory's frame: the match keeps running. */
-function flashArmoryPanel() {
-  const panel = document.querySelector('#armoryOverlay .panel') as HTMLElement | null;
-  if (!panel) return;
-  panel.classList.remove('is-hit');
-  void panel.offsetWidth; // restart the animation
-  panel.classList.add('is-hit');
+// While the pack is open, hovering a row and holding the drop key (G) drops that
+// item. Gun keys keep switching guns.
+let raidInvHoverRow: HTMLElement | null = null;
+for (const type of ['keydown', 'keyup'] as const) {
+  window.addEventListener(type, (e) => {
+    if (!raidInvOpen || currentScreen !== 'playing' || e.code !== bindings.dropItem || !raidInvHoverRow?.isConnected) return;
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    if (type === 'keydown' && e.repeat) return;
+    raidInvHoverRow.querySelector('.hold-btn')?.dispatchEvent(new Event(type === 'keydown' ? 'slot-hold' : 'slot-release'));
+  }, true);
 }
-document.querySelectorAll('[data-close-armory]').forEach(el => el.addEventListener('click', () => toggleArmory(false)));
-armoryOverlay.addEventListener('mousedown', (e) => {
-  if (e.target === armoryOverlay) {
-    toggleArmory(false);
+
+let raidInvHelpSeen = (() => { try { return Number(localStorage.getItem('boxhead_pack_help') || 0); } catch { return 0; } })();
+function toggleRaidInventory(force?: boolean) {
+  raidInvOpen = force !== undefined ? force : !raidInvOpen;
+  if (raidInvOpen) { raidInvHelpSeen++; try { localStorage.setItem('boxhead_pack_help', String(raidInvHelpSeen)); } catch { /* ignore */ } }
+  if (currentScreen !== 'playing') raidInvOpen = false;
+  raidInvEl.hidden = !raidInvOpen;
+  raidInvKey = '';
+  if (raidInvOpen) renderRaidInventory();
+}
+
+/** A Drop button you hold for half a second, so a stray click never throws loot away. */
+function holdToDrop(onDone: () => void): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'hold-btn';
+  const label = document.createElement('span');
+  label.textContent = 'Hold to drop';
+  btn.append(label);
+  btn.title = 'Hold (mouse, or Space/Enter when focused) for half a second to drop it here';
+  let timer = 0;
+  const start = (e: Event) => {
+    e.preventDefault();
+    if (timer) return;
+    btn.classList.add('holding');
+    label.textContent = 'Hold…';
+    timer = window.setTimeout(() => { timer = 0; onDone(); }, 500);
+  };
+  const cancel = () => {
+    if (timer) window.clearTimeout(timer);
+    timer = 0;
+    btn.classList.remove('holding');
+    label.textContent = 'Hold to drop';
+  };
+  btn.addEventListener('pointerdown', start);
+  btn.addEventListener('pointerup', cancel);
+  btn.addEventListener('pointerleave', cancel);
+  btn.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.stopPropagation(); start(e); } });
+  btn.addEventListener('slot-hold', start);
+  btn.addEventListener('slot-release', cancel);
+  btn.addEventListener('keyup', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.stopPropagation(); cancel(); } });
+  return btn;
+}
+
+/** Re-render the pack screen when what it shows changes. */
+function renderRaidInventory() {
+  if (!raidInvOpen) return;
+  const me = players[myId];
+  if (!me) return;
+  const pack = me.backpack ?? [];
+  const cap = me.backpackCapacity || 4;
+  const decrypting = pack.find(isEncrypted);
+  const nu = nearest(staticUplinks, me.pos.x, me.pos.y);
+  const uplinkText = nu ? `${nu.point.name} · ${formatDistance(nu.dist)} ${compass(nu.point.x - me.pos.x, nu.point.y - me.pos.y)}` : '';
+  const key = `${pack.map(i => i.id).join(',')}|${cap}|${Math.floor(me.decrypt || 0)}|${bindings.inventory}|${uplinkText}`;
+  if (key === raidInvKey) return;
+  // Don't rebuild under a Drop being held down.
+  if (raidInvEl.querySelector('.hold-btn.holding')) return;
+  raidInvKey = key;
+  document.getElementById('raidInvKey')!.textContent = keyDisplayName(bindings.inventory);
+  document.getElementById('raidInvCount')!.textContent = `${pack.length}/${cap}`;
+  const sealed = pack.filter(isEncrypted);
+  const risk = document.getElementById('raidInvSub')!;
+  risk.replaceChildren(`At risk: $${fmtInt(backpackValue(pack))}`);
+  if (sealed.length) {
+    const opened = backpackValue(pack.filter(i => !isEncrypted(i))) + sealed.reduce((s, i) => s + estimatedValue(i), 0);
+    risk.append(` · ~$${fmtInt(opened)} once decrypted`);
+    const loud = document.createElement('small');
+    loud.className = 'rp-uplink';
+    loud.textContent = `Nearest uplink: ${uplinkText || 'none in range'}. Decrypting is loud.`;
+    risk.append(loud);
   }
-});
+  const small = document.createElement('small');
+  small.textContent = 'Kept only if you extract.';
+  risk.append(small);
 
-const MAX_UPGRADE_LEVEL = 10;
-
-function renderArmoryDOM() {
-  if (!armoryOpen) return;
-  const p = players[myId];
-  if (!p) return;
-
-  const credits = Math.floor(p.credits ?? 0);
-  armoryCreditsVal.textContent = `$${fmtInt(credits)}`;
-
-  const dmgLv = p.damageLevel || 0;
-  const meleeLv = p.meleeLevel || 0;
-  const dmgCost = 200 + dmgLv * 150;
-  const meleeCost = 150 + meleeLv * 125;
-
-  const slots = p.weaponSlots || [true, false, false, false];
-  const weaponNames = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
-  const nextLockedIdx = slots.findIndex((unlocked, idx) => idx > 0 && !unlocked);
-  const nextWeapon = nextLockedIdx !== -1 ? weaponNames[nextLockedIdx] : '';
-  const unlockedCount = slots.filter(Boolean).length;
-
-  const curMeleeDmg = Math.round(45 * (1 + meleeLv * 0.35));
-  const nextMeleeDmg = Math.round(45 * (1 + (meleeLv + 1) * 0.35));
-  const tac = p.tacticalItems || [0, 0, 0];
-
-  // Order matches the number keys that buy them while the armory is open.
-  // Every stat reads "Label current → next".
-  const cards: {
-    id: number; shortcut: string; icon: string; title: string; level: string;
-    maxed: boolean; desc: string; stats: [string, string, string][]; cost: number;
-  }[] = [
-    {
-      id: 1, shortcut: '1', icon: 'i-crosshair', title: 'Firearm power',
-      level: `Level ${Math.min(dmgLv, MAX_UPGRADE_LEVEL)} / ${MAX_UPGRADE_LEVEL}`, maxed: dmgLv >= MAX_UPGRADE_LEVEL,
-      desc: '+20% gun and explosive damage, +4% crit chance.',
-      stats: [
-        ['Bonus damage', `+${dmgLv * 20}%`, `+${(dmgLv + 1) * 20}%`],
-        ['Crit chance', `${Math.min(60, 20 + dmgLv * 4)}%`, `${Math.min(60, 20 + (dmgLv + 1) * 4)}%`],
-      ],
-      cost: dmgCost,
-    },
-    {
-      id: 5, shortcut: '2', icon: 'i-sword', title: 'Katana',
-      level: `Level ${Math.min(meleeLv, MAX_UPGRADE_LEVEL)} / ${MAX_UPGRADE_LEVEL}`, maxed: meleeLv >= MAX_UPGRADE_LEVEL,
-      desc: 'Harder, wider swings that heal you on each kill.',
-      stats: [['Damage', `${curMeleeDmg}`, `${nextMeleeDmg}`]], cost: meleeCost,
-    },
-    {
-      id: 2, shortcut: '3', icon: 'i-shield', title: 'Armor & medkit', level: 'Repeatable', maxed: false,
-      desc: '+25 max health, and heals 60 right away.',
-      stats: [['Max health', `${p.maxHealth}`, `${p.maxHealth + 25}`]], cost: 150,
-    },
-    {
-      id: 3, shortcut: '4', icon: 'i-ammo', title: 'Bigger magazine', level: 'Repeatable', maxed: false,
-      desc: '+25 ammo capacity, and refills your reserve.',
-      stats: [['Ammo capacity', `${p.maxAmmo}`, `${p.maxAmmo + 25}`]], cost: 125,
-    },
-    {
-      id: 4, shortcut: '5', icon: 'i-crate', title: 'Gear resupply', level: 'Repeatable', maxed: false,
-      desc: '+2 of each placeable you drop from the hotbar.',
-      stats: [
-        ['Barrels', `${tac[0]}`, `${tac[0] + 2}`],
-        ['Barricades', `${tac[1]}`, `${tac[1] + 2}`],
-        ['Claymores', `${tac[2]}`, `${tac[2] + 2}`],
-      ],
-      cost: 140,
-    },
-    {
-      id: 6, shortcut: '6', icon: nextLockedIdx !== -1 ? ['i-pistol', 'i-uzi', 'i-shotgun', 'i-rocket'][nextLockedIdx] : 'i-crosshair',
-      title: nextWeapon ? `Unlock ${nextWeapon}` : 'Arsenal complete',
-      level: `Guns ${unlockedCount} / 4`, maxed: nextLockedIdx === -1,
-      desc: nextWeapon ? `Unlocks and equips the ${nextWeapon}. Shares your ammo.` : 'Every weapon is unlocked.',
-      stats: [['Weapons', `${unlockedCount}`, `${unlockedCount + 1}`]], cost: 250,
-    },
-  ];
-
-  armoryGrid.innerHTML = cards.map((c) => {
-    const canBuy = !c.maxed && credits >= c.cost;
-    const stats = c.stats.map(([label, cur, next]) =>
-      `<span class="shop-stat"><span class="shop-stat-label">${label}</span> ${c.maxed ? cur : `${cur} → ${next}`}</span>`).join('');
-    // The price sits on the card; the button says whether you can buy it, or how far off you are.
-    let buy: string;
-    if (c.maxed) {
-      buy = `<button class="btn btn-sm shop-buy-btn maxed" disabled><svg class="icon"><use href="#i-check"/></svg><span>Maxed out</span></button>`;
-    } else if (canBuy) {
-      buy = `<button class="btn btn-sm shop-buy-btn btn-money-solid" data-upgrade-id="${c.id}"><span>Buy</span><kbd class="kbd">${c.shortcut}</kbd></button>`;
+  const list = document.getElementById('raidInvList')!;
+  list.replaceChildren();
+  pack.forEach((item) => {
+    const row = document.createElement('div');
+    row.className = 'rp-row';
+    row.setAttribute('role', 'listitem');
+    row.style.setProperty('--rarity', RARITY_COLOR[item.rarity]);
+    const icon = document.createElement('span');
+    icon.className = 'rar-icon sm' + (isEncrypted(item) ? ' sealed' : '');
+    icon.style.setProperty('--rarity', RARITY_COLOR[item.rarity]);
+    icon.append(svgIcon(KIND_ICON[item.kind]));
+    const body = document.createElement('span');
+    body.className = 'row-body';
+    const name = document.createElement('span');
+    name.className = 'row-name';
+    name.textContent = item.name;
+    const chip = document.createElement('span');
+    chip.className = 'rar-chip';
+    if (isEncrypted(item)) {
+      chip.classList.add('sealed-chip');
+      const dot = document.createElement('span');
+      dot.className = 'rar-dot';
+      dot.style.background = RARITY_COLOR[item.rarity];
+      chip.append(dot, `Sealed · ${RARITY_LABEL[item.rarity]}`);
     } else {
-      const pct = Math.round((credits / c.cost) * 100);
-      buy = `<button class="btn btn-sm shop-buy-btn cant-buy" data-upgrade-id="${c.id}" disabled title="Not enough credits"><svg class="icon"><use href="#i-lock"/></svg><span>Need $${fmtInt(c.cost - credits)} more</span><kbd class="kbd">${c.shortcut}</kbd><span class="progress" style="width:${pct}%"></span></button>`;
+      chip.style.setProperty('--rarity', RARITY_COLOR[item.rarity]);
+      chip.textContent = RARITY_LABEL[item.rarity];
     }
-    const level = `<span class="badge">${c.level}</span>`;
-    return `
-      <div class="shop-card">
-        <div class="shop-card-top">
-          <span class="shop-icon"><svg class="icon"><use href="#${c.icon}"/></svg></span>
-          <div>
-            <div class="shop-title">${c.title}</div>
-            <div class="shop-level">${level}${c.maxed ? '' : `<span class="shop-price${canBuy ? '' : ' shop-price--short'}">$${fmtInt(c.cost)}</span>`}</div>
-          </div>
-        </div>
-        <p class="shop-desc">${c.desc}</p>
-        <div class="shop-stat-row">${stats}</div>
-        <div class="shop-buy">${buy}</div>
-      </div>`;
-  }).join('');
-
-  armoryGrid.querySelectorAll('.shop-buy-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const id = Number((btn as HTMLElement).dataset.upgradeId);
-      if (id > 0) {
-        pendingBuyUpgrade = id;
-        maybeSendInput();
+    const meta = document.createElement('span');
+    meta.className = 'row-meta';
+    let progress: HTMLElement | null = null;
+    if (isEncrypted(item)) {
+      if (item === decrypting && me.decrypt > 0) {
+        meta.textContent = `Decrypting · ${Math.max(0, DECRYPT_SECS[item.rarity] - me.decrypt).toFixed(0)}s left`;
+        meta.classList.add('rp-uplink');
+        progress = document.createElement('span');
+        progress.className = 'rp-progress';
+        const fill = document.createElement('span');
+        fill.style.width = `${Math.min(100, (me.decrypt / DECRYPT_SECS[item.rarity]) * 100)}%`;
+        progress.append(fill);
+      } else {
+        meta.append(`Decrypt ${DECRYPT_SECS[item.rarity]}s at an uplink`);
       }
-    });
+    } else {
+      meta.textContent = keyStat(item) ? `${item.power} PWR · ${keyStat(item)!.text.split(' · ')[0]}` : 'Sells at the trader';
+    }
+    const metaLine = document.createElement('span');
+    metaLine.className = 'rp-meta-line';
+    metaLine.append(chip, meta);
+    body.append(name, metaLine);
+    if (progress) body.append(progress);
+    const worth = document.createElement('span');
+    worth.className = 'rp-value';
+    worth.textContent = isEncrypted(item) ? `$${fmtInt(item.value)} now` : `$${fmtInt(item.value)}`;
+    if (isEncrypted(item)) {
+      const open = document.createElement('small');
+      open.className = 'value-open';
+      open.style.display = 'block';
+      open.textContent = `~$${fmtInt(estimatedValue(item))} decrypted`;
+      worth.append(open);
+    }
+    const side = document.createElement('span');
+    side.className = 'rp-side';
+    side.append(worth, holdToDrop(() => { pendingDropId = item.id; maybeSendInput(); }));
+    row.addEventListener('pointerenter', () => { raidInvHoverRow = row; });
+    row.addEventListener('pointerleave', () => { if (raidInvHoverRow === row) raidInvHoverRow = null; });
+    row.append(icon, body, side);
+    list.append(row);
   });
+  if (pack.length < cap) {
+    const row = document.createElement('div');
+    row.className = 'rp-row empty';
+    const free = cap - pack.length;
+    row.textContent = `${free} empty slot${free === 1 ? '' : 's'}`;
+    list.append(row);
+  }
+  const foot = document.getElementById('raidInvFoot')!;
+  foot.replaceChildren();
+  // Help text only for the first few times you open the pack.
+  if (raidInvHelpSeen > 3) { foot.hidden = true; return; }
+  foot.hidden = false;
+  const line1 = document.createElement('span');
+  const g = document.createElement('kbd');
+  g.className = 'kbd';
+  g.textContent = keyDisplayName(bindings.dropItem);
+  line1.append('Hold ', g, ' over an item: drop it');
+  const line2 = document.createElement('span');
+  line2.append('Tap ', g.cloneNode(true), ': drop your last pickup');
+  foot.append(line1, line2);
 }
 
 // Melee visual effect & cooldown tracker
@@ -1356,7 +1569,7 @@ function triggerMeleeAttack() {
       meleeSwingAngle = p.angle;
       const px = predictionInitialized ? predictedX : p.pos.x;
       const py = predictionInitialized ? predictedY : p.pos.y;
-      const reach = MELEE_RANGE * (1 + (p.meleeLevel || 0) * 0.1);
+      const reach = MELEE_RANGE;
       // Spawn plasma katana slash sparks along the 120° arc
       for (let i = 0; i < 10; i++) {
         const frac = i / 9 - 0.5;
@@ -1537,11 +1750,12 @@ const input: ClientInput = {
   selectWeapon: 0,
   dash: false,
   placeItem: 0,
-  buyUpgrade: 0,
 };
 
 let pendingPlaceItem = 0;
-let pendingBuyUpgrade = 0;
+let pendingDrop = false;
+/** Items you just dropped or swapped out: the loot hint ignores them for a few seconds. */
+const recentlyDropped = new Map<string, number>();
 
 // ============ Key Bindings System ============
 interface KeyBindings {
@@ -1554,12 +1768,12 @@ interface KeyBindings {
   dash: string;
   weapon1: string;
   weapon2: string;
-  weapon3: string;
-  weapon4: string;
   placeBarrel: string;
   placeBarricade: string;
   placeMine: string;
-  toggleShop: string;
+  toggleMap: string;
+  dropItem: string;
+  inventory: string;
 }
 
 const DEFAULT_BINDINGS: KeyBindings = {
@@ -1572,12 +1786,12 @@ const DEFAULT_BINDINGS: KeyBindings = {
   dash: 'ShiftLeft',
   weapon1: 'Digit1',
   weapon2: 'Digit2',
-  weapon3: 'Digit3',
-  weapon4: 'Digit4',
   placeBarrel: 'KeyE',
   placeBarricade: 'KeyQ',
   placeMine: 'KeyF',
-  toggleShop: 'KeyB',
+  toggleMap: 'KeyM',
+  dropItem: 'KeyG',
+  inventory: 'KeyI',
 };
 
 const BINDING_LABELS: Record<keyof KeyBindings, string> = {
@@ -1588,20 +1802,26 @@ const BINDING_LABELS: Record<keyof KeyBindings, string> = {
   shoot: 'Shoot',
   melee: 'Katana',
   dash: 'Dash',
-  weapon1: 'Pistol',
-  weapon2: 'Uzi',
-  weapon3: 'Shotgun',
-  weapon4: 'Rocket',
+  weapon1: 'Primary gun',
+  weapon2: 'Secondary gun',
   placeBarrel: 'Place barrel',
   placeBarricade: 'Place barricade',
   placeMine: 'Place claymore',
-  toggleShop: 'Open armory',
+  toggleMap: 'Full map',
+  dropItem: 'Drop last pickup',
+  inventory: 'Pack (inventory)',
 };
 
 function loadBindings(): KeyBindings {
   try {
     const saved = localStorage.getItem('boxhead_keybindings');
-    if (saved) return { ...DEFAULT_BINDINGS, ...JSON.parse(saved) };
+    if (saved) {
+      // Keep only actions that still exist (older builds had more weapon keys and an armory key).
+      const parsed = JSON.parse(saved) as Record<string, string>;
+      const merged = { ...DEFAULT_BINDINGS };
+      for (const key of Object.keys(DEFAULT_BINDINGS) as (keyof KeyBindings)[]) if (typeof parsed[key] === 'string') merged[key] = parsed[key];
+      return merged;
+    }
   } catch { /* ignore */ }
   return { ...DEFAULT_BINDINGS };
 }
@@ -1666,14 +1886,6 @@ function drainDeltaQueue() {
   for (let i = 0; i < count; i++) {
     applyDelta(pendingDeltas[i]);
     pushStateSnapshot();
-    if (gameOver && currentScreen === 'playing') {
-      const me = players[myId];
-      finalWave = wave;
-      finalScore = me ? me.score : 0;
-      finalKills = me ? me.kills : 0;
-      finalMaxCombo = me ? me.maxCombo : 0;
-      setScreen('gameover');
-    }
   }
   pendingDeltas.splice(0, count);
 }
@@ -1693,21 +1905,29 @@ function resetGameState() {
   muzzleFlashes.length = 0;
   dashGhosts.length = 0;
   eventFeed.length = 0;
-  wave = 1;
-  waveKills = 0;
-  waveTarget = 12;
-  waveBreakTimer = 0;
   ammoAvailability.clear();
-  gameOver = false;
+  crateAvailability.clear();
   dropMap.clear();
+  lastRaidEnd = null;
+  lastSnapshotTick = 0;
+  leavingRaid = false;
+  joinRefused = false;
+  lootHintKey = '';
   myId = '';
   stateBuffer.length = 0;
   lastSentInput = '';
   lastSendTime = 0;
   predictionInitialized = false;
   pendingDeltas.length = 0;
-  toggleArmory(false);
+  mapOpen = false;
 }
+
+/** Set when the player chose to leave, so the closing socket isn't reported as a lost connection. */
+let leavingRaid = false;
+/** Tick of the last snapshot; deltas at or before it are stale. */
+let lastSnapshotTick = 0;
+let joinRefused = false;
+let lootHintKey = '';
 
 function triggerWaveBanner(title: string, subtitle: string, color = theme.accent) {
   waveBannerText = title;
@@ -1717,9 +1937,10 @@ function triggerWaveBanner(title: string, subtitle: string, color = theme.accent
 }
 
 function connectToServer() {
+  deployedLoadout = { ...(hideoutView.state?.loadout ?? {}) };
   roomErrorMsg.textContent = '';
   currentRoomId = selectedRoomId;
-  currentRoomName = rooms.find(r => r.id === currentRoomId)?.name ?? 'Arena';
+  currentRoomName = rooms.find(r => r.id === currentRoomId)?.name ?? currentMap()?.name ?? 'the raid';
   resetGameState();
   setScreen('playing');
   localStorage.setItem('boxhead_name', playerName);
@@ -1728,7 +1949,7 @@ function connectToServer() {
   ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined, profileId: waveProfile, startingWave, roomId: currentRoomId }));
+    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined, roomId: currentRoomId, insure: (document.getElementById('insureToggle') as HTMLInputElement).checked }));
   };
 
   ws.onmessage = (event) => {
@@ -1736,8 +1957,15 @@ function connectToServer() {
 
     if (data.type === 'joinError') {
       // The server refused the join (e.g. verified-only room); onclose returns to the menu.
-      roomErrorMsg.textContent = (data as { type: string; error?: string }).error || 'Could not join that lobby';
+      joinRefused = true;
+      roomErrorMsg.textContent = (data as { type: string; error?: string }).error || 'Could not join that raid';
+      setScreen('menu');
       showMenuView('browser');
+    } else if (data.type === 'raidEnd') {
+      lastRaidEnd = data as RaidEnd;
+      if (ws) ws.onclose = null;
+      if (inputInterval) { clearInterval(inputInterval); inputInterval = null; }
+      setScreen('results');
     } else if (data.type === 'room') {
       const room = data as { type: string; hostId: string | null; paused: boolean; roomName?: string };
       roomHostId = room.hostId;
@@ -1745,12 +1973,12 @@ function connectToServer() {
       if (serverPaused !== room.paused) {
         serverPaused = room.paused;
         input.up = input.down = input.left = input.right = input.shooting = input.melee = input.dash = false;
-        input.placeItem = input.buyUpgrade = input.selectWeapon = 0;
+        input.placeItem = input.selectWeapon = 0;
         keysDown.clear();
         dashPending = false;
         dashActiveTimer = dashIframeTimer = 0;
         lastSentInput = '';
-        toggleArmory(false);
+        mapOpen = false;
       }
       renderRoomControls();
     } else if (data.type === 'init') {
@@ -1760,21 +1988,21 @@ function connectToServer() {
       staticMapWidth = init.mapWidth;
       staticMapHeight = init.mapHeight;
       staticAmmoSpawns = init.ammoSpawnPoints;
-      for (let i = 0; i < staticAmmoSpawns.length; i++) {
-        ammoAvailability.set(`ammo_${i}`, true);
-      }
-      if (init.gameOver) {
-        gameOver = true;
-        wave = init.wave ?? 1;
-        finalWave = wave;
-        finalScore = 0;
-        setScreen('gameover');
-      } else {
-        triggerWaveBanner(`Wave ${init.wave}`, 'Survive the horde', theme.accent);
-        pushFeedEvent(`Joined ${currentRoomName} · Wave ${init.wave}`, theme.you);
-      }
+      staticExtracts = init.extracts;
+      staticCrates = init.crates;
+      staticNests = init.nests;
+      staticUplinks = init.uplinks ?? [];
+      raidMap = init.map;
+      minimapCache = null;
+      for (let i = 0; i < staticAmmoSpawns.length; i++) ammoAvailability.set(`ammo_${i}`, true);
+      for (let i = 0; i < staticCrates.length; i++) crateAvailability.set(`crate_${i}`, true);
+      triggerWaveBanner(init.map.name, `Find loot · reach an extract within ${formatClock(init.map.raidSecs)}`, theme.text);
+      pushFeedEvent(currentRoomName && currentRoomName !== init.map.name ? `Deployed to ${init.map.name} · ${currentRoomName}` : `Deployed to ${init.map.name}`, theme.you);
     } else if (data.type === 'snapshot') {
       const snap = data as SnapshotState;
+      // Deltas queued before this snapshot describe older states: drop them.
+      for (let i = pendingDeltas.length - 1; i >= 0; i--) if (pendingDeltas[i].tick <= snap.tick) pendingDeltas.splice(i, 1);
+      lastSnapshotTick = snap.tick;
       players = snap.players;
       const mySnap = snap.players[myId];
       if (mySnap) {
@@ -1799,12 +2027,8 @@ function connectToServer() {
           placeableMap.set(p.id, p);
         }
       }
-      wave = snap.wave;
-      rememberWave(wave);
-      waveKills = snap.waveKills ?? 0;
-      waveTarget = snap.waveTarget ?? wave * 12;
-      waveBreakTimer = snap.waveBreakTimer ?? 0;
-      gameOver = snap.gameOver;
+      crateAvailability.clear();
+      for (const c of snap.crates ?? []) crateAvailability.set(c.id, c.available);
       ammoAvailability.clear();
       for (const a of snap.ammoPickups) {
         ammoAvailability.set(a.id, a.available);
@@ -1816,22 +2040,10 @@ function connectToServer() {
         }
       }
 
-      if (snap.gameOver && currentScreen === 'playing') {
-        const me = players[myId];
-        finalWave = wave;
-        finalScore = me ? Math.floor(me.score) : 0;
-        finalKills = me ? me.kills : 0;
-        finalMaxCombo = me ? me.maxCombo : 0;
-        toggleArmory(false);
-        setScreen('gameover');
-      } else if (!snap.gameOver && currentScreen === 'gameover') {
-        setScreen('playing');
-      }
-
-      if (armoryOpen) renderArmoryDOM();
       pushStateSnapshot();
     } else if (data.type === 'delta') {
-      pendingDeltas.push(data as DeltaState);
+      const delta = data as DeltaState;
+      if (lastSnapshotTick > 0 && delta.tick > lastSnapshotTick) pendingDeltas.push(delta);
     }
   };
 
@@ -1839,9 +2051,14 @@ function connectToServer() {
   ws.onclose = () => {
     if (ws !== connection) return;
     if (inputInterval) { clearInterval(inputInterval); inputInterval = null; }
-    if (currentScreen === 'playing') {
-      toggleArmory(false);
+    // A raid result closes the socket itself (onclose is cleared), and a refused
+    // join already showed its reason. Anything else mid-raid is a lost connection.
+    if (currentScreen === 'playing' && !joinRefused) {
       setScreen('menu');
+      showMenuView('hideout');
+      document.getElementById('hideoutError')!.textContent = leavingRaid
+        ? 'You left the raid. Your loadout and loot were lost.'
+        : 'Connection lost. A raid you drop out of counts as abandoned.';
     }
   };
 
@@ -1849,132 +2066,146 @@ function connectToServer() {
 }
 
 function applyDelta(delta: DeltaState) {
-  let myShopStateChanged = false;
   // Players
   if (delta.players) {
     for (const id in delta.players) {
       const diff = delta.players[id];
       const existing = players[id];
-      if (existing) {
-        if (diff.damageLog !== undefined) existing.damageLog = diff.damageLog;
-        if (diff.name !== undefined) existing.name = diff.name;
-        if (diff.pos) {
-          existing.pos = diff.pos;
-          if (id === myId && predictionInitialized) {
-            const errX = diff.pos.x - predictedX;
-            const errY = diff.pos.y - predictedY;
-            const errDist = Math.sqrt(errX * errX + errY * errY);
-            if (errDist > 50) {
-              predictedX = diff.pos.x;
-              predictedY = diff.pos.y;
-            } else if (errDist > 2) {
-              predictedX += errX * 0.3;
-              predictedY += errY * 0.3;
-            }
-          }
-        }
-        if (diff.angle !== undefined) existing.angle = diff.angle;
-        if (diff.health !== undefined) {
-          if (id === myId) {
-            if (diff.health < existing.health) {
-              const lost = Math.round(existing.health - diff.health);
-              damageFlashAlpha = 0.55;
-              addScreenShake(8);
-              spawnFloatingText(predictedX, predictedY - 18, `-${lost} HP`, theme.accent, 16);
-              if (armoryOpen) flashArmoryPanel();
-            } else if (diff.health > existing.health) {
-              const gained = Math.round(diff.health - existing.health);
-              healFlashAlpha = 0.35;
-              spawnFloatingText(predictedX, predictedY - 18, `+${gained} HP`, theme.health, 15);
-            }
-            myShopStateChanged = true;
-          }
-          existing.health = diff.health;
-        }
-        if (diff.maxHealth !== undefined) {
-          existing.maxHealth = diff.maxHealth;
-          if (id === myId) myShopStateChanged = true;
-        }
-        if (diff.score !== undefined) existing.score = diff.score;
-        if (diff.credits !== undefined) {
-          if (id === myId) {
-            const prevCredits = existing.credits ?? 0;
-            const deltaCredits = Math.round(diff.credits - prevCredits);
-            if (deltaCredits >= 25) {
-              spawnFloatingText(predictedX + 12, predictedY - 28, `+$${deltaCredits}`, theme.money, 14);
-            }
-            myShopStateChanged = true;
-          }
-          existing.credits = diff.credits;
-        }
-        if (diff.ammo !== undefined) {
-          if (id === myId && diff.ammo > existing.ammo) {
-            const gained = Math.round(diff.ammo - existing.ammo);
-            spawnFloatingText(predictedX, predictedY - 26, `+${gained} ammo`, theme.text, 13);
-          }
-          existing.ammo = diff.ammo;
-          if (id === myId) myShopStateChanged = true;
-        }
-        if (diff.maxAmmo !== undefined) {
-          existing.maxAmmo = diff.maxAmmo;
-          if (id === myId) myShopStateChanged = true;
-        }
-        if (diff.weapon !== undefined) existing.weapon = diff.weapon;
-        if (diff.weaponSlots !== undefined) {
-          if (id === myId) {
-            const weaponNames = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
-            for (let s = 1; s < 4; s++) {
-              if (diff.weaponSlots[s] && !existing.weaponSlots[s]) {
-                spawnFloatingText(predictedX, predictedY - 34, `Unlocked ${weaponNames[s]}`, theme.you, 16);
-                pushFeedEvent(`Unlocked the ${weaponNames[s]}`, theme.you);
-              }
-            }
-            myShopStateChanged = true;
-          }
-          existing.weaponSlots = diff.weaponSlots;
-        }
-        if (diff.combo !== undefined) {
-          if (id === myId && diff.combo > existing.combo) {
-            const c = diff.combo;
-            if (c % 5 === 0) {
-              // Milestone credits stack (server rules): every 5th kill +$35, every 10th +$60 more, every 15th +$100 more.
-              const bonus = 35 + (c % 10 === 0 ? 60 : 0) + (c % 15 === 0 ? 100 : 0);
-              pushFeedEvent(c === 10 ? `Overdrive! +$${bonus}, rapid fire` : `${c}× combo: +$${bonus}`, theme.money);
-              spawnFloatingText(predictedX, predictedY - 38, c === 10 ? 'Overdrive: rapid fire' : `${c}× combo +$${bonus}`, theme.money, c >= 10 ? 17 : 15);
-            }
-          }
-          existing.combo = diff.combo;
-        }
-        if (diff.comboTimer !== undefined) existing.comboTimer = diff.comboTimer;
-        if (diff.maxCombo !== undefined) existing.maxCombo = diff.maxCombo;
-        if (diff.kills !== undefined) existing.kills = diff.kills;
-        if (diff.tacticalItems !== undefined) {
-          existing.tacticalItems = diff.tacticalItems;
-          if (id === myId) myShopStateChanged = true;
-        }
-        if (diff.damageLevel !== undefined) {
-          if (id === myId && diff.damageLevel > existing.damageLevel) {
-            spawnFloatingText(predictedX, predictedY - 36, `Firearm power level ${diff.damageLevel}`, theme.you, 16);
-            pushFeedEvent(`Firearm power: level ${diff.damageLevel}`, theme.you);
-            myShopStateChanged = true;
-          }
-          existing.damageLevel = diff.damageLevel;
-        }
-        if (diff.meleeLevel !== undefined) {
-          if (id === myId && diff.meleeLevel > (existing.meleeLevel || 0)) {
-            spawnFloatingText(predictedX, predictedY - 36, `Katana level ${diff.meleeLevel}`, theme.you, 16);
-            pushFeedEvent(`Katana: level ${diff.meleeLevel}`, theme.you);
-            myShopStateChanged = true;
-          }
-          existing.meleeLevel = diff.meleeLevel;
-        }
-      } else {
+      if (!existing) {
         players[id] = diff as Player;
+        continue;
       }
+      const me = id === myId;
+      if (diff.damageLog !== undefined) existing.damageLog = diff.damageLog;
+      if (diff.name !== undefined) existing.name = diff.name;
+      if (diff.pos) {
+        existing.pos = diff.pos;
+        if (me && predictionInitialized) {
+          const errX = diff.pos.x - predictedX;
+          const errY = diff.pos.y - predictedY;
+          const errDist = Math.sqrt(errX * errX + errY * errY);
+          if (errDist > 50) {
+            predictedX = diff.pos.x;
+            predictedY = diff.pos.y;
+          } else if (errDist > 2) {
+            predictedX += errX * 0.3;
+            predictedY += errY * 0.3;
+          }
+        }
+      }
+      if (diff.angle !== undefined) existing.angle = diff.angle;
+      if (diff.health !== undefined) {
+        if (me) {
+          if (diff.health < existing.health) {
+            const lost = Math.round(existing.health - diff.health);
+            damageFlashAlpha = 0.55;
+            addScreenShake(8);
+            spawnFloatingText(predictedX, predictedY - 18, `-${lost} HP`, theme.accent, 16);
+            if (diff.health <= 0) pushFeedEvent(Object.values(players).some(o => o.id !== myId && o.health > 0) ? 'You are down: get revived' : 'You are down: nobody can revive you', theme.accent);
+          } else if (diff.health > existing.health) {
+            const gained = Math.round(diff.health - existing.health);
+            healFlashAlpha = 0.35;
+            spawnFloatingText(predictedX, predictedY - 18, `+${gained} HP`, theme.health, 15);
+          }
+        } else if (diff.health <= 0 && existing.health > 0) {
+          pushFeedEvent(`${existing.name || 'Squadmate'} down: stand close to revive`, theme.accent);
+        }
+        existing.health = diff.health;
+      }
+      if (diff.maxHealth !== undefined) existing.maxHealth = diff.maxHealth;
+      if (diff.bounty !== undefined) {
+        const gained = Math.round(diff.bounty - (existing.bounty ?? 0));
+        if (me && gained >= 10) spawnFloatingText(predictedX + 12, predictedY - 28, `+$${gained}`, theme.money, 14);
+        existing.bounty = diff.bounty;
+      }
+      if (diff.ammo !== undefined) {
+        if (me && diff.ammo > existing.ammo + 1) {
+          spawnFloatingText(predictedX, predictedY - 26, `+${Math.round(diff.ammo - existing.ammo)} ammo`, theme.text, 13);
+        }
+        existing.ammo = diff.ammo;
+      }
+      if (diff.maxAmmo !== undefined) existing.maxAmmo = diff.maxAmmo;
+      if (diff.weapon !== undefined) existing.weapon = diff.weapon;
+      if (diff.weapons !== undefined) existing.weapons = diff.weapons;
+      if (diff.activeSlot !== undefined) existing.activeSlot = diff.activeSlot;
+      if (diff.backpack !== undefined) {
+        if (me) {
+          const before = new Set(existing.backpack.map(i => i.id));
+          const after = new Set(diff.backpack.map(i => i.id));
+          // A sealed item replaced in place by a new one was decrypted, not dropped.
+          const opened = new Set<string>();
+          diff.backpack.forEach((item, idx) => {
+            const old = existing.backpack[idx];
+            if (!before.has(item.id) && old && isEncrypted(old) && !after.has(old.id) && existing.backpack.length === diff.backpack!.length) {
+              opened.add(old.id);
+              spawnFloatingText(predictedX, predictedY - 40, `Decrypted: ${item.name}`, RARITY_COLOR[item.rarity], 17);
+              pushFeedEvent(`Decrypted ${old.name} → ${RARITY_LABEL[item.rarity]} ${item.name} · $${fmtInt(item.value)}`, RARITY_COLOR[item.rarity]);
+              before.add(item.id);
+            }
+          });
+          for (const item of diff.backpack) {
+            if (before.has(item.id)) continue;
+            spawnFloatingText(predictedX, predictedY - 40, `+ ${item.name} (${item.power})`, RARITY_COLOR[item.rarity], item.rarity === 'common' ? 14 : 16);
+            pushFeedEvent(`+ ${item.name} · $${fmtInt(item.value)}`, RARITY_COLOR[item.rarity]);
+          }
+          for (const old of existing.backpack) {
+            if (!after.has(old.id) && !opened.has(old.id)) {
+              recentlyDropped.set(old.id, performance.now());
+              pushFeedEvent(`Dropped ${old.name}`, theme.textSecondary);
+            }
+          }
+        }
+        existing.backpack = diff.backpack;
+      }
+      if (diff.backpackCapacity !== undefined) existing.backpackCapacity = diff.backpackCapacity;
+      if (diff.gearScore !== undefined) existing.gearScore = diff.gearScore;
+      if (diff.raidTime !== undefined) {
+        if (me) {
+          for (const mark of [300, 120, 60]) {
+            if (existing.raidTime > mark && diff.raidTime <= mark) {
+              triggerWaveBanner(`${formatClock(mark)} left`, 'Get to an extraction point or be lost', mark <= 60 ? theme.accent : theme.money);
+              pushFeedEvent(`${formatClock(mark)} left in the raid`, mark <= 60 ? theme.accent : theme.money);
+            }
+          }
+        }
+        existing.raidTime = diff.raidTime;
+      }
+      if (diff.extractProgress !== undefined) {
+        if (me && existing.extractProgress <= 0 && diff.extractProgress > 0) pushFeedEvent('Extracting: stay inside the ring', theme.health);
+        existing.extractProgress = diff.extractProgress;
+      }
+      if (diff.bleedout !== undefined) existing.bleedout = diff.bleedout;
+      if (diff.camp !== undefined) {
+        if (me && existing.camp < CAMP_WARNING && diff.camp >= CAMP_WARNING && !existing.hunted) {
+          pushFeedEvent('Camping: keep moving or be hunted', theme.money);
+        }
+        existing.camp = diff.camp;
+      }
+      if (diff.decrypt !== undefined) {
+        if (me && !(existing.decrypt > 0) && diff.decrypt > 0) pushFeedEvent('Decrypting: stay in the ring · the noise draws monsters', UPLINK_COLOR);
+        existing.decrypt = diff.decrypt;
+      }
+      if (diff.hunted !== undefined) {
+        if (me && diff.hunted && !existing.hunted) {
+          triggerWaveBanner('Hunted', 'You stayed in one place too long. Something is coming for you', theme.accent);
+          addScreenShake(10);
+        }
+        if (me && !diff.hunted && existing.hunted) pushFeedEvent('The hunt is over', theme.textSecondary);
+        existing.hunted = diff.hunted;
+      }
+      if (diff.combo !== undefined) {
+        if (me && diff.combo > existing.combo && diff.combo % 5 === 0) {
+          const c = diff.combo;
+          pushFeedEvent(c === 10 ? 'Overdrive! Rapid fire and a speed boost' : `${c}× combo: resupplied`, theme.money);
+          spawnFloatingText(predictedX, predictedY - 52, c === 10 ? 'Overdrive' : `${c}× combo`, theme.money, c >= 10 ? 17 : 15);
+        }
+        existing.combo = diff.combo;
+      }
+      if (diff.comboTimer !== undefined) existing.comboTimer = diff.comboTimer;
+      if (diff.maxCombo !== undefined) existing.maxCombo = diff.maxCombo;
+      if (diff.kills !== undefined) existing.kills = diff.kills;
+      if (diff.tacticalItems !== undefined) existing.tacticalItems = diff.tacticalItems;
     }
-  }
-  if (myShopStateChanged && armoryOpen) {
-    renderArmoryDOM();
   }
   if (delta.playersRemoved) {
     for (const id of delta.playersRemoved) {
@@ -2014,7 +2245,14 @@ function applyDelta(delta: DeltaState) {
   if (delta.zombiesRemoved) {
     for (const id of delta.zombiesRemoved) {
       const z = zombieMap.get(id);
-      if (z) {
+      // Culled enemies (far from everyone) vanish without a death effect.
+      // Enemies also vanish when they leave your view range: only show deaths on screen.
+      const visible = z && Math.abs(z.pos.x - camX - canvas.width / 2) < canvas.width / 2 + 40 && Math.abs(z.pos.y - camY - canvas.height / 2) < canvas.height / 2 + 40;
+      if (z && visible && z.type === 'abomination') {
+        triggerWaveBanner('Abomination down', 'It dropped high-end loot', theme.money);
+        spawnExplosion(z.pos.x, z.pos.y, 140, '#7a2034');
+      }
+      if (z && visible) {
         const dmg = Math.max(10, Math.round(z.health));
         spawnBlood(z.pos.x, z.pos.y, 14, true);
         spawnFloatingText(z.pos.x, z.pos.y - 14, `-${dmg}`, theme.text, 15);
@@ -2096,28 +2334,19 @@ function applyDelta(delta: DeltaState) {
     }
   }
 
-  // Wave & Wave Break transitions
-  if (delta.waveBreakTimer !== undefined) {
-    if (waveBreakTimer <= 0 && delta.waveBreakTimer > 0) {
-      // The server pays 100 + 30 per wave number for a clear.
-      const clearBonus = 100 + wave * 30;
-      triggerWaveBanner(`Wave ${wave} cleared`, `+$${clearBonus} · +25 HP · gear resupplied`, theme.text);
-      pushFeedEvent(`Wave ${wave} cleared: +$${clearBonus}`, theme.money);
+  if (delta.crates) {
+    for (const c of delta.crates) {
+      if (crateAvailability.get(c.id) && !c.available) {
+        const i = Number(c.id.slice(6));
+        const crate = staticCrates[i];
+        if (crate && Math.hypot(crate.x - predictedX, crate.y - predictedY) < 400) {
+          spawnFloatingText(crate.x, crate.y - 20, 'Crate opened', theme.money, 14);
+          shockwaves.push({ x: crate.x, y: crate.y, radius: 8, maxRadius: 46, color: '#f2b53c', life: 0.3, maxLife: 0.3 });
+        }
+      }
+      crateAvailability.set(c.id, c.available);
     }
-    waveBreakTimer = delta.waveBreakTimer;
   }
-  if (delta.wave !== undefined) {
-    if (delta.wave > wave) {
-      waveBreakTimer = 0;
-      triggerWaveBanner(`Wave ${delta.wave}`, 'Hostiles inbound', theme.accent);
-      pushFeedEvent(`Wave ${delta.wave} started`, theme.textSecondary);
-    }
-    wave = delta.wave;
-    rememberWave(wave);
-  }
-  if (delta.waveKills !== undefined) waveKills = delta.waveKills;
-  if (delta.waveTarget !== undefined) waveTarget = delta.waveTarget;
-  if (delta.gameOver !== undefined) gameOver = delta.gameOver;
   if (delta.ammoPickups) {
     for (const a of delta.ammoPickups) {
       ammoAvailability.set(a.id, a.available);
@@ -2165,23 +2394,6 @@ function tryTriggerDash() {
 }
 
 function handleActionDown(code: string) {
-  // When Armory modal is open, number keys [1]-[6] purchase shop cards directly
-  if (armoryOpen) {
-    const shopShortcuts: Record<string, number> = {
-      Digit1: 1, // Firearm Power
-      Digit2: 5, // Plasma Katana
-      Digit3: 2, // Nano-Armor
-      Digit4: 3, // Expanded Magazine
-      Digit5: 4, // Tactical Munitions Pack
-      Digit6: 6, // Unlock Next Firearm
-    };
-    if (shopShortcuts[code]) {
-      pendingBuyUpgrade = shopShortcuts[code];
-      maybeSendInput();
-      return;
-    }
-  }
-
   const actions = codeToActions(code);
   for (const action of actions) {
     switch (action) {
@@ -2189,36 +2401,29 @@ function handleActionDown(code: string) {
       case 'moveDown': input.down = true; break;
       case 'moveLeft': input.left = true; break;
       case 'moveRight': input.right = true; break;
-      case 'shoot':
-        if (!armoryOpen) input.shooting = true;
-        break;
-      case 'melee':
-        if (!armoryOpen) triggerMeleeAttack();
-        break;
+      case 'shoot': input.shooting = true; break;
+      case 'melee': triggerMeleeAttack(); break;
       case 'dash':
         if (isMoving()) tryTriggerDash();
         break;
       case 'weapon1': input.selectWeapon = 1; break;
       case 'weapon2': input.selectWeapon = 2; break;
-      case 'weapon3': input.selectWeapon = 3; break;
-      case 'weapon4': input.selectWeapon = 4; break;
       case 'placeBarrel': pendingPlaceItem = 1; break;
       case 'placeBarricade': pendingPlaceItem = 2; break;
       case 'placeMine': pendingPlaceItem = 3; break;
-      case 'toggleShop': toggleArmory(); break;
+      case 'toggleMap': toggleMap(); break;
+      case 'dropItem': pendingDrop = true; break;
+      case 'inventory': toggleRaidInventory(); break;
     }
   }
 
   // Right mouse button (Mouse2) also acts as a quick Melee Cleave trigger
-  if (code === 'Mouse2' && !armoryOpen && currentScreen === 'playing') {
+  if (code === 'Mouse2' && currentScreen === 'playing') {
     triggerMeleeAttack();
   }
-
-  if (!armoryOpen) {
-    if (code === 'Digit5') pendingPlaceItem = 1;
-    if (code === 'Digit6') pendingPlaceItem = 2;
-    if (code === 'Digit7') pendingPlaceItem = 3;
-  }
+  if (code === 'Digit5') pendingPlaceItem = 1;
+  if (code === 'Digit6') pendingPlaceItem = 2;
+  if (code === 'Digit7') pendingPlaceItem = 3;
 }
 
 function handleActionUp(code: string) {
@@ -2231,7 +2436,7 @@ function handleActionUp(code: string) {
       case 'moveRight': input.right = false; break;
       case 'shoot': input.shooting = false; break;
       case 'melee': input.melee = false; break;
-      case 'weapon1': case 'weapon2': case 'weapon3': case 'weapon4':
+      case 'weapon1': case 'weapon2':
         input.selectWeapon = 0; break;
     }
   }
@@ -2258,10 +2463,6 @@ window.addEventListener('keydown', (e) => {
   if (wasDown) return;
   keysDown.add(code);
 
-  if (code === 'Escape' && armoryOpen) {
-    toggleArmory(false);
-    return;
-  }
 
   if (doubleTapDash && !wasDown) {
     const dirCodes = [bindings.moveUp, bindings.moveDown, bindings.moveLeft, bindings.moveRight];
@@ -2296,7 +2497,7 @@ window.addEventListener('mousemove', (e) => {
 
 window.addEventListener('mousedown', (e) => {
   if (settingsListening || serverPaused) return;
-  if ((e.target as HTMLElement).closest('#roomControls, #pauseOverlay, #armoryOverlay') || (e.target as HTMLElement).closest('#settingsOverlay')) {
+  if ((e.target as HTMLElement).closest('#roomControls, #pauseOverlay, #raidInventory') || (e.target as HTMLElement).closest('#settingsOverlay')) {
     return;
   }
   if (currentScreen === 'playing' && e.button === 0) {
@@ -2322,14 +2523,14 @@ window.addEventListener('mousedown', (e) => {
       tryTriggerDash();
       return;
     }
-    // Check if clicking hotbar Armory button
+    // Hotbar map button
     if (
-      e.clientX >= hotbarArmoryBtnRect.x &&
-      e.clientX <= hotbarArmoryBtnRect.x + hotbarArmoryBtnRect.w &&
-      e.clientY >= hotbarArmoryBtnRect.y &&
-      e.clientY <= hotbarArmoryBtnRect.y + hotbarArmoryBtnRect.h
+      e.clientX >= hotbarMapBtnRect.x &&
+      e.clientX <= hotbarMapBtnRect.x + hotbarMapBtnRect.w &&
+      e.clientY >= hotbarMapBtnRect.y &&
+      e.clientY <= hotbarMapBtnRect.y + hotbarMapBtnRect.h
     ) {
-      toggleArmory();
+      toggleMap();
       return;
     }
     // Check if clicking weapon slots on hotbar
@@ -2406,16 +2607,9 @@ function handleTouchStart(e: TouchEvent) {
       const wdy = ty - touchWeaponBtn.y;
       if (wdx * wdx + wdy * wdy < (touchWeaponBtn.r + 10) ** 2) {
         const p = players[myId];
-        if (p) {
-          const currentSlot = ['pistol', 'uzi', 'shotgun', 'rocketLauncher'].indexOf(p.weapon);
-          for (let s = 1; s <= 4; s++) {
-            const next = (currentSlot + s) % 4;
-            if (p.weaponSlots[next]) {
-              input.selectWeapon = next + 1;
-              setTimeout(() => { input.selectWeapon = 0; }, 100);
-              break;
-            }
-          }
+        if (p && p.weapons.length > 1) {
+          input.selectWeapon = ((p.activeSlot + 1) % p.weapons.length) + 1;
+          setTimeout(() => { input.selectWeapon = 0; }, 100);
         }
         continue;
       }
@@ -2509,9 +2703,13 @@ function maybeSendInput() {
     input.placeItem = pendingPlaceItem;
     pendingPlaceItem = 0;
   }
-  if (pendingBuyUpgrade > 0) {
-    input.buyUpgrade = pendingBuyUpgrade;
-    pendingBuyUpgrade = 0;
+  if (pendingDrop) {
+    input.dropItem = true;
+    pendingDrop = false;
+  }
+  if (pendingDropId) {
+    input.dropId = pendingDropId;
+    pendingDropId = null;
   }
 
   const snapshot = JSON.stringify(input);
@@ -2525,7 +2723,8 @@ function maybeSendInput() {
 
   input.dash = false;
   input.placeItem = 0;
-  input.buyUpgrade = 0;
+  input.dropItem = false;
+  delete input.dropId;
 }
 
 function buildRenderState(): GameState | null {
@@ -2540,10 +2739,6 @@ function buildRenderState(): GameState | null {
     zombies: interpZombies,
     bullets: extrapBullets,
     placeables: Array.from(placeableMap.values()),
-    wave,
-    waveKills,
-    waveTarget,
-    waveBreakTimer,
     walls: staticWalls,
     ammoPickups: staticAmmoSpawns.map((s, i) => ({
       id: `ammo_${i}`,
@@ -2553,7 +2748,6 @@ function buildRenderState(): GameState | null {
     })),
     mapWidth: staticMapWidth,
     mapHeight: staticMapHeight,
-    gameOver,
     drops: Array.from(dropMap.values()),
   };
 }
@@ -2601,74 +2795,72 @@ function drawGrid() {
   }
 }
 
-function drawTunnels() {
-  const pulse = 0.4 + 0.3 * Math.sin(performance.now() / 500);
-  const tw = TUNNEL_WIDTH;
-  const hMid = MAP_WIDTH / 2;
-  const vMid = MAP_HEIGHT / 2;
-  const arrowSize = 12;
+const onScreen = (x: number, y: number, pad: number) => {
+  const sx = x - camX, sy = y - camY;
+  return sx > -pad && sx < canvas.width + pad && sy > -pad && sy < canvas.height + pad;
+};
 
-  function drawTunnelOpening(
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-    arrowDir: 'up' | 'down' | 'left' | 'right'
-  ) {
-    const sx = x - camX;
-    const sy = y - camY;
-    if (sx + w < -20 || sx > canvas.width + 20 || sy + h < -20 || sy > canvas.height + 20) return;
+function drawNests() {
+  const now = performance.now();
+  for (const n of staticNests) if (onScreen(n.x, n.y, 140)) drawNestSprite(ctx, n.x - camX, n.y - camY, now);
+}
 
-    ctx.fillStyle = `rgba(0, 200, 255, ${pulse * 0.15})`;
-    ctx.fillRect(sx, sy, w, h);
+function drawCrates() {
+  const now = performance.now();
+  staticCrates.forEach((c, i) => {
+    if (crateAvailability.get(`crate_${i}`) && onScreen(c.x, c.y, 40)) drawCrateSprite(ctx, c.x - camX, c.y - camY, now);
+  });
+}
 
-    ctx.strokeStyle = `rgba(0, 200, 255, ${pulse * 0.6})`;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([8, 4]);
-    ctx.strokeRect(sx + 1, sy + 1, w - 2, h - 2);
-    ctx.setLineDash([]);
-
-    ctx.fillStyle = `rgba(0, 200, 255, ${pulse * 0.8})`;
-    const cx = sx + w / 2;
-    const cy = sy + h / 2;
-
-    const drawArrow = (ax: number, ay: number) => {
-      ctx.beginPath();
-      if (arrowDir === 'up') {
-        ctx.moveTo(ax, ay - arrowSize);
-        ctx.lineTo(ax - arrowSize / 2, ay);
-        ctx.lineTo(ax + arrowSize / 2, ay);
-      } else if (arrowDir === 'down') {
-        ctx.moveTo(ax, ay + arrowSize);
-        ctx.lineTo(ax - arrowSize / 2, ay);
-        ctx.lineTo(ax + arrowSize / 2, ay);
-      } else if (arrowDir === 'left') {
-        ctx.moveTo(ax - arrowSize, ay);
-        ctx.lineTo(ax, ay - arrowSize / 2);
-        ctx.lineTo(ax, ay + arrowSize / 2);
-      } else {
-        ctx.moveTo(ax + arrowSize, ay);
-        ctx.lineTo(ax, ay - arrowSize / 2);
-        ctx.lineTo(ax, ay + arrowSize / 2);
-      }
-      ctx.fill();
-    };
-
-    if (arrowDir === 'left' || arrowDir === 'right') {
-      drawArrow(cx, cy - 30);
-      drawArrow(cx, cy);
-      drawArrow(cx, cy + 30);
-    } else {
-      drawArrow(cx - 30, cy);
-      drawArrow(cx, cy);
-      drawArrow(cx + 30, cy);
-    }
+function drawExtracts(state: GameState) {
+  const now = performance.now();
+  const me = state.players[myId];
+  for (const e of staticExtracts) {
+    if (!onScreen(e.x, e.y, e.radius + 40)) continue;
+    const inside = me && Math.hypot(me.pos.x - e.x, me.pos.y - e.y) < e.radius;
+    drawExtractZone(ctx, e.x - camX, e.y - camY, e.radius, e.name, now, inside ? (me.extractProgress || 0) / EXTRACT_TIME : 0);
   }
+}
 
-  drawTunnelOpening(hMid - tw / 2, 0, tw, 20, 'up');
-  drawTunnelOpening(hMid - tw / 2, MAP_HEIGHT - 20, tw, 20, 'down');
-  drawTunnelOpening(0, vMid - tw / 2, 20, tw, 'left');
-  drawTunnelOpening(MAP_WIDTH - 20, vMid - tw / 2, 20, tw, 'right');
+function drawUplinks(state: GameState) {
+  const now = performance.now();
+  const me = state.players[myId];
+  for (const u of staticUplinks) {
+    if (!onScreen(u.x, u.y, u.radius + 60)) continue;
+    const sx = u.x - camX, sy = u.y - camY;
+    const inside = !!me && Math.hypot(me.pos.x - u.x, me.pos.y - u.y) < u.radius;
+    const sealed = me?.backpack?.find(isEncrypted);
+    ctx.save();
+    // Ring
+    ctx.strokeStyle = withAlpha(UPLINK_COLOR, inside ? 0.9 : 0.5);
+    ctx.lineWidth = 2;
+    ctx.setLineDash([10, 8]);
+    ctx.lineDashOffset = -now / 60;
+    ctx.beginPath(); ctx.arc(sx, sy, u.radius, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = withAlpha(UPLINK_COLOR, inside ? 0.1 : 0.05);
+    ctx.fill();
+    // Terminal: a glowing diamond on a base.
+    const pulse = 0.6 + 0.4 * Math.sin(now / 300);
+    ctx.fillStyle = '#10161d';
+    ctx.fillRect(sx - 14, sy - 6, 28, 18);
+    ctx.shadowColor = UPLINK_COLOR;
+    ctx.shadowBlur = 14 * pulse;
+    ctx.fillStyle = UPLINK_COLOR;
+    ctx.beginPath(); ctx.moveTo(sx, sy - 22); ctx.lineTo(sx + 9, sy - 10); ctx.lineTo(sx, sy + 2); ctx.lineTo(sx - 9, sy - 10); ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0;
+    // Progress arc while you decrypt here.
+    if (inside && sealed && me.decrypt > 0) {
+      ctx.strokeStyle = UPLINK_COLOR;
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.arc(sx, sy, u.radius - 6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, me.decrypt / DECRYPT_SECS[sealed.rarity]));
+      ctx.stroke();
+    }
+    ctx.restore();
+    hudText(u.name.toUpperCase(), sx, sy + 30, { size: 11, weight: 800, color: UPLINK_COLOR, align: 'center' });
+    if (inside && !sealed) hudText('Nothing sealed to decrypt', sx, sy + 46, { size: 11, weight: 600, color: theme.textSecondary, align: 'center' });
+  }
 }
 
 function drawBloodStains() {
@@ -2805,8 +2997,8 @@ function drawTickHealthBar(sx: number, sy: number, health: number, maxHealth: nu
 
 function drawZombies(state: GameState) {
   const myPlayer = state.players[myId];
-  const dmgMult = myPlayer ? 1 + (myPlayer.damageLevel || 0) * 0.2 : 1;
-  const weaponDmg = (myPlayer ? (WEAPON_STATS[myPlayer.weapon]?.damage ?? 25) : 25) * dmgMult;
+  const gun = myPlayer?.weapons?.[myPlayer.activeSlot];
+  const weaponDmg = (myPlayer ? (WEAPON_STATS[myPlayer.weapon]?.damage ?? 25) : 25) * weaponDamageMult(gun?.power ?? 1);
 
   for (const z of state.zombies) {
     const sx = z.pos.x - camX;
@@ -2826,7 +3018,7 @@ function drawZombies(state: GameState) {
       angle = Math.atan2(closestP.pos.y - z.pos.y, closestP.pos.x - z.pos.x);
     }
 
-    const size = drawEnemySprite(ctx, z.type, sx, sy, angle);
+    const size = drawEnemySprite(ctx, z.type, sx, sy, angle, !!z.elite);
 
     const barW = size * 2 + 10;
     drawTickHealthBar(sx - barW / 2, sy - size - 16, z.health, z.maxHealth, barW, weaponDmg);
@@ -2982,8 +3174,7 @@ function drawMeleeSwing(dt: number, state: GameState) {
 
   const progress = Math.max(0, Math.min(1, 1 - meleeSwingTime / 0.28));
   const alpha = Math.max(0, 1 - progress * 0.85);
-  const meleeLv = p.meleeLevel || 0;
-  const maxReach = MELEE_RANGE * (1 + meleeLv * 0.1);
+  const maxReach = MELEE_RANGE;
   const arcRadius = maxReach * (0.55 + progress * 0.45);
   const halfArc = Math.PI / 3; // 120° total cleave arc
   const startAngle = meleeSwingAngle - halfArc;
@@ -3084,7 +3275,7 @@ function drawPlayers(dt: number, state: GameState) {
       ctx.fillText(displayName, 0, -24);
       ctx.fillStyle = theme.textSecondary;
       ctx.font = font(11, 600);
-      ctx.fillText('Stand close to revive', 0, 22);
+      ctx.fillText(`Bleeding out ${Math.ceil(p.bleedout || 0)}s · stand close to revive`, 0, 22);
       ctx.restore();
       continue;
     }
@@ -3334,7 +3525,7 @@ const HOTBAR_ICONS: Record<string, Path2D> = {
   barrel: new Path2D('M7 3h10v18H7zM7 8h10M7 16h10'),
   barricade: new Path2D('M3 8h18v8H3zM8 8l-3 8M13 8l-3 8M18 8l-3 8'),
   claymore: new Path2D('M4 17a8 7 0 0 1 16 0zM12 10V6M9 7l3-2 3 2'),
-  armory: new Path2D('M5 8h14l-1 12H6zM9 8a3 3 0 0 1 6 0'),
+  map: new Path2D('M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2zM9 4v14M15 6v14'),
   lock: new Path2D('M7 11h10v8H7zM9 11V8.5a3 3 0 0 1 6 0V11'),
   dash: new Path2D('M5 6l6 6-6 6M13 6l6 6-6 6'),
 };
@@ -3351,72 +3542,193 @@ function drawIcon(icon: Path2D, cx: number, cy: number, size: number, color: str
   ctx.restore();
 }
 
-function drawMinimap(state: GameState) {
-  const pad = 8;
-  const mmW = HUD.sideW - pad * 2;
-  const mmH = mmW * (staticMapHeight / staticMapWidth);
-  const panelW = mmW + pad * 2;
-  const panelH = mmH + pad * 2;
-  const px = canvas.width - HUD.margin - panelW;
-  const py = canvas.height - HUD.margin - panelH;
-  const mmX = px + pad;
-  const mmY = py + pad;
-  const scaleX = mmW / staticMapWidth;
-  const scaleY = mmH / staticMapHeight;
-  const dot = (x: number, y: number, size: number, color: string) => {
-    ctx.fillStyle = color;
-    ctx.fillRect(mmX + x * scaleX - size / 2, mmY + y * scaleY - size / 2, size, size);
-  };
-
-  hudPanel(px, py, panelW, panelH);
-  ctx.save();
-  hudRoundRect(mmX, mmY, mmW, mmH, 6);
-  ctx.clip();
-  ctx.fillStyle = theme.field;
-  ctx.fillRect(mmX, mmY, mmW, mmH);
-  ctx.fillStyle = theme.borderStrong;
-  for (const w of staticWalls) {
-    ctx.fillRect(mmX + w.x * scaleX, mmY + w.y * scaleY, Math.max(1, w.w * scaleX), Math.max(1, w.h * scaleY));
-  }
-  for (let i = 0; i < staticAmmoSpawns.length; i++) {
-    if (ammoAvailability.get(`ammo_${i}`)) dot(staticAmmoSpawns[i].x, staticAmmoSpawns[i].y, 3, theme.textSecondary);
-  }
-  for (const pl of state.placeables) dot(pl.pos.x, pl.pos.y, 3, theme.textMuted);
-  for (const d of state.drops) dot(d.pos.x, d.pos.y, 3, d.type === 'health' ? theme.health : theme.textSecondary);
-
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(mmX + camX * scaleX, mmY + camY * scaleY, canvas.width * scaleX, canvas.height * scaleY);
-
-  for (const z of state.zombies) dot(z.pos.x, z.pos.y, 3, theme.accent);
-  for (const id in state.players) {
-    if (id !== myId) dot(state.players[id].pos.x, state.players[id].pos.y, 5, theme.text);
-  }
-  const me = state.players[myId];
-  if (me) dot(me.pos.x, me.pos.y, 6, theme.you);
-  ctx.restore();
+/** Pre-rendered walls for the radar and full map (the big maps have hundreds of walls). */
+let minimapCache: { canvas: HTMLCanvasElement; scale: number } | null = null;
+function wallLayer(): { canvas: HTMLCanvasElement; scale: number } {
+  if (minimapCache) return minimapCache;
+  const scale = 0.12;
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(staticMapWidth * scale);
+  c.height = Math.ceil(staticMapHeight * scale);
+  const g = c.getContext('2d')!;
+  g.fillStyle = theme.field;
+  g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = theme.borderStrong;
+  for (const w of staticWalls) g.fillRect(w.x * scale, w.y * scale, Math.max(1, w.w * scale), Math.max(1, w.h * scale));
+  minimapCache = { canvas: c, scale };
+  return minimapCache;
 }
 
-/** Shared geometry for the hotbar and the vitals strip that sits on it. */
+/** Radar: the area around you (the maps are far bigger than the screen), with
+ *  extracts pinned to the rim when they're out of range. */
+const RADAR_RANGE = 1500;
+function drawMinimap(state: GameState) {
+  const me = state.players[myId];
+  if (!me) return;
+  const pad = 8;
+  const size = HUD.sideW - pad * 2;
+  const px = canvas.width - HUD.margin - HUD.sideW;
+  const py = canvas.height - HUD.margin - HUD.sideW;
+  const mmX = px + pad;
+  const mmY = py + pad;
+  const cx = predictionInitialized ? predictedX : me.pos.x;
+  const cy = predictionInitialized ? predictedY : me.pos.y;
+  const scale = size / (RADAR_RANGE * 2);
+  const toX = (x: number) => mmX + size / 2 + (x - cx) * scale;
+  const toY = (y: number) => mmY + size / 2 + (y - cy) * scale;
+  const dot = (x: number, y: number, r: number, color: string) => {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(toX(x), toY(y), r, 0, Math.PI * 2);
+    ctx.fill();
+  };
+
+  hudPanel(px, py, HUD.sideW, HUD.sideW);
+  ctx.save();
+  hudRoundRect(mmX, mmY, size, size, 6);
+  ctx.clip();
+  const layer = wallLayer();
+  const k = scale / layer.scale;
+  ctx.drawImage(layer.canvas, mmX + size / 2 - cx * scale, mmY + size / 2 - cy * scale, layer.canvas.width * k, layer.canvas.height * k);
+  for (const n of staticNests) {
+    ctx.strokeStyle = withAlpha(theme.accent, 0.85);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(toX(n.x), toY(n.y), 5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  staticCrates.forEach((c, i) => { if (crateAvailability.get(`crate_${i}`)) dot(c.x, c.y, 2.5, theme.money); });
+  for (const d of state.drops) if (d.type === 'loot' && d.item) dot(d.pos.x, d.pos.y, 2.5, RARITY_COLOR[d.item.rarity]);
+  for (const z of state.zombies) dot(z.pos.x, z.pos.y, z.type === 'abomination' ? 5 : 2, theme.accent);
+  for (const e of staticExtracts) {
+    ctx.strokeStyle = theme.health;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(toX(e.x), toY(e.y), Math.max(4, e.radius * scale), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  for (const u of staticUplinks) {
+    const ux = toX(u.x), uy = toY(u.y);
+    ctx.fillStyle = UPLINK_COLOR;
+    ctx.beginPath(); ctx.moveTo(ux, uy - 5); ctx.lineTo(ux + 4, uy); ctx.lineTo(ux, uy + 5); ctx.lineTo(ux - 4, uy); ctx.closePath(); ctx.fill();
+  }
+  for (const id in state.players) if (id !== myId) dot(state.players[id].pos.x, state.players[id].pos.y, 3.5, theme.text);
+  // You, with a heading tick.
+  dot(cx, cy, 4, theme.you);
+  ctx.strokeStyle = theme.you;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(toX(cx), toY(cy));
+  ctx.lineTo(toX(cx) + Math.cos(me.angle) * 10, toY(cy) + Math.sin(me.angle) * 10);
+  ctx.stroke();
+  ctx.restore();
+
+  // Extracts beyond radar range: green chevrons on the rim.
+  for (const e of staticExtracts) {
+    const dx = e.x - cx, dy = e.y - cy;
+    if (Math.abs(dx) < RADAR_RANGE && Math.abs(dy) < RADAR_RANGE) continue;
+    const t = (size / 2 - 7) / Math.max(Math.abs(dx), Math.abs(dy)) / scale;
+    const ex = mmX + size / 2 + dx * scale * t, ey = mmY + size / 2 + dy * scale * t;
+    ctx.save();
+    ctx.translate(ex, ey);
+    ctx.rotate(Math.atan2(dy, dx));
+    ctx.fillStyle = theme.health;
+    ctx.beginPath();
+    ctx.moveTo(5, 0); ctx.lineTo(-4, -5); ctx.lineTo(-4, 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  hudKeycap(keyDisplayName(bindings.toggleMap), px + HUD.sideW - pad - 4, py + pad + 4, 'right');
+}
+
+/** Full map overlay (M): the whole raid at a glance. */
+function drawFullMap(state: GameState) {
+  if (!mapOpen) return;
+  const me = state.players[myId];
+  ctx.fillStyle = 'rgba(5, 6, 9, 0.78)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const maxW = canvas.width - 120, maxH = canvas.height - 200;
+  const scale = Math.min(maxW / staticMapWidth, maxH / staticMapHeight);
+  const w = staticMapWidth * scale, h = staticMapHeight * scale;
+  const x0 = (canvas.width - w) / 2, y0 = (canvas.height - h) / 2 + 20;
+  const X = (x: number) => x0 + x * scale, Y = (y: number) => y0 + y * scale;
+  hudPanel(x0 - 12, y0 - 52, w + 24, h + 64);
+  hudText(raidMap ? `${raidMap.name} · Tier ${raidMap.tier}` : 'Map', x0, y0 - 22, { size: 16, weight: 800, caps: true });
+  let lx = x0 + w;
+  for (const [label, color] of [['You', theme.you], ['Crate', theme.money], ['Nest', theme.accent], ['Uplink', UPLINK_COLOR], ['Extract', theme.health]] as const) {
+    const tw = hudText(label, lx, y0 - 22, { size: 12, weight: 600, color: theme.textSecondary, align: 'right' });
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(lx - tw - 9, y0 - 26, 4, 0, Math.PI * 2);
+    ctx.fill();
+    lx -= tw + 28;
+  }
+  const layer = wallLayer();
+  ctx.drawImage(layer.canvas, x0, y0, w, h);
+  for (const n of staticNests) {
+    ctx.fillStyle = withAlpha(theme.accent, 0.25);
+    ctx.beginPath(); ctx.arc(X(n.x), Y(n.y), 1500 * scale, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = theme.accent;
+    ctx.beginPath(); ctx.arc(X(n.x), Y(n.y), 5, 0, Math.PI * 2); ctx.fill();
+  }
+  staticCrates.forEach((c, i) => {
+    if (!crateAvailability.get(`crate_${i}`)) return;
+    ctx.fillStyle = theme.money;
+    ctx.fillRect(X(c.x) - 2, Y(c.y) - 2, 4, 4);
+  });
+  for (const e of staticExtracts) {
+    ctx.strokeStyle = theme.health;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(X(e.x), Y(e.y), Math.max(7, e.radius * scale), 0, Math.PI * 2); ctx.stroke();
+    hudText(e.name, X(e.x), Y(e.y) + (e.y < staticMapHeight / 2 ? 24 : -16), { size: 12, weight: 700, color: theme.health, align: 'center' });
+  }
+  for (const u of staticUplinks) {
+    const ux = X(u.x), uy = Y(u.y);
+    ctx.fillStyle = UPLINK_COLOR;
+    ctx.beginPath(); ctx.moveTo(ux, uy - 8); ctx.lineTo(ux + 6, uy); ctx.lineTo(ux, uy + 8); ctx.lineTo(ux - 6, uy); ctx.closePath(); ctx.fill();
+    hudText(u.name, ux, uy + 20, { size: 11, weight: 700, color: UPLINK_COLOR, align: 'center' });
+  }
+  for (const id in state.players) {
+    const p = state.players[id];
+    const mine = id === myId;
+    ctx.fillStyle = mine ? theme.you : p.health > 0 ? theme.text : theme.accent;
+    ctx.beginPath(); ctx.arc(X(p.pos.x), Y(p.pos.y), mine ? 6 : 4, 0, Math.PI * 2); ctx.fill();
+    if (!mine) hudText(p.name, X(p.pos.x), Y(p.pos.y) - 9, { size: 11, weight: 700, align: 'center' });
+  }
+  if (me) {
+    const ne = nearest(staticExtracts, me.pos.x, me.pos.y);
+    if (ne) {
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = withAlpha(theme.health, 0.7);
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(X(me.pos.x), Y(me.pos.y)); ctx.lineTo(X(ne.point.x), Y(ne.point.y)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  hudText(`Press ${keyDisplayName(bindings.toggleMap)} or Esc to close · the raid keeps running`, canvas.width / 2, y0 + h + 34, { size: 12, weight: 600, color: theme.textSecondary, align: 'center' });
+}
+
+/** Shared geometry for the hotbar: katana, dash | 2 guns | 3 deployables | map. */
 function hotbarLayout() {
   const gap = 6;
   const groupGap = 17;
-  const fixed = gap * 6 + groupGap * 3;
-  // Ten equal slots, centred between the status card (bottom left) and the minimap (bottom right).
+  const slots = 8;
+  const fixed = gap * 4 + groupGap * 3;
   const room = canvas.width - 2 * (HUD.margin + HUD.sideW + 24);
-  const slotW = Math.max(54, Math.min(78, Math.floor((room - fixed) / 10)));
+  const slotW = Math.max(54, Math.min(84, Math.floor((room - fixed) / slots)));
   const slotH = 66;
-  const totalW = slotW * 10 + fixed;
+  const totalW = slotW * slots + fixed;
   return { slotW, slotH, gap, groupGap, totalW, x: Math.round((canvas.width - totalW) / 2), y: canvas.height - HUD.margin - slotH };
 }
 
 /** Height of the desktop status card (bottom left). */
-const STATUS_CARD_H = 132;
+const STATUS_CARD_H = 168;
 
 /**
- * Vitals. Desktop: a status card in the bottom-left corner (health, ammo, credits)
- * that mirrors the minimap, so the bottom centre holds only the hotbar.
- * Touch screens keep a slim strip under the wave header.
+ * Vitals. Desktop: a status card in the bottom-left corner (health, ammo, the
+ * bounty and pack you'd lose by dying) that mirrors the radar.
+ * Touch screens keep a slim strip under the raid header.
  */
 function drawHUD(state: GameState) {
   const p = state.players[myId];
@@ -3431,7 +3743,6 @@ function drawHUD(state: GameState) {
   const right = x + w - pad;
   hudPanel(x, y, w, h);
 
-  // Health: the heaviest element.
   const maxHp = p.maxHealth || 100;
   const hpPct = p.health / maxHp;
   const lowHp = hpPct <= 0.3;
@@ -3439,11 +3750,10 @@ function drawHUD(state: GameState) {
   const hpTotalW = hudText(` / ${maxHp}`, right, y + 30, { size: 13, weight: 600, color: theme.textMuted, align: 'right' });
   hudText(`${Math.ceil(Math.max(0, p.health))}`, right - hpTotalW, y + 30, { size: 18, weight: 800, color: lowHp ? theme.accent : theme.text, align: 'right' });
   ctx.save();
-  if (lowHp) ctx.globalAlpha = 0.65 + 0.35 * Math.sin(performance.now() / 120); // pulse when low
+  if (lowHp) ctx.globalAlpha = 0.65 + 0.35 * Math.sin(performance.now() / 120);
   hudBar(x + pad, y + 40, w - pad * 2, 10, hpPct, lowHp ? theme.accent : theme.health);
   ctx.restore();
 
-  // Ammo: the pistol never runs dry, so it shows ∞; other guns get a thin bar.
   hudLabel('Ammo', x + pad, y + 78);
   if (p.weapon === 'pistol') {
     hudText('∞', right, y + 82, { size: 24, weight: 700, align: 'right' });
@@ -3456,80 +3766,178 @@ function drawHUD(state: GameState) {
     hudBar(x + pad, y + 86, w - pad * 2, 4, ammoPct, lowAmmo ? theme.accent : theme.textSecondary);
   }
 
-  // Credits: what the armory spends.
-  hudLabel('Credits', x + pad, y + 118);
-  hudText(`$${fmtInt(p.credits ?? 0)}`, right, y + 118, { size: 18, weight: 800, color: theme.money, align: 'right' });
+  // What's at stake: banked only if you extract.
+  hudLabel('Bounty', x + pad, y + 118);
+  hudText(`$${fmtInt(p.bounty ?? 0)}`, right, y + 118, { size: 18, weight: 800, color: theme.money, align: 'right' });
+  const pack = p.backpack ?? [];
+  const cap = p.backpackCapacity || 4;
+  const packLabelW = hudLabel('Pack', x + pad, y + 150);
+  hudKeycap(keyDisplayName(bindings.inventory), x + pad + packLabelW + 6, y + 136);
+  const full = pack.length >= cap;
+  const valW = hudText(`$${fmtInt(backpackValue(pack))}`, right, y + 150, { size: 13, weight: 700, color: theme.textSecondary, align: 'right' });
+  hudText(`${pack.length}/${cap}  `, right - valW, y + 150, { size: 18, weight: 800, color: full ? theme.money : theme.text, align: 'right' });
+  // One pip per slot, filled in the item's rarity color.
+  const pipW = Math.min(12, (w - pad * 2 - (cap - 1) * 3) / cap);
+  for (let i = 0; i < cap; i++) {
+    const item = pack[i];
+    hudRoundRect(x + pad + i * (pipW + 3), y + 158, pipW, 4, 2);
+    ctx.fillStyle = item ? RARITY_COLOR[item.rarity] : HUD.track;
+    ctx.fill();
+  }
 }
 
-/** Touch layout: one slim strip under the wave header. */
+/** Touch layout: one slim strip under the raid header. */
 function drawVitalsStrip(p: Player) {
   const h = 40;
   const w = Math.min(hotbarLayout().totalW, canvas.width - HUD.margin * 2);
   const x = Math.round((canvas.width - w) / 2);
-  const y = HUD.margin + 66;
+  const y = HUD.margin + (threatLevel(p.camp || 0, !!p.hunted) === 'none' ? 76 : 102);
   const pad = HUD.pad;
   const base = y + 26;
   hudPanel(x, y, w, h);
   const inner = w - pad * 2;
-  const ammoX = x + pad + Math.round(inner * 0.52);
-  const creditsX = ammoX + Math.round(inner * 0.25);
+  const ammoX = x + pad + Math.round(inner * 0.5);
+  const bountyX = ammoX + Math.round(inner * 0.25);
   ctx.fillStyle = HUD.border;
   ctx.fillRect(ammoX - 12, y + 9, 1, h - 18);
-  ctx.fillRect(creditsX - 12, y + 9, 1, h - 18);
+  ctx.fillRect(bountyX - 12, y + 9, 1, h - 18);
   const maxHp = p.maxHealth || 100;
   const hpPct = p.health / maxHp;
   const lowHp = hpPct <= 0.3;
-  const labelW = hudLabel('Health', x + pad, base - 1, 'left', lowHp ? theme.accent : theme.textSecondary);
+  const labelW = hudLabel('HP', x + pad, base - 1, 'left', lowHp ? theme.accent : theme.textSecondary);
   const valueRight = ammoX - 26;
-  const totalW = hudText(` / ${maxHp}`, valueRight, base, { size: 13, weight: 600, color: theme.textMuted, align: 'right' });
-  const valueW = hudText(`${Math.ceil(Math.max(0, p.health))}`, valueRight - totalW, base, { size: 18, weight: 800, color: lowHp ? theme.accent : theme.text, align: 'right' });
+  const valueW = hudText(`${Math.ceil(Math.max(0, p.health))}`, valueRight, base, { size: 18, weight: 800, color: lowHp ? theme.accent : theme.text, align: 'right' });
   const barX = x + pad + labelW + 12;
-  hudBar(barX, y + h / 2 - 5, valueRight - totalW - valueW - 14 - barX, 10, hpPct, lowHp ? theme.accent : theme.health);
+  hudBar(barX, y + h / 2 - 5, valueRight - valueW - 10 - barX, 10, hpPct, lowHp ? theme.accent : theme.health);
   const ammoLabelW = hudLabel('Ammo', ammoX, base - 1);
-  if (p.weapon === 'pistol') {
-    hudText('∞', ammoX + ammoLabelW + 12, base + 2, { size: 24, weight: 700 });
-  } else {
-    const vw = hudText(`${Math.floor(p.ammo)}`, ammoX + ammoLabelW + 12, base, { size: 18, weight: 800 });
-    hudText(` / ${p.maxAmmo || 40}`, ammoX + ammoLabelW + 12 + vw, base, { size: 13, weight: 600, color: theme.textMuted });
-  }
-  const creditsLabelW = hudLabel('Credits', creditsX, base - 1);
-  hudText(`$${fmtInt(p.credits ?? 0)}`, creditsX + creditsLabelW + 12, base, { size: 18, weight: 800, color: theme.money });
+  hudText(p.weapon === 'pistol' ? '∞' : `${Math.floor(p.ammo)}`, ammoX + ammoLabelW + 10, base, { size: 18, weight: 800 });
+  hudText(`$${fmtInt(p.bounty ?? 0)} · ${(p.backpack ?? []).length}/${p.backpackCapacity || 4}`, bountyX, base, { size: 15, weight: 800, color: theme.money });
 }
 
-function drawWaveHeader(state: GameState) {
-  const w = 340;
+/**
+ * Raid header (top centre): map, raid clock, the nearest extraction and the
+ * camping threat. While extracting it becomes a progress bar.
+ */
+function drawRaidHeader(state: GameState) {
+  const me = state.players[myId];
+  if (!me) return;
+  const w = 380;
   const x = Math.round((canvas.width - w) / 2);
   const y = HUD.margin;
   const pad = HUD.pad;
-  const onBreak = state.waveBreakTimer > 0;
-  hudPanel(x, y, w, onBreak ? 84 : 58);
+  const threat = threatLevel(me.camp || 0, !!me.hunted);
+  const h = threat === 'none' ? 66 : 92;
+  const lowTime = me.raidTime <= 120;
+  hudPanel(x, y, w, h, { border: threat === 'hunted' ? theme.accent : lowTime ? theme.money : HUD.border });
 
-  if (onBreak) {
-    hudText(`Wave ${state.wave} cleared`, x + pad, y + 27, { size: 16, weight: 800, caps: true });
-    hudText(`Next wave in ${Math.ceil(state.waveBreakTimer)}s`, x + w - pad, y + 27, { size: 13, weight: 700, color: theme.textSecondary, align: 'right' });
-    hudBar(x + pad, y + 37, w - pad * 2, 8, state.waveBreakTimer / WAVE_BREAK_DURATION, theme.textSecondary);
-    // "[B] Open the armory", centered
-    const hint = 'Open the armory';
-    const keyLabel = keyDisplayName(bindings.toggleShop);
-    ctx.font = font(12, 600);
-    const hintW = ctx.measureText(hint).width;
-    ctx.font = font(11, 700);
-    const keyW = Math.max(18, ctx.measureText(keyLabel).width + 10);
-    const startX = x + (w - (keyW + 8 + hintW)) / 2;
-    hudKeycap(keyLabel, startX, y + 55, 'left');
-    hudText(hint, startX + keyW + 8, y + 68, { size: 12, weight: 600, color: theme.textSecondary });
-  } else {
-    const target = Math.max(1, state.waveTarget);
-    // Progress counts up, and the bar fills as the squad's kills land.
-    const kills = Math.min(target, Math.max(0, state.waveKills));
-    hudText(`Wave ${state.wave}`, x + pad, y + 27, { size: 16, weight: 800, caps: true });
-    const unitW = hudText(` / ${target} kills`, x + w - pad, y + 27, { size: 13, weight: 600, color: theme.textSecondary, align: 'right' });
-    hudText(`${kills}`, x + w - pad - unitW, y + 27, { size: 16, weight: 800, align: 'right' });
-    ctx.save();
-    if (target - kills <= 3) ctx.globalAlpha = 0.7 + 0.3 * Math.sin(performance.now() / 150); // almost cleared
-    hudBar(x + pad, y + 37, w - pad * 2, 8, kills / target, theme.text);
-    ctx.restore();
+  hudText(raidMap?.name ?? 'Raid', x + pad, y + 26, { size: 16, weight: 800, caps: true, maxWidth: 190 });
+  ctx.save();
+  if (me.raidTime <= 60) ctx.globalAlpha = 0.7 + 0.3 * Math.sin(performance.now() / 150);
+  const leftW = hudText(' left', x + w - pad, y + 26, { size: 12, weight: 600, color: theme.textSecondary, align: 'right' });
+  hudText(formatClock(me.raidTime), x + w - pad - leftW, y + 27, { size: 20, weight: 800, color: lowTime ? (me.raidTime <= 60 ? theme.accent : theme.money) : theme.text, align: 'right' });
+  ctx.restore();
+
+  const extracting = (me.extractProgress || 0) > 0;
+  const ne = nearest(staticExtracts, me.pos.x, me.pos.y);
+  const sealed = (me.backpack ?? []).find(isEncrypted);
+  if (extracting) {
+    hudText(`Extracting · ${Math.max(0, EXTRACT_TIME - me.extractProgress).toFixed(1)}s`, x + pad, y + 48, { size: 13, weight: 800, color: theme.health });
+    hudBar(x + pad, y + 54, w - pad * 2, 6, me.extractProgress / EXTRACT_TIME, theme.health);
+  } else if (sealed && (me.decrypt || 0) > 0) {
+    const need = DECRYPT_SECS[sealed.rarity];
+    hudText(`Decrypting ${sealed.name} · ${Math.max(0, need - me.decrypt).toFixed(1)}s`, x + pad, y + 48, { size: 13, weight: 800, color: UPLINK_COLOR, maxWidth: w - pad * 2 });
+    hudBar(x + pad, y + 54, w - pad * 2, 6, me.decrypt / need, UPLINK_COLOR);
+  } else if (sealed) {
+    const nu = nearest(staticUplinks, me.pos.x, me.pos.y);
+    if (nu) {
+      const dx = nu.point.x - me.pos.x, dy = nu.point.y - me.pos.y;
+      hudText(`Sealed loot · ${nu.point.name}`, x + pad, y + 50, { size: 12, weight: 600, color: theme.textSecondary });
+      hudText(`${formatDistance(nu.dist)} ${compass(dx, dy)}`, x + w - pad, y + 50, { size: 13, weight: 700, color: UPLINK_COLOR, align: 'right' });
+    }
+  } else if (ne) {
+    const dx = ne.point.x - me.pos.x, dy = ne.point.y - me.pos.y;
+    hudText('Nearest extract', x + pad, y + 50, { size: 12, weight: 600, color: theme.textSecondary });
+    hudText(`${ne.point.name} · ${formatDistance(ne.dist)} ${compass(dx, dy)}`, x + w - pad, y + 50, { size: 13, weight: 700, color: theme.health, align: 'right', maxWidth: w - 130 });
   }
+
+  if (threat === 'warning') {
+    const pct = Math.min(1, (me.camp - CAMP_WARNING) / (CAMP_LIMIT - CAMP_WARNING));
+    hudText(campWarningText(me.camp), x + pad, y + 76, { size: 12, weight: 700, color: theme.money });
+    hudBar(x + pad, y + 82, w - pad * 2, 4, pct, theme.money);
+  } else if (threat === 'hunted') {
+    ctx.save();
+    ctx.globalAlpha = 0.7 + 0.3 * Math.sin(performance.now() / 120);
+    const mine = state.zombies.filter(z => z.target === myId);
+    const boss = mine.some(z => z.type === 'abomination');
+    hudText(boss ? 'Hunted by an Abomination · extract or kill it' : 'Hunted by elites · extract or fight', x + pad, y + 80, { size: 13, weight: 800, color: theme.accent, maxWidth: w - pad * 2 - 60 });
+    ctx.restore();
+    const closest = nearest(mine.map(z => z.pos), me.pos.x, me.pos.y);
+    if (closest) hudText(formatDistance(closest.dist), x + w - pad, y + 80, { size: 13, weight: 800, color: theme.accent, align: 'right' });
+  }
+}
+
+/** Off-screen pointer toward the nearest extraction, at the edge of the play area. */
+function drawExtractPointer(state: GameState) {
+  const me = state.players[myId];
+  if (!me) return;
+  const ne = nearest(staticExtracts, me.pos.x, me.pos.y);
+  if (!ne) return;
+  const sx = ne.point.x - camX, sy = ne.point.y - camY;
+  if (sx > 0 && sx < canvas.width && sy > 0 && sy < canvas.height) return;
+  const cx = canvas.width / 2, cy = canvas.height / 2;
+  const a = Math.atan2(sy - cy, sx - cx);
+  const r = Math.min(canvas.width, canvas.height) * 0.32;
+  ctx.save();
+  ctx.translate(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+  ctx.rotate(a);
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = theme.health;
+  ctx.beginPath();
+  ctx.moveTo(12, 0); ctx.lineTo(-6, -8); ctx.lineTo(-2, 0); ctx.lineTo(-6, 8);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/** Standing on loot with a full pack: say why it wasn't picked up. */
+function drawLootHint(state: GameState) {
+  const me = state.players[myId];
+  if (!me || me.health <= 0) return;
+  const cap = me.backpackCapacity || 4;
+  for (const d of state.drops) {
+    if (d.type !== 'loot' || !d.item) continue;
+    if (Math.hypot(d.pos.x - me.pos.x, d.pos.y - me.pos.y) > 34) continue;
+    const dropped = recentlyDropped.get(d.item.id);
+    if (dropped && performance.now() - dropped < 5000) continue;
+    const swap = swapCandidate(me.backpack ?? [], cap, d.item);
+    if (swap === 'fits') continue;
+    const dropKey = keyDisplayName(bindings.dropItem);
+    const valuable = d.item.kind === 'valuable';
+    const text = swap
+      ? `Pack full: swapping your ${swap.name} for this`
+      : `Pack full · ${dropKey} drops ${me.backpack?.at(-1)?.name ?? 'your last pickup'} (your last pickup)`;
+    void valuable;
+    const key = `${d.id}|${text}`;
+    if (key !== lootHintKey) { lootHintKey = key; }
+    hudText(text, canvas.width / 2, canvas.height / 2 + 70, { size: 13, weight: 700, color: theme.money, align: 'center' });
+    const detail = isEncrypted(d.item)
+      ? `${RARITY_LABEL[d.item.rarity]} sealed item · ~$${fmtInt(estimatedValue(d.item))} once decrypted at an uplink`
+      : `${RARITY_LABEL[d.item.rarity]} ${KIND_LABEL[d.item.kind]} · power ${d.item.power} · ${itemEffect(d.item)} · $${fmtInt(d.item.value)}`;
+    hudText(detail, canvas.width / 2, canvas.height / 2 + 88, { size: 12, weight: 600, color: theme.textSecondary, align: 'center' });
+    return;
+  }
+}
+
+/** Red pulse at the screen edges while an Abomination hunts you. */
+function drawThreatOverlay(state: GameState) {
+  const me = state.players[myId];
+  if (!me?.hunted) return;
+  const a = 0.18 + 0.1 * Math.sin(performance.now() / 260);
+  const g = ctx.createRadialGradient(canvas.width / 2, canvas.height / 2, canvas.width * 0.3, canvas.width / 2, canvas.height / 2, canvas.width * 0.7);
+  g.addColorStop(0, 'rgba(120, 20, 50, 0)');
+  g.addColorStop(1, `rgba(120, 20, 50, ${a})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
 
 function drawComboHUD(state: GameState) {
@@ -3543,14 +3951,16 @@ function drawComboHUD(state: GameState) {
   const h = 64;
   const pad = HUD.pad;
   const overdrive = p.combo >= 10;
-  const bonus = Math.round((Math.min(5.0, 1.0 + (p.combo - 1) * 0.2) - 1) * 100);
+  const mult = Math.min(COMBO_MAX_MULT, 1.0 + (p.combo - 1) * 0.2);
+  const bonus = Math.round((mult - 1) * 100);
   hudPanel(x, y, w, h, { border: overdrive ? theme.money : HUD.border });
 
   const labelW = hudLabel('Combo', x + pad, y + 22);
   hudText(`×${p.combo}`, x + pad + labelW + 6, y + 22, { size: 13, weight: 800 });
   if (overdrive) hudTag('OVERDRIVE', x + w - pad, y + 9, theme.money);
+  else if (mult >= COMBO_MAX_MULT) hudTag('MAX', x + w - pad, y + 9, theme.money);
   const bonusW = hudText(`+${bonus}%`, x + pad, y + 46, { size: 20, weight: 800, color: theme.money });
-  hudText('rewards', x + pad + bonusW + 6, y + 46, { size: 12, weight: 600, color: theme.textSecondary });
+  hudText('kill bounty', x + pad + bonusW + 6, y + 46, { size: 12, weight: 600, color: theme.textSecondary });
   hudBar(x + pad, y + 53, w - pad * 2, 4, (p.comboTimer || 0) / COMBO_DURATION, theme.money);
 }
 
@@ -3561,13 +3971,13 @@ function drawComboHUD(state: GameState) {
 function drawTeammateMarkers(state: GameState) {
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
-  const top = HUD.margin + 92;
+  const top = HUD.margin + 104;
   const bottom = canvas.height - HUD.margin - (isMobile ? 0 : STATUS_CARD_H) - 30;
   const left = HUD.margin + 24;
   const right = canvas.width - HUD.margin - 24;
   // Side panels the chips must also clear (x, y, w, h): squad list, minimap, combo meter.
   const squadH = 38 + Object.keys(state.players).length * 30 + 4;
-  const mapH = (HUD.sideW - 16) * (staticMapHeight / staticMapWidth) + 16;
+  const mapH = HUD.sideW;
   const sideX = canvas.width - HUD.margin - HUD.sideW;
   const avoid: [number, number, number, number][] = [
     [sideX, HUD.margin, HUD.sideW, squadH],
@@ -3641,7 +4051,8 @@ function drawWaveBanner(dt: number) {
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
   ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-  ctx.fillRect(0, cy - 46, canvas.width, 92);
+  const side = isMobile ? 0 : HUD.margin + HUD.sideW + 24;
+  ctx.fillRect(side, cy - 46, canvas.width - side * 2, 92);
   hudText(waveBannerText, canvas.width / 2, cy + 8, { size: 42, weight: 900, color: waveBannerColor, align: 'center', caps: true });
   hudText(waveBannerSub, canvas.width / 2, cy + 32, { size: 13, weight: 700, color: theme.text, align: 'center', caps: true });
   ctx.restore();
@@ -3663,6 +4074,8 @@ interface HotbarSlot {
   locked?: boolean;
   /** 0–1 cooldown, drawn as a fill that drains from the top. */
   cooldown?: number;
+  /** Rarity color for gear: a stripe along the bottom edge. */
+  accent?: string;
 }
 
 function drawHotbarSlot(x: number, y: number, w: number, h: number, s: HotbarSlot) {
@@ -3705,6 +4118,11 @@ function drawHotbarSlot(x: number, y: number, w: number, h: number, s: HotbarSlo
   }
   drawIcon(s.icon, x + w / 2, y + 37, 30, s.active ? theme.you : theme.text);
   ctx.restore();
+  if (s.accent) {
+    hudRoundRect(x + 8, y + h - 4, w - 16, 3, 1.5);
+    ctx.fillStyle = s.accent;
+    ctx.fill();
+  }
   // The padlock sits in the corner where counts go, at full strength.
   if (s.locked) drawIcon(HOTBAR_ICONS.lock, x + w - 15, y + 15, 16, theme.textSecondary);
   // Names stay readable on dimmed slots.
@@ -3722,7 +4140,6 @@ function drawWeaponAndTacticalBar(state: GameState) {
     ctx.fillRect(Math.round(x - groupGap / 2), barY + 12, 1, slotH - 24);
   };
 
-  // Katana (melee)
   hotbarMeleeBtnRect = { x, y: barY, w: slotW, h: slotH };
   drawHotbarSlot(x, barY, slotW, slotH, {
     key: keyDisplayName(bindings.melee), icon: HOTBAR_ICONS.katana, name: 'Katana',
@@ -3730,7 +4147,6 @@ function drawWeaponAndTacticalBar(state: GameState) {
   });
   x += slotW + gap;
 
-  // Dash: one dot per charge; the fill drains as the next charge comes back.
   hotbarDashBtnRect = { x, y: barY, w: slotW, h: slotH };
   drawHotbarSlot(x, barY, slotW, slotH, {
     key: keyDisplayName(bindings.dash), icon: HOTBAR_ICONS.dash, name: 'Dash',
@@ -3741,26 +4157,26 @@ function drawWeaponAndTacticalBar(state: GameState) {
   x += slotW + groupGap;
   groupDivider();
 
-  // Firearms (1–4); the equipped one shows its ammo in the corner.
-  const weapons = ['pistol', 'uzi', 'shotgun', 'rocketLauncher'];
-  const names = ['Pistol', 'Uzi', 'Shotgun', 'Rocket'];
-  const icons = [HOTBAR_ICONS.pistol, HOTBAR_ICONS.uzi, HOTBAR_ICONS.shotgun, HOTBAR_ICONS.rocket];
-  const weaponKeys = [bindings.weapon1, bindings.weapon2, bindings.weapon3, bindings.weapon4];
-  const slots = p.weaponSlots || [true, false, false, false];
+  // The two guns you brought in. The equipped one shows its ammo; the frame takes its rarity color.
+  const icons: Record<string, Path2D> = { pistol: HOTBAR_ICONS.pistol, uzi: HOTBAR_ICONS.uzi, shotgun: HOTBAR_ICONS.shotgun, rocketLauncher: HOTBAR_ICONS.rocket };
+  const shortName: Record<string, string> = { pistol: 'Pistol', uzi: 'Uzi', shotgun: 'Shotgun', rocketLauncher: 'Rocket' };
+  const weaponKeys = [bindings.weapon1, bindings.weapon2];
   hotbarWeaponRects = [];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 2; i++) {
+    const gun = p.weapons?.[i];
     hotbarWeaponRects.push({ slot: i + 1, x, y: barY, w: slotW, h: slotH });
-    const equipped = p.weapon === weapons[i];
-    drawHotbarSlot(x, barY, slotW, slotH, {
-      key: keyDisplayName(weaponKeys[i]), icon: icons[i], name: names[i], active: equipped, locked: !slots[i],
-      tag: equipped ? (weapons[i] === 'pistol' ? '∞' : `${Math.floor(p.ammo)}`) : undefined,
+    const equipped = !!gun && p.activeSlot === i;
+    drawHotbarSlot(x, barY, slotW, slotH, gun ? {
+      key: keyDisplayName(weaponKeys[i]), icon: icons[gun.kind], name: `${shortName[gun.kind]} ${gun.power}`, active: equipped,
+      tag: equipped ? (gun.kind === 'pistol' ? '∞' : `${Math.floor(p.ammo)}`) : undefined, accent: RARITY_COLOR[gun.rarity],
+    } : {
+      key: keyDisplayName(weaponKeys[i]), icon: HOTBAR_ICONS.lock, name: 'Empty', disabled: true,
     });
     x += slotW + gap;
   }
   x += groupGap - gap;
   groupDivider();
 
-  // Gear (barrel, barricade, claymore) with a count in the corner
   const tacItems = p.tacticalItems || [0, 0, 0];
   const tacLabels = ['Barrel', 'Barricade', 'Claymore'];
   const tacIcons = [HOTBAR_ICONS.barrel, HOTBAR_ICONS.barricade, HOTBAR_ICONS.claymore];
@@ -3777,16 +4193,15 @@ function drawWeaponAndTacticalBar(state: GameState) {
   x += groupGap - gap;
   groupDivider();
 
-  // Armory
-  hotbarArmoryBtnRect = { x, y: barY, w: slotW, h: slotH };
+  hotbarMapBtnRect = { x, y: barY, w: slotW, h: slotH };
   drawHotbarSlot(x, barY, slotW, slotH, {
-    key: keyDisplayName(bindings.toggleShop), icon: HOTBAR_ICONS.armory, name: 'Armory', open: armoryOpen,
+    key: keyDisplayName(bindings.toggleMap), icon: HOTBAR_ICONS.map, name: 'Map', open: mapOpen,
   });
 }
 
-/** Squad status: name, health and score columns, so you can see who needs help. */
+/** Squad status: name, health and kills, so you can see who needs help. */
 function drawScoreboardAndFeed(state: GameState) {
-  const playerList = Object.values(state.players).sort((a, b) => b.score - a.score);
+  const playerList = Object.values(state.players).sort((a, b) => b.kills - a.kills);
   if (playerList.length === 0) return;
 
   const rowH = 30;
@@ -3802,7 +4217,7 @@ function drawScoreboardAndFeed(state: GameState) {
   hudPanel(x, y, w, h);
   hudLabel('Player', x + pad, y + 24);
   hudLabel('HP', healthX, y + 24);
-  hudLabel('Score', x + w - pad, y + 24, 'right');
+  hudLabel('Kills', x + w - pad, y + 24, 'right');
   ctx.fillStyle = HUD.border;
   ctx.fillRect(x + 1, y + headH - 4, w - 2, 1);
 
@@ -3827,7 +4242,7 @@ function drawScoreboardAndFeed(state: GameState) {
       const hpPct = p.health / (p.maxHealth || 100);
       hudBar(healthX, ry + 9, healthColW, 6, hpPct, hpPct <= 0.3 ? theme.accent : theme.health);
     }
-    hudText(fmtInt(p.score), x + w - pad, ry + 18, { size: 13, weight: 700, color: down ? theme.textMuted : theme.text, align: 'right' });
+    hudText(fmtInt(p.kills || 0), x + w - pad, ry + 18, { size: 13, weight: 700, color: down ? theme.textMuted : theme.text, align: 'right' });
   }
 
   // Event feed below the squad panel (hidden while paused)
@@ -3965,12 +4380,11 @@ let recapShowAll = false;
 const RECAP_ROWS = 3;
 function updateDeathRecap() {
   const player = players[myId];
-  const visible = player && player.health <= 0 && (currentScreen === 'playing' || currentScreen === 'gameover');
+  const visible = player && player.health <= 0 && (currentScreen === 'playing' || (currentScreen === 'results' && lastRaidEnd?.outcome.result === 'killed'));
   deathRecap.hidden = !visible;
   if (!visible) { recapKey = ''; recapShowAll = false; return; }
-  if (armoryOpen) toggleArmory(false);
-  const over = currentScreen === 'gameover';
-  const parent = over ? document.getElementById('gameOverDetails')! : document.body;
+  const over = currentScreen === 'results';
+  const parent = over ? document.getElementById('resultsDetails')! : document.body;
   if (deathRecap.parentElement !== parent) parent.appendChild(deathRecap);
   deathRecap.classList.toggle('recap--floating', !over);
   const hits = player.damageLog || [];
@@ -3978,7 +4392,7 @@ function updateDeathRecap() {
   if (key === recapKey) return;
   recapKey = key;
 
-  const name = (type: string) => type.charAt(0).toUpperCase() + type.slice(1);
+  const name = enemyName;
   const last = hits[hits.length - 1];
   const title = document.createElement('p');
   title.className = 'recap-title';
@@ -4047,7 +4461,7 @@ function draw() {
 
   canvas.style.cursor = currentScreen === 'playing' ? 'crosshair' : 'default';
 
-  if (currentScreen === 'playing' || currentScreen === 'gameover') {
+  if (currentScreen === 'playing' || currentScreen === 'results') {
     const state = buildRenderState();
 
     if (state) {
@@ -4057,10 +4471,13 @@ function draw() {
       ctx.fillRect(-camX, -camY, staticMapWidth, staticMapHeight);
 
       if (!isMobile) drawGrid();
-      drawTunnels();
+      drawNests();
+      drawExtracts(state);
+      drawUplinks(state);
       drawBloodStains();
       drawWalls();
       drawAmmoPickups();
+      drawCrates();
       drawPlaceables(state);
       drawDrops(state);
       drawBullets(state);
@@ -4072,20 +4489,25 @@ function draw() {
 
       drawHudBackdrop();
       if (!isMobile) drawMinimap(state);
+      drawThreatOverlay(state);
+      drawExtractPointer(state);
       drawHUD(state);
-      drawWaveHeader(state);
+      drawRaidHeader(state);
       drawComboHUD(state);
       drawScoreboardAndFeed(state);
       if (!isMobile) drawWeaponAndTacticalBar(state);
       drawTeammateMarkers(state);
+      drawLootHint(state);
       drawWaveBanner(dt);
       drawMobileControls();
+      drawFullMap(state);
+      renderRaidInventory();
     } else {
       ctx.fillStyle = theme.textSecondary;
       ctx.font = font(18, 600);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(`Joining ${currentRoomName}…`, canvas.width / 2, canvas.height / 2);
+      ctx.fillText(`Deploying to ${currentRoomName}…`, canvas.width / 2, canvas.height / 2);
     }
   }
 

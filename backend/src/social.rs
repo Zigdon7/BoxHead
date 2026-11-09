@@ -173,3 +173,39 @@ pub async fn google_token_exchange(
     userinfo_res.json::<GoogleUserInfo>().await
         .map_err(|e| format!("Failed to parse user info: {}", e))
 }
+
+/// Ask Steam to confirm an OpenID 2.0 sign-in assertion really came from it.
+pub async fn steam_verify(params: &HashMap<String, String>) -> Result<(), String> {
+    let mut form: Vec<(String, String)> = params.iter()
+        .filter(|(k, _)| k.starts_with("openid."))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in form.iter_mut() {
+        if k == "openid.mode" { *v = "check_authentication".into(); }
+    }
+    let res = reqwest::Client::new()
+        .post("https://steamcommunity.com/openid/login")
+        .form(&form)
+        .send().await
+        .map_err(|e| format!("Couldn't reach Steam: {e}"))?;
+    let body = res.text().await.map_err(|e| format!("Couldn't read Steam's reply: {e}"))?;
+    if body.lines().any(|l| l.trim() == "is_valid:true") { Ok(()) } else { Err("Steam didn't confirm this sign-in.".into()) }
+}
+
+/// The Steam persona name: via the Web API when STEAM_API_KEY is set, else the public profile.
+pub async fn steam_persona(steam_id: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    if let Ok(key) = std::env::var("STEAM_API_KEY") {
+        let url = format!("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={key}&steamids={steam_id}");
+        if let Ok(res) = client.get(&url).send().await {
+            if let Ok(v) = res.json::<serde_json::Value>().await {
+                if let Some(name) = v["response"]["players"][0]["personaname"].as_str() { return Some(name.to_string()); }
+            }
+        }
+    }
+    let xml = client.get(format!("https://steamcommunity.com/profiles/{steam_id}/?xml=1")).send().await.ok()?.text().await.ok()?;
+    let start = xml.find("<steamID><![CDATA[")? + "<steamID><![CDATA[".len();
+    let end = xml[start..].find("]]>")? + start;
+    let name = xml[start..end].trim();
+    (!name.is_empty()).then(|| name.chars().take(32).collect())
+}

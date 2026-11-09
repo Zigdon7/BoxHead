@@ -98,7 +98,7 @@ async function action(url, label) {
 
 const ui = { sort: 'maxUs', desc: true, filter: '' };
 const columns = [
-  ['name', 'Room'], ['health', 'Health'], ['connected', 'Players', 'num'], ['wave', 'Wave', 'num'],
+  ['name', 'Room'], ['health', 'Health'], ['connected', 'Players', 'num'], ['tier', 'Map', 'num'],
   ['zombies', 'Zombies', 'num'], ['avgUs', 'Avg tick', 'num'], ['maxUs', 'Max tick', 'num'],
   ['overruns', 'Overruns', 'num'], ['pubAvgUs', 'Send avg', 'num'], ['pubMaxUs', 'Send max', 'num'],
   ['skippedFrames', 'Skipped', 'num'], ['droppedDeltas', 'Dropped', 'num'], ['lastThread', 'Threads'], ['uptimeMs', 'Uptime', 'num'],
@@ -142,11 +142,11 @@ function renderRooms(server) {
   const rows = rooms.map(r => el('tr', { class: r.health },
     el('td', { class: 'name', title: r.id },
       el('span', { text: r.name }), ' ',
-      r.verifiedOnly ? el('span', { class: 'pill verified', text: 'verified' }) : null,
+      el('span', { class: 'pill' + (r.pool === 'cross' ? ' verified' : ''), text: r.pool }),
       r.permanent ? el('span', { class: 'pill idle', text: 'official' }) : null),
     el('td', {}, el('span', { class: `pill ${r.health}`, text: r.health })),
     el('td', { class: 'num', text: String(r.connected) }),
-    el('td', { class: 'num', text: r.gameOver ? `${r.wave} ✖` : r.paused ? `${r.wave} ⏸` : String(r.wave) }),
+    el('td', { class: 'num', text: `${r.map ?? '—'}${r.paused ? ' ⏸' : ''}` }),
     el('td', { class: 'num', text: String(r.zombies) }),
     el('td', { class: 'num', text: fmtMs(r.tick.avgUs) }),
     el('td', { class: 'num', text: fmtMs(r.tick.maxUs) }),

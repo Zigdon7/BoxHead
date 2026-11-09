@@ -14,7 +14,7 @@ export type Weapon = "pistol" | "uzi" | "shotgun" | "rocketLauncher";
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "DropType".
  */
-export type DropType = "ammo" | "health" | "weapon" | "tactical";
+export type DropType = "ammo" | "health" | "tactical" | "loot";
 /**
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "PlaceableType".
@@ -22,9 +22,29 @@ export type DropType = "ammo" | "health" | "weapon" | "tactical";
 export type PlaceableType = "barrel" | "barricade" | "mine";
 /**
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "ItemKind".
+ */
+export type ItemKind = "pistol" | "uzi" | "shotgun" | "rocketLauncher" | "armor" | "pack" | "valuable" | "encrypted";
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "Rarity".
+ */
+export type Rarity = "common" | "uncommon" | "rare" | "epic" | "legendary";
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "ZombieType".
  */
-export type ZombieType = "zombie" | "devil" | "crawler" | "brute" | "vampire";
+export type ZombieType = "zombie" | "devil" | "crawler" | "brute" | "vampire" | "abomination";
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "Slot".
+ */
+export type Slot = "primary" | "secondary" | "armor" | "pack";
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "RaidResult".
+ */
+export type RaidResult = "extracted" | "killed" | "missingInAction" | "abandoned";
 
 export interface BoxheadTypes {
   [k: string]: unknown;
@@ -68,6 +88,20 @@ export interface DropPickup {
   id: string;
   type: DropType;
   pos: Vector2;
+  item?: Item;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "Item".
+ */
+export interface Item {
+  id: string;
+  kind: ItemKind;
+  rarity: Rarity;
+  power: number;
+  name: string;
+  value: number;
   [k: string]: unknown;
 }
 /**
@@ -92,18 +126,13 @@ export interface Player {
   name: string;
   pos: Vector2;
   angle: number;
-  score: number;
-  credits: number;
   health: number;
   maxHealth: number;
   ammo: number;
   maxAmmo: number;
   weapon: Weapon;
-  /**
-   * @minItems 4
-   * @maxItems 4
-   */
-  weaponSlots: [boolean, boolean, boolean, boolean];
+  weapons: RaidWeapon[];
+  activeSlot: number;
   combo: number;
   comboTimer: number;
   maxCombo: number;
@@ -113,9 +142,28 @@ export interface Player {
    * @maxItems 3
    */
   tacticalItems: [number, number, number];
-  damageLevel: number;
-  meleeLevel: number;
+  bounty: number;
+  backpack: Item[];
+  backpackCapacity: number;
+  gearScore: number;
+  raidTime: number;
+  extractProgress: number;
+  bleedout: number;
+  camp: number;
+  hunted: boolean;
   damageLog?: DamageHit[];
+  decrypt: number;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "RaidWeapon".
+ */
+export interface RaidWeapon {
+  kind: Weapon;
+  power: number;
+  rarity: Rarity;
+  name: string;
   [k: string]: unknown;
 }
 /**
@@ -129,6 +177,8 @@ export interface Zombie {
   health: number;
   maxHealth: number;
   speed: number;
+  elite?: boolean;
+  target?: string;
   [k: string]: unknown;
 }
 /**
@@ -191,7 +241,8 @@ export interface ClientInput {
   selectWeapon: number;
   dash?: boolean;
   placeItem?: number;
-  buyUpgrade?: number;
+  dropItem?: boolean;
+  dropId?: string;
   [k: string]: unknown;
 }
 /**
@@ -201,12 +252,48 @@ export interface ClientInput {
 export interface InitPayload {
   type: "init";
   id: string;
+  map: MapInfo;
   walls: Wall[];
   mapWidth: number;
   mapHeight: number;
   ammoSpawnPoints: AmmoSpawnPoint[];
-  gameOver?: boolean;
-  wave?: number;
+  extracts: ExtractPoint[];
+  crates: Point[];
+  nests: Point[];
+  uplinks: ExtractPoint[];
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "MapInfo".
+ */
+export interface MapInfo {
+  id: string;
+  name: string;
+  tier: number;
+  minGearScore: number;
+  raidSecs: number;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "ExtractPoint".
+ */
+export interface ExtractPoint {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  radius: number;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "Point".
+ */
+export interface Point {
+  x: number;
+  y: number;
   [k: string]: unknown;
 }
 /**
@@ -215,22 +302,16 @@ export interface InitPayload {
  */
 export interface SnapshotState {
   type: "snapshot";
-  tick: {
-    [k: string]: unknown;
-  };
+  tick: number;
   players: {
     [k: string]: Player;
   };
   zombies: Zombie[];
   bullets: Bullet[];
   placeables: Placeable[];
-  wave: number;
-  waveKills: number;
-  waveTarget: number;
-  waveBreakTimer: number;
   ammoPickups: AmmoPickupState[];
+  crates: AmmoPickupState[];
   drops: DropPickup[];
-  gameOver: boolean;
   [k: string]: unknown;
 }
 /**
@@ -242,18 +323,13 @@ export interface PlayerDelta {
   name?: string;
   pos?: Vector2;
   angle?: number;
-  score?: number;
-  credits?: number;
   health?: number;
   maxHealth?: number;
   ammo?: number;
   maxAmmo?: number;
   weapon?: Weapon;
-  /**
-   * @minItems 4
-   * @maxItems 4
-   */
-  weaponSlots?: [boolean, boolean, boolean, boolean];
+  weapons?: RaidWeapon[];
+  activeSlot?: number;
   combo?: number;
   comboTimer?: number;
   maxCombo?: number;
@@ -263,9 +339,17 @@ export interface PlayerDelta {
    * @maxItems 3
    */
   tacticalItems?: [number, number, number];
-  damageLevel?: number;
-  meleeLevel?: number;
+  bounty?: number;
+  backpack?: Item[];
+  backpackCapacity?: number;
+  gearScore?: number;
+  raidTime?: number;
+  extractProgress?: number;
+  bleedout?: number;
+  camp?: number;
+  hunted?: boolean;
   damageLog?: DamageHit[];
+  decrypt?: number;
   [k: string]: unknown;
 }
 /**
@@ -299,11 +383,71 @@ export interface DeltaState {
   placeablesRemoved?: string[];
   dropsNew?: DropPickup[];
   dropsRemoved?: string[];
-  wave?: number;
-  waveKills?: number;
-  waveTarget?: number;
-  waveBreakTimer?: number;
   ammoPickups?: AmmoPickupState[];
-  gameOver?: boolean;
+  crates?: AmmoPickupState[];
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "RaidOutcome".
+ */
+export interface RaidOutcome {
+  playerId: string;
+  name: string;
+  result: RaidResult;
+  extractName?: string;
+  killedBy?: ZombieType;
+  loot: Item[];
+  bounty: number;
+  kills: number;
+  maxCombo: number;
+  survivedSecs: number;
+  lost: Item[];
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "RaidSettlement".
+ */
+export interface RaidSettlement {
+  cashEarned: number;
+  itemsKept: number;
+  itemsAutoSold: number;
+  cash: number;
+  insured: boolean;
+  /**
+   * Extra cash from Operations rank, perks and the season boost (already in cashEarned).
+   */
+  bonusCash: number;
+  ops?: OpsProgress;
+  [k: string]: unknown;
+}
+/**
+ * Operations progress on the raided map after a raid.
+ *
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "OpsProgress".
+ */
+export interface OpsProgress {
+  map: string;
+  xpGained: number;
+  xp: number;
+  rank: number;
+  rankedUp: boolean;
+  /**
+   * XP needed for the next rank (null at the top).
+   */
+  next: number | null;
+  [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "RaidEnd".
+ */
+export interface RaidEnd {
+  type: "raidEnd";
+  map: string;
+  outcome: RaidOutcome;
+  settlement?: RaidSettlement | null;
   [k: string]: unknown;
 }

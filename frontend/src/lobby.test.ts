@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
-  RoomInfo, Friend, OPEN_ROOM_ID, partitionRooms, resolveSelectedRoom, roomStatusText,
-  verifyStatusText, sortFriends, friendsSummary, defaultCallsign, accountLabel,
+  RoomInfo, Friend, Matchmaking, OPEN_ROOM_ID, resolveSelectedRoom, roomStatusText, roomsForMap,
+  matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel,
 } from './lobby';
 
 function room(overrides: Partial<RoomInfo> = {}): RoomInfo {
   return {
-    id: 'r1', name: 'Room', verifiedOnly: false, permanent: false,
-    players: 0, wave: 1, gameOver: false, paused: false, canJoin: true,
+    id: 'r1', name: 'Room', pool: { id: 'steam', label: 'Steam' }, permanent: false,
+    players: 0, paused: false, canJoin: true,
+    map: { id: 'outskirts', name: 'Outskirts', tier: 1, minGearScore: 0, threat: 'Low' },
     ...overrides,
   };
 }
@@ -16,28 +17,10 @@ function friend(handle: string, online: boolean): Friend {
   return { handle, display_name: handle, user_id: `id-${handle}`, online };
 }
 
-describe('partitionRooms', () => {
-  it('splits verified and open lobbies, preserving server order', () => {
-    const rooms = [
-      room({ id: 'open', permanent: true }),
-      room({ id: 'verified', verifiedOnly: true, permanent: true }),
-      room({ id: 'a' }),
-      room({ id: 'b', verifiedOnly: true }),
-    ];
-    const { verified, open } = partitionRooms(rooms);
-    expect(verified.map(r => r.id)).toEqual(['verified', 'b']);
-    expect(open.map(r => r.id)).toEqual(['open', 'a']);
-  });
-
-  it('handles an empty list', () => {
-    expect(partitionRooms([])).toEqual({ verified: [], open: [] });
-  });
-});
-
 describe('resolveSelectedRoom', () => {
   const rooms = [
     room({ id: OPEN_ROOM_ID }),
-    room({ id: 'locked', verifiedOnly: true, canJoin: false }),
+    room({ id: 'locked', pool: { id: 'cross', label: 'Cross-platform' }, canJoin: false }),
     room({ id: 'mine' }),
   ];
 
@@ -59,35 +42,54 @@ describe('resolveSelectedRoom', () => {
 });
 
 describe('roomStatusText', () => {
-  it('describes empty lobbies', () => {
-    expect(roomStatusText(room())).toBe('Waiting for players');
+  it('describes empty raids', () => {
+    expect(roomStatusText(room())).toBe('Empty · you deploy alone');
+    expect(roomStatusText(room({ permanent: true }))).toBe('Empty · you deploy alone');
   });
 
-  it('shows the live wave for active lobbies', () => {
-    expect(roomStatusText(room({ players: 3, wave: 7 }))).toBe('In progress · Wave 7');
+  it('counts operators in a live raid', () => {
+    expect(roomStatusText(room({ players: 1 }))).toBe('Raid in progress · 1 player inside');
+    expect(roomStatusText(room({ players: 3 }))).toBe('Raid in progress · 3 players inside');
   });
 
-  it('prioritises overrun over paused', () => {
-    expect(roomStatusText(room({ players: 2, gameOver: true, paused: true }))).toBe('Overrun · waiting for a restart');
-    expect(roomStatusText(room({ players: 2, paused: true, wave: 4 }))).toBe('Paused · Wave 4');
-  });
-
-  it('leaves the official marker to the UI badge', () => {
-    expect(roomStatusText(room({ permanent: true }))).toBe('Waiting for players');
+  it('shows a host pause', () => {
+    expect(roomStatusText(room({ players: 2, paused: true }))).toBe('Paused by the host');
   });
 });
 
-describe('verifyStatusText', () => {
-  it('confirms verified accounts', () => {
-    expect(verifyStatusText(true, true)).toMatch(/Verified account/);
+describe('roomsForMap / map fallback', () => {
+  const rust = { id: 'rustyard', name: 'Rust Yard', tier: 2, minGearScore: 20, threat: 'Moderate' };
+  const rooms = [
+    room({ id: 'outskirts', permanent: true }),
+    room({ id: 'rustyard', permanent: true, map: rust }),
+    room({ id: 'rust-mine', map: rust }),
+  ];
+  it('filters lobbies to one map', () => {
+    expect(roomsForMap(rooms, 'rustyard').map(r => r.id)).toEqual(['rustyard', 'rust-mine']);
+  });
+  it('falls back to the public raid on the chosen map', () => {
+    expect(resolveSelectedRoom(rooms, 'outskirts', 'rustyard')).toBe('rustyard');
+    expect(resolveSelectedRoom(rooms, 'rust-mine', 'rustyard')).toBe('rust-mine');
+  });
+});
+
+describe('matchmakingText', () => {
+  const pool = (id: 'steam' | 'bluesky' | 'direct' | 'cross', label: string) => ({ id, label });
+  const mm = (platform: ReturnType<typeof pool>, crossplay: boolean): Matchmaking =>
+    ({ platform, crossplay, pool: crossplay ? pool('cross', 'Cross-platform') : platform });
+
+  it('names the platform you are limited to', () => {
+    expect(matchmakingText(mm(pool('steam', 'Steam'), false))).toBe('Off: you only meet players who signed in with Steam.');
+    expect(matchmakingText(mm(pool('bluesky', 'Bluesky'), false))).toMatch(/with Bluesky\.$/);
+    expect(matchmakingText(mm(pool('direct', 'Email & Google'), false))).toMatch(/email or Google/);
   });
 
-  it('explains guests are unverified', () => {
-    expect(verifyStatusText(false, false)).toMatch(/guest/);
+  it('explains cross-play is opt-in on both sides', () => {
+    expect(matchmakingText(mm(pool('steam', 'Steam'), true))).toMatch(/^On: .*also turned it on/);
   });
 
-  it('flags a stale session the server no longer accepts', () => {
-    expect(verifyStatusText(false, true)).toMatch(/session has expired/);
+  it('asks signed-out visitors to sign in', () => {
+    expect(matchmakingText(null)).toMatch(/Sign in/);
   });
 });
 

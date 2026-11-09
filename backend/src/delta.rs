@@ -1,10 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::*;
 
-/// The wave-break countdown is sent at 0.1 s resolution.
-fn round_break_timer(t: f64) -> f64 {
-    (t * 10.0).round() / 10.0
+/// Everything the delta tracker diffs, borrowed from a frame.
+pub struct World<'a> {
+    pub players: &'a HashMap<String, Player>,
+    pub zombies: &'a [Zombie],
+    pub bullets: &'a [Bullet],
+    pub placeables: &'a [Placeable],
+    pub drops: &'a [DropPickup],
+    pub ammo: &'a HashMap<String, bool>,
+    pub crates: &'a HashMap<String, bool>,
 }
+
+fn tenths(v: f64) -> f64 { (v * 10.0).round() / 10.0 }
 
 struct PrevState {
     players: HashMap<String, Player>,
@@ -12,421 +20,224 @@ struct PrevState {
     bullet_set: HashSet<String>,
     placeable_map: HashMap<String, Placeable>,
     drop_set: HashSet<String>,
-    wave: u32,
-    wave_kills: u32,
-    wave_target: u32,
-    wave_break_timer: f64,
-    ammo_availability: HashMap<String, bool>,
-    game_over: bool,
+    ammo: HashMap<String, bool>,
+    crates: HashMap<String, bool>,
 }
 
+/// Per-client diff state. Ticks come from the room's frame sequence, so they
+/// keep increasing across restarts and resyncs.
 pub struct DeltaTracker {
     prev: Option<PrevState>,
-    tick: u64,
+}
+
+fn full_player(p: &Player) -> PlayerDelta {
+    PlayerDelta {
+        id: p.id.clone(),
+        name: Some(p.name.clone()),
+        pos: Some(p.pos.clone()),
+        angle: Some(p.angle),
+        health: Some(p.health),
+        max_health: Some(p.max_health),
+        ammo: Some(p.ammo),
+        max_ammo: Some(p.max_ammo),
+        weapon: Some(p.weapon.clone()),
+        weapons: Some(p.weapons.clone()),
+        active_slot: Some(p.active_slot),
+        combo: Some(p.combo),
+        combo_timer: Some(tenths(p.combo_timer)),
+        max_combo: Some(p.max_combo),
+        kills: Some(p.kills),
+        tactical_items: Some(p.tactical_items),
+        bounty: Some(p.bounty),
+        backpack: Some(p.backpack.clone()),
+        backpack_capacity: Some(p.backpack_capacity),
+        gear_score: Some(p.gear_score),
+        raid_time: Some(p.raid_time.ceil()),
+        extract_progress: Some(tenths(p.extract_progress)),
+        bleedout: Some(tenths(p.bleedout)),
+        camp: Some(p.camp.floor()),
+        hunted: Some(p.hunted),
+        decrypt: Some(tenths(p.decrypt)),
+        damage_log: Some(p.damage_log.clone()),
+    }
+}
+
+/// Fields that changed since the previous frame. Timers are compared at the
+/// resolution clients see, so a slow countdown still crosses each boundary.
+fn player_diff(prev: &Player, curr: &Player) -> Option<PlayerDelta> {
+    let mut d = PlayerDelta { id: curr.id.clone(), ..Default::default() };
+    let mut changed = false;
+    macro_rules! eq_field {
+        ($f:ident) => {
+            if curr.$f != prev.$f { d.$f = Some(curr.$f.clone()); changed = true; }
+        };
+    }
+    // Compare at wire precision, not frame to frame: slow aiming or creeping
+    // must still cross each rounding boundary and reach other clients.
+    if tenths(curr.pos.x) != tenths(prev.pos.x) || tenths(curr.pos.y) != tenths(prev.pos.y) {
+        d.pos = Some(Vector2 { x: tenths(curr.pos.x), y: tenths(curr.pos.y) });
+        changed = true;
+    }
+    let hundredths = |a: f64| (a * 100.0).round() / 100.0;
+    if hundredths(curr.angle) != hundredths(prev.angle) {
+        d.angle = Some(hundredths(curr.angle));
+        changed = true;
+    }
+    eq_field!(name);
+    eq_field!(health);
+    eq_field!(max_health);
+    eq_field!(ammo);
+    eq_field!(max_ammo);
+    eq_field!(weapon);
+    eq_field!(weapons);
+    eq_field!(active_slot);
+    eq_field!(combo);
+    eq_field!(max_combo);
+    eq_field!(kills);
+    eq_field!(tactical_items);
+    eq_field!(bounty);
+    eq_field!(backpack);
+    eq_field!(backpack_capacity);
+    eq_field!(gear_score);
+    eq_field!(damage_log);
+    eq_field!(hunted);
+    if curr.camp.floor() != prev.camp.floor() { d.camp = Some(curr.camp.floor()); changed = true; }
+    if tenths(curr.combo_timer) != tenths(prev.combo_timer) { d.combo_timer = Some(tenths(curr.combo_timer)); changed = true; }
+    if curr.raid_time.ceil() != prev.raid_time.ceil() { d.raid_time = Some(curr.raid_time.ceil()); changed = true; }
+    if tenths(curr.extract_progress) != tenths(prev.extract_progress) { d.extract_progress = Some(tenths(curr.extract_progress)); changed = true; }
+    if tenths(curr.bleedout) != tenths(prev.bleedout) { d.bleedout = Some(tenths(curr.bleedout)); changed = true; }
+    if tenths(curr.decrypt) != tenths(prev.decrypt) { d.decrypt = Some(tenths(curr.decrypt)); changed = true; }
+    changed.then_some(d)
+}
+
+fn availability(map: &HashMap<String, bool>) -> Vec<AmmoPickupState> {
+    map.iter().map(|(id, available)| AmmoPickupState { id: id.clone(), available: *available }).collect()
+}
+
+fn availability_changes(prev: &HashMap<String, bool>, curr: &HashMap<String, bool>) -> Option<Vec<AmmoPickupState>> {
+    let changes: Vec<_> = curr.iter().filter(|(id, a)| prev.get(*id) != Some(a))
+        .map(|(id, a)| AmmoPickupState { id: id.clone(), available: *a }).collect();
+    (!changes.is_empty()).then_some(changes)
 }
 
 impl DeltaTracker {
     pub fn new() -> Self {
-        DeltaTracker { prev: None, tick: 0 }
+        DeltaTracker { prev: None }
     }
 
-    pub fn tick(&self) -> u64 {
-        self.tick
-    }
+    pub fn compute_delta(&mut self, w: &World, tick: u64) -> DeltaState {
+        let mut delta = DeltaState { msg_type: "delta".to_string(), tick, ..Default::default() };
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn compute_delta(
-        &mut self,
-        players: &HashMap<String, Player>,
-        zombies: &[Zombie],
-        bullets: &[Bullet],
-        placeables: &[Placeable],
-        drops: &[DropPickup],
-        wave: u32,
-        wave_kills: u32,
-        wave_target: u32,
-        wave_break_timer: f64,
-        ammo_availability: &HashMap<String, bool>,
-        game_over: bool,
-    ) -> DeltaState {
-        self.tick += 1;
-
-        if self.prev.is_none() {
-            self.save_state(
-                players,
-                zombies,
-                bullets,
-                placeables,
-                drops,
-                wave,
-                wave_kills,
-                wave_target,
-                wave_break_timer,
-                ammo_availability,
-                game_over,
-            );
-            let player_deltas: HashMap<String, PlayerDelta> = players.iter().map(|(id, p)| {
-                (id.clone(), PlayerDelta {
-                    id: p.id.clone(),
-                    name: Some(p.name.clone()),
-                    pos: Some(p.pos.clone()),
-                    angle: Some(p.angle),
-                    score: Some(p.score),
-                    credits: Some(p.credits),
-                    health: Some(p.health),
-                    max_health: Some(p.max_health),
-                    ammo: Some(p.ammo),
-                    max_ammo: Some(p.max_ammo),
-                    weapon: Some(p.weapon.clone()),
-                    weapon_slots: Some(p.weapon_slots),
-                    combo: Some(p.combo),
-                    combo_timer: Some(p.combo_timer),
-                    max_combo: Some(p.max_combo),
-                    kills: Some(p.kills),
-                    tactical_items: Some(p.tactical_items),
-                    damage_level: Some(p.damage_level),
-                    melee_level: Some(p.melee_level),
-                    damage_log: Some(p.damage_log.clone()),
-                })
-            }).collect();
-
-            return DeltaState {
-                msg_type: "delta".to_string(),
-                tick: self.tick,
-                players: Some(player_deltas),
-                players_removed: None,
-                zombies_new: Some(zombies.to_vec()),
-                zombies_updated: None,
-                zombies_removed: None,
-                bullets_new: Some(bullets.to_vec()),
-                bullets_removed: None,
-                placeables_new: if placeables.is_empty() { None } else { Some(placeables.to_vec()) },
-                placeables_updated: None,
-                placeables_removed: None,
-                drops_new: if drops.is_empty() { None } else { Some(drops.to_vec()) },
-                drops_removed: None,
-                wave: Some(wave),
-                wave_kills: Some(wave_kills),
-                wave_target: Some(wave_target),
-                wave_break_timer: Some(wave_break_timer),
-                ammo_pickups: None,
-                game_over: Some(game_over),
-            };
-        }
-
-        let prev = self.prev.as_ref().unwrap();
-        let mut delta = DeltaState {
-            msg_type: "delta".to_string(),
-            tick: self.tick,
-            players: None,
-            players_removed: None,
-            zombies_new: None,
-            zombies_updated: None,
-            zombies_removed: None,
-            bullets_new: None,
-            bullets_removed: None,
-            placeables_new: None,
-            placeables_updated: None,
-            placeables_removed: None,
-            drops_new: None,
-            drops_removed: None,
-            wave: None,
-            wave_kills: None,
-            wave_target: None,
-            wave_break_timer: None,
-            ammo_pickups: None,
-            game_over: None,
+        let Some(prev) = self.prev.as_ref() else {
+            delta.players = Some(w.players.iter().map(|(id, p)| (id.clone(), full_player(p))).collect());
+            delta.zombies_new = Some(w.zombies.to_vec());
+            delta.bullets_new = Some(w.bullets.to_vec());
+            if !w.placeables.is_empty() { delta.placeables_new = Some(w.placeables.to_vec()); }
+            if !w.drops.is_empty() { delta.drops_new = Some(w.drops.to_vec()); }
+            delta.ammo_pickups = Some(availability(w.ammo));
+            delta.crates = Some(availability(w.crates));
+            self.save_state(w);
+            return delta;
         };
 
         // Players
         let mut player_changes: HashMap<String, PlayerDelta> = HashMap::new();
-        let mut players_removed: Vec<String> = Vec::new();
-
-        for (id, curr) in players {
-            if let Some(prev_p) = prev.players.get(id) {
-                let mut pd = PlayerDelta {
-                    id: id.clone(),
-                    name: None, pos: None, angle: None, score: None, credits: None, health: None,
-                    max_health: None, ammo: None, max_ammo: None, weapon: None, weapon_slots: None,
-                    combo: None, combo_timer: None, max_combo: None, kills: None,
-                    tactical_items: None, damage_level: None, melee_level: None, damage_log: None,
-                };
-                let mut changed = false;
-
-                if (curr.pos.x - prev_p.pos.x).abs() > 0.5 || (curr.pos.y - prev_p.pos.y).abs() > 0.5 {
-                    pd.pos = Some(Vector2 {
-                        x: (curr.pos.x * 10.0).round() / 10.0,
-                        y: (curr.pos.y * 10.0).round() / 10.0,
-                    });
-                    changed = true;
-                }
-                if (curr.angle - prev_p.angle).abs() > 0.01 {
-                    pd.angle = Some((curr.angle * 100.0).round() / 100.0);
-                    changed = true;
-                }
-                if curr.damage_log != prev_p.damage_log { pd.damage_log = Some(curr.damage_log.clone()); changed = true; }
-                if curr.health != prev_p.health { pd.health = Some(curr.health); changed = true; }
-                if curr.max_health != prev_p.max_health { pd.max_health = Some(curr.max_health); changed = true; }
-                if curr.score != prev_p.score { pd.score = Some(curr.score); changed = true; }
-                if curr.credits != prev_p.credits { pd.credits = Some(curr.credits); changed = true; }
-                if curr.ammo != prev_p.ammo { pd.ammo = Some(curr.ammo); changed = true; }
-                if curr.max_ammo != prev_p.max_ammo { pd.max_ammo = Some(curr.max_ammo); changed = true; }
-                if curr.weapon != prev_p.weapon { pd.weapon = Some(curr.weapon.clone()); changed = true; }
-                if curr.weapon_slots != prev_p.weapon_slots { pd.weapon_slots = Some(curr.weapon_slots); changed = true; }
-                if curr.combo != prev_p.combo { pd.combo = Some(curr.combo); changed = true; }
-                if (curr.combo_timer - prev_p.combo_timer).abs() > 0.05 {
-                    pd.combo_timer = Some((curr.combo_timer * 10.0).round() / 10.0);
-                    changed = true;
-                }
-                if curr.max_combo != prev_p.max_combo { pd.max_combo = Some(curr.max_combo); changed = true; }
-                if curr.kills != prev_p.kills { pd.kills = Some(curr.kills); changed = true; }
-                if curr.tactical_items != prev_p.tactical_items { pd.tactical_items = Some(curr.tactical_items); changed = true; }
-                if curr.damage_level != prev_p.damage_level { pd.damage_level = Some(curr.damage_level); changed = true; }
-                if curr.melee_level != prev_p.melee_level { pd.melee_level = Some(curr.melee_level); changed = true; }
-
-                if changed {
-                    player_changes.insert(id.clone(), pd);
-                }
-            } else {
-                // New player
-                player_changes.insert(id.clone(), PlayerDelta {
-                    id: curr.id.clone(),
-                    name: Some(curr.name.clone()),
-                    pos: Some(curr.pos.clone()),
-                    angle: Some(curr.angle),
-                    score: Some(curr.score),
-                    credits: Some(curr.credits),
-                    health: Some(curr.health),
-                    max_health: Some(curr.max_health),
-                    ammo: Some(curr.ammo),
-                    max_ammo: Some(curr.max_ammo),
-                    weapon: Some(curr.weapon.clone()),
-                    weapon_slots: Some(curr.weapon_slots),
-                    combo: Some(curr.combo),
-                    combo_timer: Some(curr.combo_timer),
-                    max_combo: Some(curr.max_combo),
-                    kills: Some(curr.kills),
-                    tactical_items: Some(curr.tactical_items),
-                    damage_level: Some(curr.damage_level),
-                    melee_level: Some(curr.melee_level),
-                    damage_log: Some(curr.damage_log.clone()),
-                });
+        for (id, curr) in w.players {
+            match prev.players.get(id) {
+                Some(prev_p) => { if let Some(d) = player_diff(prev_p, curr) { player_changes.insert(id.clone(), d); } }
+                None => { player_changes.insert(id.clone(), full_player(curr)); }
             }
         }
-        for id in prev.players.keys() {
-            if !players.contains_key(id) {
-                players_removed.push(id.clone());
-            }
-        }
+        let players_removed: Vec<String> = prev.players.keys().filter(|id| !w.players.contains_key(*id)).cloned().collect();
         if !player_changes.is_empty() { delta.players = Some(player_changes); }
         if !players_removed.is_empty() { delta.players_removed = Some(players_removed); }
 
         // Zombies
-        let mut zombies_new: Vec<Zombie> = Vec::new();
-        let mut zombies_updated: Vec<ZombieDelta> = Vec::new();
-        let mut zombies_removed: Vec<String> = Vec::new();
-        let mut curr_zombie_ids: HashSet<String> = HashSet::new();
-
-        for z in zombies {
-            curr_zombie_ids.insert(z.id.clone());
+        let mut zombies_new = Vec::new();
+        let mut zombies_updated = Vec::new();
+        let mut curr_zombie_ids: HashSet<&str> = HashSet::new();
+        for z in w.zombies {
+            curr_zombie_ids.insert(&z.id);
             if let Some(prev_z) = prev.zombie_map.get(&z.id) {
                 let mut zd = ZombieDelta { id: z.id.clone(), pos: None, health: None };
-                let mut changed = false;
-
                 // Compare wire coordinates: sub-half-pixel movement must still cross
                 // pixel boundaries, even though the baseline is saved every tick.
                 if z.pos.x.round() != prev_z.pos.x.round() || z.pos.y.round() != prev_z.pos.y.round() {
                     zd.pos = Some(Vector2 { x: z.pos.x.round(), y: z.pos.y.round() });
-                    changed = true;
                 }
-                if z.health != prev_z.health { zd.health = Some(z.health); changed = true; }
-                if changed { zombies_updated.push(zd); }
+                if z.health != prev_z.health { zd.health = Some(z.health); }
+                if zd.pos.is_some() || zd.health.is_some() { zombies_updated.push(zd); }
             } else {
                 zombies_new.push(z.clone());
             }
         }
-        for id in prev.zombie_map.keys() {
-            if !curr_zombie_ids.contains(id) {
-                zombies_removed.push(id.clone());
-            }
-        }
+        let zombies_removed: Vec<String> = prev.zombie_map.keys().filter(|id| !curr_zombie_ids.contains(id.as_str())).cloned().collect();
         if !zombies_new.is_empty() { delta.zombies_new = Some(zombies_new); }
         if !zombies_updated.is_empty() { delta.zombies_updated = Some(zombies_updated); }
         if !zombies_removed.is_empty() { delta.zombies_removed = Some(zombies_removed); }
 
         // Bullets
-        let curr_bullet_ids: HashSet<String> = bullets.iter().map(|b| b.id.clone()).collect();
-        let mut bullets_new: Vec<Bullet> = Vec::new();
-        let mut bullets_removed: Vec<String> = Vec::new();
-
-        for b in bullets {
-            if !prev.bullet_set.contains(&b.id) {
-                bullets_new.push(b.clone());
-            }
-        }
-        for id in &prev.bullet_set {
-            if !curr_bullet_ids.contains(id) {
-                bullets_removed.push(id.clone());
-            }
-        }
+        let curr_bullet_ids: HashSet<&str> = w.bullets.iter().map(|b| b.id.as_str()).collect();
+        let bullets_new: Vec<Bullet> = w.bullets.iter().filter(|b| !prev.bullet_set.contains(&b.id)).cloned().collect();
+        let bullets_removed: Vec<String> = prev.bullet_set.iter().filter(|id| !curr_bullet_ids.contains(id.as_str())).cloned().collect();
         if !bullets_new.is_empty() { delta.bullets_new = Some(bullets_new); }
         if !bullets_removed.is_empty() { delta.bullets_removed = Some(bullets_removed); }
 
         // Placeables
-        let mut placeables_new: Vec<Placeable> = Vec::new();
-        let mut placeables_updated: Vec<PlaceableDelta> = Vec::new();
-        let mut placeables_removed: Vec<String> = Vec::new();
-        let mut curr_placeable_ids: HashSet<String> = HashSet::new();
-
-        for p in placeables {
-            curr_placeable_ids.insert(p.id.clone());
-            if let Some(prev_pl) = prev.placeable_map.get(&p.id) {
-                if p.health != prev_pl.health {
-                    placeables_updated.push(PlaceableDelta {
-                        id: p.id.clone(),
-                        health: Some(p.health),
-                    });
-                }
-            } else {
-                placeables_new.push(p.clone());
+        let mut placeables_new = Vec::new();
+        let mut placeables_updated = Vec::new();
+        let curr_placeable_ids: HashSet<&str> = w.placeables.iter().map(|p| p.id.as_str()).collect();
+        for p in w.placeables {
+            match prev.placeable_map.get(&p.id) {
+                Some(prev_pl) if p.health != prev_pl.health => placeables_updated.push(PlaceableDelta { id: p.id.clone(), health: Some(p.health) }),
+                Some(_) => {}
+                None => placeables_new.push(p.clone()),
             }
         }
-        for id in prev.placeable_map.keys() {
-            if !curr_placeable_ids.contains(id) {
-                placeables_removed.push(id.clone());
-            }
-        }
+        let placeables_removed: Vec<String> = prev.placeable_map.keys().filter(|id| !curr_placeable_ids.contains(id.as_str())).cloned().collect();
         if !placeables_new.is_empty() { delta.placeables_new = Some(placeables_new); }
         if !placeables_updated.is_empty() { delta.placeables_updated = Some(placeables_updated); }
         if !placeables_removed.is_empty() { delta.placeables_removed = Some(placeables_removed); }
 
         // Drops
-        let curr_drop_ids: HashSet<String> = drops.iter().map(|d| d.id.clone()).collect();
-        let mut drops_new: Vec<DropPickup> = Vec::new();
-        let mut drops_removed: Vec<String> = Vec::new();
-
-        for d in drops {
-            if !prev.drop_set.contains(&d.id) {
-                drops_new.push(d.clone());
-            }
-        }
-        for id in &prev.drop_set {
-            if !curr_drop_ids.contains(id) {
-                drops_removed.push(id.clone());
-            }
-        }
+        let curr_drop_ids: HashSet<&str> = w.drops.iter().map(|d| d.id.as_str()).collect();
+        let drops_new: Vec<DropPickup> = w.drops.iter().filter(|d| !prev.drop_set.contains(&d.id)).cloned().collect();
+        let drops_removed: Vec<String> = prev.drop_set.iter().filter(|id| !curr_drop_ids.contains(id.as_str())).cloned().collect();
         if !drops_new.is_empty() { delta.drops_new = Some(drops_new); }
         if !drops_removed.is_empty() { delta.drops_removed = Some(drops_removed); }
 
-        // Wave & progress
-        if wave != prev.wave { delta.wave = Some(wave); }
-        if wave_kills != prev.wave_kills { delta.wave_kills = Some(wave_kills); }
-        if wave_target != prev.wave_target { delta.wave_target = Some(wave_target); }
-        // Compare with the value clients were last sent (stored rounded), not the previous
-        // frame: at 60 Hz the timer moves ~0.017 a frame, so a frame-to-frame threshold
-        // never fired and clients froze on "next wave in 8s" through the next wave.
-        let break_timer = round_break_timer(wave_break_timer);
-        if break_timer != prev.wave_break_timer {
-            delta.wave_break_timer = Some(break_timer);
-        }
+        delta.ammo_pickups = availability_changes(&prev.ammo, w.ammo);
+        delta.crates = availability_changes(&prev.crates, w.crates);
 
-        // Ammo
-        let mut ammo_changes: Vec<AmmoPickupState> = Vec::new();
-        for (id, avail) in ammo_availability {
-            if prev.ammo_availability.get(id) != Some(avail) {
-                ammo_changes.push(AmmoPickupState { id: id.clone(), available: *avail });
-            }
-        }
-        if !ammo_changes.is_empty() { delta.ammo_pickups = Some(ammo_changes); }
-
-        // Game over
-        if game_over != prev.game_over { delta.game_over = Some(game_over); }
-
-        self.save_state(
-            players,
-            zombies,
-            bullets,
-            placeables,
-            drops,
-            wave,
-            wave_kills,
-            wave_target,
-            wave_break_timer,
-            ammo_availability,
-            game_over,
-        );
+        self.save_state(w);
         delta
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_snapshot(
-        &self,
-        players: &HashMap<String, Player>,
-        zombies: &[Zombie],
-        bullets: &[Bullet],
-        placeables: &[Placeable],
-        drops: &[DropPickup],
-        wave: u32,
-        wave_kills: u32,
-        wave_target: u32,
-        wave_break_timer: f64,
-        ammo_availability: &HashMap<String, bool>,
-        game_over: bool,
-    ) -> SnapshotState {
+    /// A full snapshot, which also becomes the baseline for this client's next delta.
+    pub fn snapshot(&mut self, w: &World, tick: u64) -> SnapshotState {
+        self.save_state(w);
         SnapshotState {
             msg_type: "snapshot".to_string(),
-            tick: self.tick,
-            players: players.clone(),
-            zombies: zombies.to_vec(),
-            bullets: bullets.to_vec(),
-            placeables: placeables.to_vec(),
-            wave,
-            wave_kills,
-            wave_target,
-            wave_break_timer: round_break_timer(wave_break_timer),
-            ammo_pickups: ammo_availability.iter().map(|(id, avail)| {
-                AmmoPickupState { id: id.clone(), available: *avail }
-            }).collect(),
-            drops: drops.to_vec(),
-            game_over,
+            tick,
+            players: w.players.clone(),
+            zombies: w.zombies.to_vec(),
+            bullets: w.bullets.to_vec(),
+            placeables: w.placeables.to_vec(),
+            ammo_pickups: availability(w.ammo),
+            crates: availability(w.crates),
+            drops: w.drops.to_vec(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn save_state(
-        &mut self,
-        players: &HashMap<String, Player>,
-        zombies: &[Zombie],
-        bullets: &[Bullet],
-        placeables: &[Placeable],
-        drops: &[DropPickup],
-        wave: u32,
-        wave_kills: u32,
-        wave_target: u32,
-        wave_break_timer: f64,
-        ammo_availability: &HashMap<String, bool>,
-        game_over: bool,
-    ) {
-        let mut zombie_map = HashMap::new();
-        for z in zombies {
-            zombie_map.insert(z.id.clone(), z.clone());
-        }
-        let mut placeable_map = HashMap::new();
-        for p in placeables {
-            placeable_map.insert(p.id.clone(), p.clone());
-        }
+    fn save_state(&mut self, w: &World) {
         self.prev = Some(PrevState {
-            players: players.clone(),
-            zombie_map,
-            bullet_set: bullets.iter().map(|b| b.id.clone()).collect(),
-            placeable_map,
-            drop_set: drops.iter().map(|d| d.id.clone()).collect(),
-            wave,
-            wave_kills,
-            wave_target,
-            wave_break_timer: round_break_timer(wave_break_timer),
-            ammo_availability: ammo_availability.clone(),
-            game_over,
+            players: w.players.clone(),
+            zombie_map: w.zombies.iter().map(|z| (z.id.clone(), z.clone())).collect(),
+            bullet_set: w.bullets.iter().map(|b| b.id.clone()).collect(),
+            placeable_map: w.placeables.iter().map(|p| (p.id.clone(), p.clone())).collect(),
+            drop_set: w.drops.iter().map(|d| d.id.clone()).collect(),
+            ammo: w.ammo.clone(),
+            crates: w.crates.clone(),
         });
     }
 }
@@ -434,50 +245,89 @@ impl DeltaTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::test_support::kit;
+
+    fn world<'a>(players: &'a HashMap<String, Player>, zombies: &'a [Zombie], empty: &'a HashMap<String, bool>) -> World<'a> {
+        World { players, zombies, bullets: &[], placeables: &[], drops: &[], ammo: empty, crates: empty }
+    }
+
+    fn one_player() -> HashMap<String, Player> {
+        let mut game = crate::game::Game::new(crate::gear::default_map());
+        game.add_player("p", "P", &kit(5, 5, 5));
+        game.players().clone()
+    }
 
     #[test]
-    fn wave_break_countdown_reaches_clients() {
+    fn slow_countdowns_reach_clients_at_their_display_resolution() {
         let mut tracker = DeltaTracker::new();
-        let mut timer: f64 = 0.0;
-        let mut client: f64 = 0.0;
+        let empty = HashMap::new();
+        let mut players = one_player();
+        let (mut raid_client, mut extract_client) = (0.0, 0.0);
         let mut sent = 0;
-        // The wave clears on frame 10: an 8 s break counts down at 60 Hz, then ends.
-        for frame in 0..(8 * 60 + 40) {
-            if frame == 10 { timer = 8.0; } else if timer > 0.0 { timer = (timer - 1.0 / 60.0).max(0.0); }
-            let delta = tracker.compute_delta(
-                &HashMap::new(), &[], &[], &[], &[],
-                1, 0, 10, timer, &HashMap::new(), false,
-            );
-            if let Some(t) = delta.wave_break_timer { client = t; sent += 1; }
-            assert!((client - timer).abs() <= 0.051, "frame {frame}: client shows {client}, server has {timer}");
+        // Ten seconds of raid clock and a full extraction countdown, at 60 Hz.
+        for frame in 0..600 {
+            let p = players.get_mut("p").unwrap();
+            p.raid_time = 600.0 - frame as f64 / 60.0;
+            p.extract_progress = (frame as f64 / 60.0).min(6.0);
+            let delta = tracker.compute_delta(&world(&players, &[], &empty), 1);
+            if let Some(d) = delta.players.and_then(|mut m| m.remove("p")) {
+                if let Some(t) = d.raid_time { raid_client = t; sent += 1; }
+                if let Some(e) = d.extract_progress { extract_client = e; }
+            }
+            let p = &players["p"];
+            assert_eq!(raid_client, p.raid_time.ceil(), "frame {frame}");
+            assert!((extract_client - p.extract_progress).abs() <= 0.051, "frame {frame}: {extract_client} vs {}", p.extract_progress);
         }
-        assert_eq!(client, 0.0, "the end of the break must reach clients");
-        assert!(sent <= 90, "about ten updates a second, not one per frame (sent {sent})");
+        assert!(sent <= 12, "the raid clock is sent once a second, not every frame ({sent})");
+    }
+
+    #[test]
+    fn slow_aim_reaches_other_clients() {
+        let mut tracker = DeltaTracker::new();
+        let empty = HashMap::new();
+        let mut players = one_player();
+        let mut client_angle = 0.0;
+        for frame in 0..120 {
+            players.get_mut("p").unwrap().angle = frame as f64 * 0.004; // ~0.24 rad/s
+            let delta = tracker.compute_delta(&world(&players, &[], &empty), 1);
+            if let Some(a) = delta.players.and_then(|mut m| m.remove("p")).and_then(|d| d.angle) { client_angle = a; }
+            assert!((client_angle - players["p"].angle).abs() <= 0.0051, "frame {frame}");
+        }
     }
 
     #[test]
     fn slow_diagonal_brutes_stay_in_sync() {
         let mut tracker = DeltaTracker::new();
+        let empty = HashMap::new();
+        let players = HashMap::new();
         let mut zombie = Zombie {
             id: "brute".into(), zombie_type: ZombieType::Brute,
             pos: Vector2 { x: 100.0, y: 100.0 }, health: 100.0,
-            max_health: 100.0, speed: 20.0,
+            max_health: 100.0, speed: 20.0, elite: false, target: None,
         };
         let mut client_pos = zombie.pos.clone();
         for _ in 0..120 {
-            let delta = tracker.compute_delta(
-                &HashMap::new(), &[zombie.clone()], &[], &[], &[],
-                1, 0, 10, 0.0, &HashMap::new(), false,
-            );
-            if let Some(updates) = delta.zombies_updated {
-                for update in updates {
-                    if let Some(pos) = update.pos { client_pos = pos; }
-                }
+            let delta = tracker.compute_delta(&world(&players, std::slice::from_ref(&zombie), &empty), 1);
+            for update in delta.zombies_updated.unwrap_or_default() {
+                if let Some(pos) = update.pos { client_pos = pos; }
             }
             assert!((client_pos.x - zombie.pos.x).abs() <= 0.51);
             assert!((client_pos.y - zombie.pos.y).abs() <= 0.51);
             zombie.pos.x += 0.22;
             zombie.pos.y += 0.22;
         }
+    }
+
+    #[test]
+    fn backpack_changes_are_sent_and_quiet_frames_send_nothing() {
+        let mut tracker = DeltaTracker::new();
+        let empty = HashMap::new();
+        let mut players = one_player();
+        tracker.compute_delta(&world(&players, &[], &empty), 1);
+        let quiet = tracker.compute_delta(&world(&players, &[], &empty), 1);
+        assert!(quiet.players.is_none());
+        players.get_mut("p").unwrap().backpack.push(crate::gear::loaner_pistol());
+        let d = tracker.compute_delta(&world(&players, &[], &empty), 1);
+        assert_eq!(d.players.unwrap()["p"].backpack.as_ref().unwrap().len(), 1);
     }
 }

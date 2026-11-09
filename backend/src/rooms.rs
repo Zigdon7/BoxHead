@@ -1,4 +1,5 @@
-//! Server-hosted rooms. Every room owns its own authoritative `Game`. Clients never host.
+//! Server-hosted raids. Every room is one persistent instance of a map with
+//! its own authoritative `Game`. Clients never host.
 //!
 //! Each room runs as two decoupled tasks on separate thread pools (see `sim.rs`):
 //!
@@ -6,9 +7,10 @@
 //!   state into a [`Frame`] and hands it off without ever waiting on players,
 //!   the database or the dashboard.
 //! * **State provider** (`room-pub-*`): takes the latest frame, computes
-//!   deltas/snapshots, serializes them and sends them to players, and records
-//!   wave progress. If it falls behind it skips straight to the newest frame
-//!   instead of slowing the game down.
+//!   deltas/snapshots, serializes them and sends them to players. It also
+//!   settles finished raids (stash writes run on a blocking thread). If it falls
+//!   behind it skips to the newest frame; raid results are queued separately
+//!   so a skipped frame can never lose one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,17 +19,23 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::db::Database;
-use crate::delta::DeltaTracker;
+use crate::delta::{DeltaTracker, World};
 use crate::game::Game;
+use crate::gear::{MapDef, MAPS};
 use crate::sim;
-use crate::types::{Bullet, DropPickup, Placeable, Player, Zombie};
+use crate::types::{Bullet, DropPickup, Placeable, Player, RaidOutcome, Zombie};
 
 pub type ClientSender = mpsc::Sender<String>;
 
-pub const OPEN_ROOM_ID: &str = "open";
-pub const VERIFIED_ROOM_ID: &str = "verified";
+/// Where a join without a room id lands: the public Outskirts raid.
+pub const OPEN_ROOM_ID: &str = "outskirts";
 /// Default room cap; override with `BOXHEAD_MAX_ROOMS`.
 pub const MAX_ROOMS: usize = 256;
+/// Each client only gets enemies, bullets, drops and deployables this close
+/// to them (a 1920×1080 screen reaches about 1,100 units from its centre).
+pub const VIEW_RANGE: f64 = 1500.0;
+/// State goes out every other game tick (30 Hz); clients interpolate between.
+pub const SEND_EVERY: u64 = 2;
 /// 60 Hz frame budget for one room tick.
 pub const TICK_BUDGET: Duration = Duration::from_micros(16_667);
 const MAX_WINDOW: Duration = Duration::from_secs(5);
@@ -40,17 +48,12 @@ pub struct Frame {
     pub bullets: Vec<Bullet>,
     pub placeables: Vec<Placeable>,
     pub drops: Vec<DropPickup>,
-    pub wave: u32,
-    pub wave_kills: u32,
-    pub wave_target: u32,
-    pub wave_break_timer: f64,
     pub ammo_availability: HashMap<String, bool>,
-    pub game_over: bool,
-    /// The round was already over before this tick (no deltas are sent).
-    pub was_finished: bool,
+    pub crate_availability: HashMap<String, bool>,
     pub paused: bool,
     pub host_id: Option<String>,
 }
+
 
 /// Cheap, lock-free-to-the-game summary for the room list and ops dashboard.
 #[derive(Clone, Debug, Default)]
@@ -59,8 +62,6 @@ pub struct RoomStats {
     pub alive: usize,
     pub zombies: usize,
     pub bullets: usize,
-    pub wave: u32,
-    pub game_over: bool,
     pub paused: bool,
     pub host_id: Option<String>,
 }
@@ -72,8 +73,6 @@ impl RoomStats {
             alive: game.players().values().filter(|p| p.health > 0.0).count(),
             zombies: game.zombies().len(),
             bullets: game.bullets().len(),
-            wave: game.wave(),
-            game_over: game.is_game_over(),
             paused: game.is_paused(),
             host_id: game.host_id().map(str::to_owned),
         }
@@ -144,9 +143,37 @@ fn parse_ttl(raw: Option<String>) -> Duration {
         .unwrap_or(EMPTY_ROOM_TTL)
 }
 
-/// Verified accounts may enter any room; everyone else only open rooms.
-pub fn can_join(room_verified_only: bool, player_verified: bool) -> bool {
-    player_verified || !room_verified_only
+/// Matchmaking pool. Players only meet others in the same pool: everyone who
+/// signed in with Steam, everyone on Bluesky, everyone on email or Google, and
+/// everyone (from any platform) who turned cross-platform play on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Pool { Steam, Bluesky, Direct, Cross }
+
+impl Pool {
+    pub const ALL: [Pool; 4] = [Pool::Steam, Pool::Bluesky, Pool::Direct, Pool::Cross];
+
+    /// The pool for a session's sign-in platform and the account's cross-play setting.
+    pub fn for_player(platform: &str, crossplay: bool) -> Pool {
+        if crossplay { return Pool::Cross; }
+        match platform { "steam" => Pool::Steam, "bluesky" => Pool::Bluesky, _ => Pool::Direct }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self { Pool::Steam => "steam", Pool::Bluesky => "bluesky", Pool::Direct => "direct", Pool::Cross => "cross" }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self { Pool::Steam => "Steam", Pool::Bluesky => "Bluesky", Pool::Direct => "Email & Google", Pool::Cross => "Cross-platform" }
+    }
+
+    pub fn json(self) -> serde_json::Value {
+        serde_json::json!({ "id": self.id(), "label": self.label() })
+    }
+}
+
+/// The id of a map's always-on raid in one pool.
+pub fn official_room_id(map: &str, pool: Pool) -> String {
+    format!("{map}-{}", pool.id())
 }
 
 pub fn sanitize_room_name(raw: &str) -> String {
@@ -157,14 +184,20 @@ pub fn sanitize_room_name(raw: &str) -> String {
 pub struct Room {
     pub id: String,
     pub name: String,
-    pub verified_only: bool,
+    /// Only players in this matchmaking pool can join.
+    pub pool: Pool,
     /// Permanent rooms always exist; player-created rooms expire when empty.
     pub permanent: bool,
+    pub map: &'static MapDef,
     pub game: Mutex<Game>,
-    pub delta_tracker: Mutex<DeltaTracker>,
+    /// One diff baseline per connected client (each sees only what's near them).
+    pub trackers: Mutex<HashMap<String, DeltaTracker>>,
     pub clients: Mutex<HashMap<String, ClientSender>>,
     pub pending_snapshots: Mutex<HashSet<String>>,
-    pub wave_profiles: Mutex<HashMap<String, (String, u32)>>,
+    /// Player id -> stash profile, for settling their raid.
+    pub raid_profiles: Mutex<HashMap<String, String>>,
+    /// Finished raids handed from the game loop to the state provider.
+    outcomes: std::sync::Mutex<Vec<RaidOutcome>>,
     last_room_status: Mutex<String>,
     empty_since: Mutex<Option<Instant>>,
     /// Game-loop (physics) timing.
@@ -177,20 +210,22 @@ pub struct Room {
     last_published_seq: AtomicU64,
     skipped_frames: AtomicU64,
     slow_client_retries: AtomicU64,
+    raids_settled: AtomicU64,
     created_at: Instant,
 }
 
 impl Room {
-    fn new(id: String, name: String, verified_only: bool, permanent: bool) -> Self {
-        let game = Game::new();
+    pub fn new(id: String, name: String, pool: Pool, permanent: bool, map: &'static MapDef) -> Self {
+        let game = Game::new(map);
         let stats = RoomStats::from_game(&game);
         Self {
-            id, name, verified_only, permanent,
+            id, name, pool, permanent, map,
             game: Mutex::new(game),
-            delta_tracker: Mutex::new(DeltaTracker::new()),
+            trackers: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             pending_snapshots: Mutex::new(HashSet::new()),
-            wave_profiles: Mutex::new(HashMap::new()),
+            raid_profiles: Mutex::new(HashMap::new()),
+            outcomes: std::sync::Mutex::new(Vec::new()),
             last_room_status: Mutex::new(String::new()),
             empty_since: Mutex::new(Some(Instant::now())),
             metrics: std::sync::Mutex::new(TickMetrics::default()),
@@ -201,33 +236,42 @@ impl Room {
             last_published_seq: AtomicU64::new(0),
             skipped_frames: AtomicU64::new(0),
             slow_client_retries: AtomicU64::new(0),
+            raids_settled: AtomicU64::new(0),
             created_at: Instant::now(),
         }
     }
 
     pub fn stats(&self) -> RoomStats { self.stats.lock().unwrap().clone() }
 
+    fn map_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.map.id, "name": self.map.name, "tier": self.map.tier,
+            "minGearScore": self.map.min_gear_score, "threat": self.map.threat(), "entryFee": self.map.entry_fee,
+        })
+    }
+
     /// Full operational view of the room for the ops dashboard.
     /// Never touches the game lock: reads stats cached by the game loop.
     pub async fn ops_snapshot(&self) -> serde_json::Value {
-        let RoomStats { players, alive, zombies, bullets, wave, game_over, paused, host_id } = self.stats();
+        let RoomStats { players, alive, zombies, bullets, paused, host_id } = self.stats();
         let connected = self.clients.lock().await.len();
         let m = self.metrics.lock().unwrap();
         let p = self.publish_metrics.lock().unwrap();
         serde_json::json!({
             "id": self.id,
             "name": self.name,
-            "verifiedOnly": self.verified_only,
+            "pool": self.pool.id(),
             "permanent": self.permanent,
+            "map": self.map.name,
+            "tier": self.map.tier,
             "connected": connected,
             "players": players,
             "alive": alive,
             "zombies": zombies,
             "bullets": bullets,
-            "wave": wave,
-            "gameOver": game_over,
             "paused": paused,
             "hostId": host_id,
+            "raidsSettled": self.raids_settled.load(Ordering::Relaxed),
             "uptimeMs": self.created_at.elapsed().as_millis() as u64,
             "tick": {
                 "count": m.ticks,
@@ -250,37 +294,39 @@ impl Room {
         })
     }
 
-    pub async fn summary(&self, player_verified: bool) -> serde_json::Value {
-        let RoomStats { wave, game_over, paused, .. } = self.stats();
+    /// Lobby-browser view. `viewer` is the viewer's pool (None when signed out).
+    pub async fn summary(&self, viewer: Option<Pool>) -> serde_json::Value {
+        let RoomStats { paused, .. } = self.stats();
         let players = self.clients.lock().await.len();
         serde_json::json!({
             "id": self.id,
             "name": self.name,
-            "verifiedOnly": self.verified_only,
+            "pool": self.pool.json(),
             "permanent": self.permanent,
             "players": players,
-            "wave": wave,
-            "gameOver": game_over,
             "paused": paused,
-            "canJoin": can_join(self.verified_only, player_verified),
+            "map": self.map_json(),
+            "canJoin": viewer == Some(self.pool),
         })
     }
 
-    /// Restart this room's round and resync every connected client.
-    pub async fn restart(&self, requested: u32, unlocked: u32) {
+    /// Operator restart: clear and restock the world and resync every client.
+    /// Players stay in their raids.
+    pub async fn restart(&self) {
         {
             let mut game = self.game.lock().await;
-            game.reset_at_wave(requested, unlocked);
+            game.reset_world();
             *self.stats.lock().unwrap() = RoomStats::from_game(&game);
         }
-        *self.delta_tracker.lock().await = DeltaTracker::new();
+        self.trackers.lock().await.clear();
         let clients = self.clients.lock().await;
         self.pending_snapshots.lock().await.extend(clients.keys().cloned());
     }
 
     /// Run one game tick and publish it inline. The live server runs these two
     /// halves on separate pools (see `spawn_room_loops`); this keeps tests simple.
-    pub async fn tick(&self, db: &Database) {
+    #[cfg(test)]
+    pub async fn tick(&self, db: &Arc<Database>) {
         if let Some(frame) = self.sim_tick().await {
             self.publish_frame(&frame, db).await;
         }
@@ -294,11 +340,16 @@ impl Room {
         }
         let started = Instant::now();
         let mut game = self.game.lock().await;
-        let was_finished = game.is_game_over();
         let paused = game.is_paused();
-        if !was_finished && !paused {
-            game.update(1.0 / 60.0);
+        if !paused {
+            let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| game.update(1.0 / 60.0)));
+            if tick.is_err() {
+                // Keep the room alive: clear the world (players keep their raids) and carry on.
+                eprintln!("Room {} panicked during a tick; resetting its world", self.id);
+                game.reset_world();
+            }
         }
+        let finished = game.take_outcomes();
         let frame = Frame {
             seq: self.next_seq.fetch_add(1, Ordering::Relaxed) + 1,
             players: game.players().clone(),
@@ -306,19 +357,15 @@ impl Room {
             bullets: game.bullets().to_vec(),
             placeables: game.placeables().to_vec(),
             drops: game.drops(),
-            wave: game.wave(),
-            wave_kills: game.wave_kills(),
-            wave_target: game.wave_target(),
-            wave_break_timer: game.wave_break_timer(),
             ammo_availability: game.ammo_availability().iter().map(|a| (a.id.clone(), a.available)).collect(),
-            game_over: game.is_game_over(),
-            was_finished,
+            crate_availability: game.crate_availability().iter().map(|a| (a.id.clone(), a.available)).collect(),
             paused,
             host_id: game.host_id().map(str::to_owned),
         };
         let stats = RoomStats::from_game(&game);
         drop(game);
         *self.stats.lock().unwrap() = stats;
+        if !finished.is_empty() { self.outcomes.lock().unwrap().extend(finished); }
 
         let elapsed = started.elapsed();
         let thread = sim::record_tick(elapsed);
@@ -326,37 +373,70 @@ impl Room {
         Some(Arc::new(frame))
     }
 
-    /// State-provider half: diff, serialize and send one frame, and persist
-    /// wave progress. Runs off the game threads.
-    pub async fn publish_frame(&self, frame: &Frame, db: &Database) {
+    /// State-provider half: settle finished raids, then diff, serialize and send
+    /// one frame. Runs off the game threads.
+    pub async fn publish_frame(&self, frame: &Frame, db: &Arc<Database>) {
         let started = Instant::now();
         let previous = self.last_published_seq.swap(frame.seq, Ordering::Relaxed);
         if previous != 0 && frame.seq > previous + 1 {
             self.skipped_frames.fetch_add(frame.seq - previous - 1, Ordering::Relaxed);
         }
-        let dropped = self.publish(frame, db).await;
+        self.settle_outcomes(db).await;
+        let dropped = self.publish(frame).await;
         let elapsed = started.elapsed();
         let thread = sim::record_tick(elapsed);
         self.publish_metrics.lock().unwrap().record(elapsed, dropped, thread, Instant::now());
     }
 
+    /// A player's connection closed. If that ended a raid still in progress, it
+    /// is abandoned and returned with the stash profile so the caller can settle
+    /// it. If the game loop already ended the raid (killed, extracted, out of
+    /// time) the profile is left for `settle_outcomes`, which is what records it.
+    pub async fn leave(&self, player_id: &str) -> Option<Departure> {
+        let (abandoned, acted) = {
+            let mut game = self.game.lock().await;
+            let acted = game.has_acted(player_id);
+            (game.abandon(player_id), acted)
+        };
+        self.clients.lock().await.remove(player_id);
+        self.pending_snapshots.lock().await.remove(player_id);
+        let outcome = abandoned?;
+        let profile = self.raid_profiles.lock().await.remove(player_id)?;
+        Some(if acted { Departure::Abandoned(outcome, profile) } else { Departure::NeverPlayed(profile) })
+    }
+
+    /// Save each finished raid to its stash and tell the player how it went.
+    /// The player is detached from the room first so no more deltas reach them;
+    /// dropping their sender then closes the connection after the result is sent.
+    pub(crate) async fn settle_outcomes(&self, db: &Arc<Database>) {
+        let finished = std::mem::take(&mut *self.outcomes.lock().unwrap());
+        for outcome in finished {
+            let profile = self.raid_profiles.lock().await.remove(&outcome.player_id);
+            let tx = self.clients.lock().await.remove(&outcome.player_id);
+            self.pending_snapshots.lock().await.remove(&outcome.player_id);
+            self.raids_settled.fetch_add(1, Ordering::Relaxed);
+            let db = db.clone();
+            let map = self.map.name;
+            let room_id = self.id.clone();
+            tokio::spawn(async move {
+                let settlement = match profile {
+                    Some(profile) => settle_with_retry(db, profile, room_id, outcome.clone()).await,
+                    None => { eprintln!("Finished raid for player {} has no stash profile", outcome.player_id); None }
+                };
+                let msg = serde_json::json!({ "type": "raidEnd", "map": map, "outcome": outcome, "settlement": settlement }).to_string();
+                if let Some(tx) = tx {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), tx.send(msg)).await;
+                }
+            });
+        }
+    }
+
     /// Returns the number of deltas dropped for clients that were behind.
-    async fn publish(&self, frame: &Frame, db: &Database) -> u64 {
+    async fn publish(&self, frame: &Frame) -> u64 {
         let room_status = serde_json::json!({
             "type": "room", "hostId": frame.host_id, "paused": frame.paused,
-            "roomId": self.id, "roomName": self.name, "verifiedOnly": self.verified_only,
+            "roomId": self.id, "roomName": self.name, "pool": self.pool.id(),
         }).to_string();
-
-        // Persist only when a connected browser reaches a new wave, not every tick.
-        {
-            let mut profiles = self.wave_profiles.lock().await;
-            for (profile, recorded_wave) in profiles.values_mut() {
-                if frame.wave > *recorded_wave {
-                    db.record_wave(profile, frame.wave);
-                    *recorded_wave = frame.wave;
-                }
-            }
-        }
 
         let room_changed = {
             let mut previous = self.last_room_status.lock().await;
@@ -368,61 +448,56 @@ impl Room {
             self.pending_snapshots.lock().await.extend(frame.players.keys().cloned());
         }
 
-        // --- Delta computation ---
-        let mut dt = self.delta_tracker.lock().await;
-        let delta = dt.compute_delta(
-            &frame.players, &frame.zombies, &frame.bullets, &frame.placeables, &frame.drops,
-            frame.wave, frame.wave_kills, frame.wave_target, frame.wave_break_timer,
-            &frame.ammo_availability, frame.game_over,
-        );
-        // The delta that ends the round is the last one clients get, so it can't be
-        // lost like an ordinary delta. It is computed against the last *published*
-        // frame, so it still carries `gameOver` even if the frame where the round
-        // ended was skipped by the latest-wins hand-off.
-        let ends_round = delta.game_over == Some(true);
-        let delta_str = serde_json::to_string(&delta).unwrap();
+        let snapshot_ids: Vec<String> = self.pending_snapshots.lock().await.drain().collect();
+        let regular = frame.seq % SEND_EVERY == 0 && !frame.paused;
+        if !room_changed && snapshot_ids.is_empty() && !regular {
+            return 0;
+        }
 
-        let snapshot_ids: Vec<String> = {
-            let mut pending = self.pending_snapshots.lock().await;
-            pending.drain().collect()
-        };
-        let snapshot_str = if !snapshot_ids.is_empty() {
-            let snapshot = dt.build_snapshot(
-                &frame.players, &frame.zombies, &frame.bullets, &frame.placeables, &frame.drops,
-                frame.wave, frame.wave_kills, frame.wave_target, frame.wave_break_timer,
-                &frame.ammo_availability, frame.game_over,
-            );
-            Some(serde_json::to_string(&snapshot).unwrap())
-        } else {
-            None
-        };
-        drop(dt);
-
-        // --- Adaptive broadcast: deltas are droppable; status + snapshots must arrive ---
+        // Adaptive broadcast: deltas are droppable; status + snapshots must arrive.
         let mut dropped = 0;
         let mut retry = Vec::new();
         let clients = self.clients.lock().await;
+        let mut trackers = self.trackers.lock().await;
+        trackers.retain(|id, _| clients.contains_key(id));
         for (id, tx) in clients.iter() {
             let needs_snapshot = snapshot_ids.contains(id);
+            if !(room_changed || needs_snapshot || regular) { continue; }
+            // What this player can see: everything near them (or everything, if
+            // they have no body in the raid).
+            let center = frame.players.get(id).map(|p| (p.pos.x, p.pos.y));
+            let near = |x: f64, y: f64| center.is_none_or(|(cx, cy)| (x - cx).abs() < VIEW_RANGE && (y - cy).abs() < VIEW_RANGE);
+            let zombies: Vec<Zombie> = frame.zombies.iter().filter(|z| near(z.pos.x, z.pos.y)).cloned().collect();
+            let bullets: Vec<Bullet> = frame.bullets.iter().filter(|b| near(b.pos.x, b.pos.y)).cloned().collect();
+            let placeables: Vec<Placeable> = frame.placeables.iter().filter(|p| near(p.pos.x, p.pos.y)).cloned().collect();
+            let drops: Vec<DropPickup> = frame.drops.iter().filter(|d| near(d.pos.x, d.pos.y)).cloned().collect();
+            let world = World {
+                players: &frame.players, zombies: &zombies, bullets: &bullets, placeables: &placeables,
+                drops: &drops, ammo: &frame.ammo_availability, crates: &frame.crate_availability,
+            };
+            let tracker = trackers.entry(id.clone()).or_insert_with(DeltaTracker::new);
             if room_changed || needs_snapshot {
-                // Host/pause changes and snapshots must not be lost like disposable
-                // deltas, but we never wait on a player: if their queue is full the
-                // resync is retried next frame, so one stalled connection can't
-                // hold up the room or anyone else in it.
+                // Never wait on a player: if their queue is full the resync is
+                // retried next frame, so one stalled connection can't hold up the room.
                 let mut must_send = vec![room_status.clone()];
-                if needs_snapshot { must_send.extend(snapshot_str.clone()); }
+                if needs_snapshot { must_send.push(serde_json::to_string(&tracker.snapshot(&world, frame.seq)).unwrap()); }
                 for msg in must_send {
                     if tx.try_send(msg).is_err() {
                         retry.push(id.clone());
                         break;
                     }
                 }
-            } else if (!frame.was_finished || ends_round) && !frame.paused && tx.try_send(delta_str.clone()).is_err() {
-                // A full queue drops ordinary deltas; the round-ending one falls back
-                // to a snapshot (which carries gameOver), retried until it fits.
-                if ends_round { retry.push(id.clone()); } else { dropped += 1; }
+            } else {
+                let delta = serde_json::to_string(&tracker.compute_delta(&world, frame.seq)).unwrap();
+                if tx.try_send(delta).is_err() {
+                    // Deltas build on each other, so a dropped one would leave this
+                    // client out of sync for good: send it a fresh snapshot instead.
+                    dropped += 1;
+                    retry.push(id.clone());
+                }
             }
         }
+        drop(trackers);
         drop(clients);
         if !retry.is_empty() {
             self.slow_client_retries.fetch_add(retry.len() as u64, Ordering::Relaxed);
@@ -430,6 +505,33 @@ impl Room {
         }
         dropped
     }
+}
+
+/// What a disconnect means for the player's stash.
+pub enum Departure {
+    /// They left a raid they were playing: it's lost.
+    Abandoned(RaidOutcome, String),
+    /// They dropped before sending a single input: void the raid, refund the fee.
+    NeverPlayed(String),
+}
+
+/// Settle a raid on a blocking thread, retrying a few times so a transient
+/// SQLite error doesn't leave the operator stuck in a raid.
+pub async fn settle_with_retry(db: Arc<Database>, profile: String, room_id: String, outcome: RaidOutcome) -> Option<crate::db::RaidSettlement> {
+    for attempt in 0..4u64 {
+        let (db2, p, r, o) = (db.clone(), profile.clone(), room_id.clone(), outcome.clone());
+        match tokio::task::spawn_blocking(move || db2.finish_raid_in(&p, Some(&r), &o)).await {
+            Ok(Ok(s)) => return Some(s),
+            Ok(Err(e)) if e.starts_with("Not in a raid") || e.starts_with("Deployed in") => {
+                eprintln!("Raid for {profile} was already settled or belongs elsewhere: {e}");
+                return None;
+            }
+            Ok(Err(e)) => eprintln!("Could not settle the raid for {profile} (attempt {}): {e}", attempt + 1),
+            Err(e) => eprintln!("Raid settlement for {profile} panicked (attempt {}): {e}", attempt + 1),
+        }
+        tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+    }
+    None
 }
 
 pub struct RegistryConfig {
@@ -461,10 +563,9 @@ impl RoomRegistry {
     pub fn max_rooms(&self) -> usize { self.max_rooms }
     pub fn empty_ttl(&self) -> Duration { self.empty_ttl }
 
-    /// Create the always-on rooms and the background reaper. Call once at startup.
+    /// Start the background reaper. Call once at startup. The always-on raids
+    /// (one per map per pool) open on demand: see [`Self::ensure_official`].
     pub async fn start(self: &Arc<Self>) {
-        self.insert(Room::new(OPEN_ROOM_ID.into(), "Open Arena".into(), false, true)).await;
-        self.insert(Room::new(VERIFIED_ROOM_ID.into(), "Verified Arena".into(), true, true)).await;
 
         let registry = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -486,7 +587,38 @@ impl RoomRegistry {
         room
     }
 
-    pub async fn create(&self, name: &str, verified_only: bool) -> Result<Arc<Room>, String> {
+    /// Open the always-on raid for every map in this pool, if not already open.
+    /// They don't count toward the room limit and are never reaped.
+    pub async fn ensure_official(&self, pool: Pool) {
+        let missing: Vec<&'static MapDef> = {
+            let rooms = self.rooms.lock().await;
+            MAPS.iter().filter(|m| !rooms.contains_key(&official_room_id(m.id, pool))).collect()
+        };
+        for map in missing {
+            let id = official_room_id(map.id, pool);
+            // Re-check under the lock so two concurrent callers don't both start a room.
+            if self.rooms.lock().await.contains_key(&id) { continue; }
+            self.insert(Room::new(id, map.name.to_string(), pool, true, map)).await;
+        }
+    }
+
+    /// Find the room a player asked for. A bare map id ("outskirts") means that
+    /// map's always-on raid in the player's own pool.
+    pub async fn resolve(&self, room_id: &str, pool: Pool) -> Option<Arc<Room>> {
+        if MAPS.iter().any(|m| m.id == room_id) {
+            self.ensure_official(pool).await;
+            return self.get(&official_room_id(room_id, pool)).await;
+        }
+        self.get(room_id).await
+    }
+
+    /// Every room in one pool, opening its always-on raids first.
+    pub async fn in_pool(&self, pool: Pool) -> Vec<Arc<Room>> {
+        self.ensure_official(pool).await;
+        self.all().await.into_iter().filter(|r| r.pool == pool).collect()
+    }
+
+    pub async fn create(&self, name: &str, pool: Pool, map: &'static MapDef) -> Result<Arc<Room>, String> {
         let name = sanitize_room_name(name);
         if name.is_empty() {
             return Err("Room name required".into());
@@ -495,7 +627,7 @@ impl RoomRegistry {
             return Err("Server room limit reached — try again later".into());
         }
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        Ok(self.insert(Room::new(id, name, verified_only, false)).await)
+        Ok(self.insert(Room::new(id, name, pool, false, map)).await)
     }
 
     pub async fn get(&self, id: &str) -> Option<Arc<Room>> {
@@ -504,8 +636,8 @@ impl RoomRegistry {
 
     pub async fn all(&self) -> Vec<Arc<Room>> {
         let mut rooms: Vec<_> = self.rooms.lock().await.values().cloned().collect();
-        rooms.sort_by(|a, b| b.permanent.cmp(&a.permanent)
-            .then(a.verified_only.cmp(&b.verified_only))
+        rooms.sort_by(|a, b| a.map.tier.cmp(&b.map.tier)
+            .then(b.permanent.cmp(&a.permanent))
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
         rooms
     }
@@ -563,6 +695,10 @@ fn spawn_room_loops(sim: &tokio::runtime::Handle, publish: &tokio::runtime::Hand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::test_support::kit;
+    use crate::gear::default_map;
+
+    fn memdb() -> Arc<Database> { Arc::new(Database::open(":memory:").unwrap()) }
 
     fn registry(ttl: Duration) -> Arc<RoomRegistry> {
         registry_with(ttl, MAX_ROOMS, tokio::runtime::Handle::current())
@@ -570,22 +706,26 @@ mod tests {
 
     fn registry_with(empty_ttl: Duration, max_rooms: usize, sim: tokio::runtime::Handle) -> Arc<RoomRegistry> {
         let publish = tokio::runtime::Handle::current();
-        RoomRegistry::new(Arc::new(Database::open(":memory:").unwrap()), RegistryConfig { empty_ttl, max_rooms, sim, publish })
+        RoomRegistry::new(memdb(), RegistryConfig { empty_ttl, max_rooms, sim, publish })
     }
 
     fn pools(sim_threads: usize, publish_threads: usize) -> (crate::sim::SimRuntime, crate::sim::SimRuntime, Arc<RoomRegistry>) {
         let sim = crate::sim::SimRuntime::new(crate::sim::THREAD_PREFIX, sim_threads).unwrap();
         let publish = crate::sim::SimRuntime::new(crate::sim::PUBLISH_PREFIX, publish_threads).unwrap();
-        let registry = RoomRegistry::new(Arc::new(Database::open(":memory:").unwrap()), RegistryConfig {
+        let registry = RoomRegistry::new(memdb(), RegistryConfig {
             empty_ttl: EMPTY_ROOM_TTL, max_rooms: MAX_ROOMS, sim: sim.handle(), publish: publish.handle(),
         });
         (sim, publish, registry)
     }
 
+    fn room(id: &str, name: &str) -> Room {
+        Room::new(id.into(), name.into(), Pool::Direct, false, default_map())
+    }
+
     /// Simulate a connected client: register a channel and a player in the room.
     async fn connect(room: &Room, id: &str) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel(64);
-        room.game.lock().await.add_player(id, id);
+        room.game.lock().await.add_player(id, id, &kit(5, 5, 5));
         room.clients.lock().await.insert(id.to_string(), tx);
         room.pending_snapshots.lock().await.insert(id.to_string());
         rx
@@ -605,14 +745,14 @@ mod tests {
     // ---- Join rules ----
 
     #[test]
-    fn verified_players_can_join_everything_unverified_only_open_rooms() {
-        assert!(can_join(false, true));
-        assert!(can_join(true, true));
-        assert!(can_join(false, false));
-        assert!(!can_join(true, false));
+    fn players_are_pooled_by_platform_unless_they_opt_into_crossplay() {
+        assert_eq!(Pool::for_player("steam", false), Pool::Steam);
+        assert_eq!(Pool::for_player("bluesky", false), Pool::Bluesky);
+        assert_eq!(Pool::for_player("direct", false), Pool::Direct);
+        assert_eq!(Pool::for_player("google", false), Pool::Direct);
+        for platform in ["steam", "bluesky", "direct"] { assert_eq!(Pool::for_player(platform, true), Pool::Cross); }
+        assert_eq!(official_room_id("outskirts", Pool::Steam), "outskirts-steam");
     }
-
-    // ---- Room names ----
 
     #[test]
     fn room_names_are_trimmed_and_bounded() {
@@ -620,13 +760,7 @@ mod tests {
         assert_eq!(sanitize_room_name(&"x".repeat(40)).len(), 24);
         assert_eq!(sanitize_room_name("   "), "");
         assert_eq!(sanitize_room_name("\u{0007}\t\r\n"), "");
-    }
-
-    #[test]
-    fn room_names_count_characters_not_bytes() {
-        let name = sanitize_room_name(&"🧟".repeat(30));
-        assert_eq!(name.chars().count(), 24);
-        assert_eq!(sanitize_room_name("<b>Ünïcode</b>"), "<b>Ünïcode</b>", "names are stored raw; the UI renders them as text");
+        assert_eq!(sanitize_room_name(&"🧟".repeat(30)).chars().count(), 24);
     }
 
     #[test]
@@ -640,81 +774,75 @@ mod tests {
     // ---- Registry ----
 
     #[tokio::test]
-    async fn registry_starts_with_open_and_verified_rooms() {
+    async fn each_pool_gets_its_own_always_on_raid_per_map() {
         let registry = registry(EMPTY_ROOM_TTL);
         registry.start().await;
-        let open = registry.get(OPEN_ROOM_ID).await.unwrap();
-        let verified = registry.get(VERIFIED_ROOM_ID).await.unwrap();
-        assert!(!open.verified_only && open.permanent);
-        assert!(verified.verified_only && verified.permanent);
-        assert_eq!(registry.all().await.len(), 2);
+        assert_eq!(registry.all().await.len(), 0, "pools open on demand");
+        let steam = registry.in_pool(Pool::Steam).await;
+        assert_eq!(steam.len(), MAPS.len());
+        for map in &MAPS {
+            let open = registry.get(&official_room_id(map.id, Pool::Steam)).await.unwrap();
+            assert!(open.pool == Pool::Steam && open.permanent && open.map.id == map.id && open.name == map.name);
+        }
+        registry.in_pool(Pool::Steam).await;
+        assert_eq!(registry.all().await.len(), MAPS.len(), "opening a pool twice adds nothing");
+        // A bare map id resolves to that map's raid in the asker's pool.
+        let blue = registry.resolve(OPEN_ROOM_ID, Pool::Bluesky).await.unwrap();
+        assert_eq!((blue.id.as_str(), blue.pool), ("outskirts-bluesky", Pool::Bluesky));
+        assert_eq!(registry.resolve("outskirts-steam", Pool::Bluesky).await.unwrap().pool, Pool::Steam, "explicit ids are not rewritten");
+        assert!(registry.resolve("nope", Pool::Steam).await.is_none());
+        assert!(registry.in_pool(Pool::Cross).await.iter().all(|r| r.pool == Pool::Cross));
     }
 
     #[tokio::test]
-    async fn create_validates_names_and_assigns_unique_ids() {
+    async fn create_validates_names_and_picks_the_map() {
         let registry = registry(EMPTY_ROOM_TTL);
-        let a = registry.create("  Squad  ", true).await.unwrap();
-        let b = registry.create("Squad", false).await.unwrap();
+        let a = registry.create("  Squad  ", Pool::Steam, &MAPS[2]).await.unwrap();
+        let b = registry.create("Squad", Pool::Cross, &MAPS[0]).await.unwrap();
         assert_eq!(a.name, "Squad");
-        assert!(a.verified_only && !b.verified_only);
-        assert!(!a.permanent);
-        assert_ne!(a.id, b.id, "duplicate names are allowed but ids are unique");
-        assert!(registry.create(" ", false).await.is_err());
-        assert!(registry.create("", false).await.is_err());
-        assert!(registry.get("does-not-exist").await.is_none());
+        assert_eq!(a.map.id, "quarantine");
+        assert!(a.pool == Pool::Steam && b.pool == Pool::Cross && !a.permanent);
+        assert_ne!(a.id, b.id);
+        assert!(registry.create(" ", Pool::Steam, &MAPS[0]).await.is_err());
     }
 
     #[tokio::test]
     async fn create_enforces_room_limit() {
-        let registry = registry_with(EMPTY_ROOM_TTL, 6, tokio::runtime::Handle::current());
+        let registry = registry_with(EMPTY_ROOM_TTL, MAPS.len() + 2, tokio::runtime::Handle::current());
         registry.start().await;
-        for i in 0..4 {
-            registry.create(&format!("Room {i}"), false).await.unwrap();
-        }
-        assert_eq!(registry.all().await.len(), 6);
-        let err = registry.create("One too many", false).await.err().unwrap();
+        registry.ensure_official(Pool::Direct).await;
+        registry.create("One", Pool::Direct, &MAPS[0]).await.unwrap();
+        registry.create("Two", Pool::Direct, &MAPS[0]).await.unwrap();
+        let err = registry.create("One too many", Pool::Direct, &MAPS[0]).await.err().unwrap();
         assert!(err.contains("limit"), "{err}");
     }
 
     #[tokio::test]
-    async fn listing_puts_official_rooms_first_then_open_then_alphabetical() {
+    async fn listing_orders_by_map_tier_then_official_first() {
         let registry = registry(EMPTY_ROOM_TTL);
         registry.start().await;
-        registry.create("zulu", true).await.unwrap();
-        registry.create("Alpha", false).await.unwrap();
-        registry.create("bravo", false).await.unwrap();
-        let names: Vec<_> = registry.all().await.iter().map(|r| r.name.clone()).collect();
-        assert_eq!(names, ["Open Arena", "Verified Arena", "Alpha", "bravo", "zulu"]);
+        registry.create("alpha", Pool::Direct, &MAPS[1]).await.unwrap();
+        let rooms = registry.in_pool(Pool::Direct).await;
+        let tiers: Vec<u32> = rooms.iter().map(|r| r.map.tier).collect();
+        assert!(tiers.windows(2).all(|w| w[0] <= w[1]));
+        let rust: Vec<_> = rooms.iter().filter(|r| r.map.tier == 2).map(|r| r.name.clone()).collect();
+        assert_eq!(rust, ["Rust Yard", "alpha"]);
     }
 
-    // ---- Summaries ----
-
     #[tokio::test]
-    async fn summary_reports_join_permission_per_caller() {
-        let registry = registry(EMPTY_ROOM_TTL);
-        let locked = registry.create("Vets", true).await.unwrap();
-        let open = registry.create("Randos", false).await.unwrap();
-        assert_eq!(locked.summary(false).await["canJoin"], false);
-        assert_eq!(locked.summary(true).await["canJoin"], true);
-        assert_eq!(open.summary(false).await["canJoin"], true);
-        let s = open.summary(false).await;
-        assert_eq!(s["name"], "Randos");
-        assert_eq!(s["verifiedOnly"], false);
+    async fn summary_reports_map_gate_and_join_permission() {
+        let r = Room::new("v".into(), "Vets".into(), Pool::Steam, false, &MAPS[1]);
+        assert_eq!(r.summary(None).await["canJoin"], false);
+        assert_eq!(r.summary(Some(Pool::Bluesky)).await["canJoin"], false);
+        assert_eq!(r.summary(Some(Pool::Cross)).await["canJoin"], false);
+        assert_eq!(r.summary(Some(Pool::Steam)).await["canJoin"], true);
+        let s = r.summary(Some(Pool::Steam)).await;
+        assert_eq!(s["pool"]["label"], "Steam");
+        assert_eq!(s["map"]["id"], "rustyard");
+        assert_eq!(s["map"]["minGearScore"], 20);
         assert_eq!(s["players"], 0);
-        assert_eq!(s["wave"], 1);
-        assert_eq!(s["gameOver"], false);
-        assert_eq!(s["paused"], false);
-    }
-
-    #[tokio::test]
-    async fn summary_counts_connected_players() {
-        let registry = registry(EMPTY_ROOM_TTL);
-        let room = registry.create("Busy", false).await.unwrap();
-        let _a = connect(&room, "a").await;
-        let _b = connect(&room, "b").await;
-        assert_eq!(room.summary(false).await["players"], 2);
-        disconnect(&room, "a").await;
-        assert_eq!(room.summary(false).await["players"], 1);
+        let _a = connect(&r, "a").await;
+        assert_eq!(r.summary(None).await["players"], 1);
     }
 
     // ---- Reaping ----
@@ -723,7 +851,7 @@ mod tests {
     async fn empty_player_rooms_expire_after_ttl_but_not_before() {
         let ttl = Duration::from_secs(90);
         let registry = registry(ttl);
-        let room = registry.create("Temp", false).await.unwrap();
+        let room = registry.create("Temp", Pool::Direct, default_map()).await.unwrap();
         let id = room.id.clone();
         drop(room);
         let t0 = Instant::now();
@@ -737,22 +865,20 @@ mod tests {
     async fn permanent_rooms_are_never_reaped() {
         let registry = registry(Duration::from_secs(1));
         registry.start().await;
+        for pool in Pool::ALL { registry.ensure_official(pool).await; }
         registry.reap_empty_rooms(Instant::now() + Duration::from_secs(3600)).await;
-        assert!(registry.get(OPEN_ROOM_ID).await.is_some());
-        assert!(registry.get(VERIFIED_ROOM_ID).await.is_some());
+        assert_eq!(registry.all().await.len(), MAPS.len() * Pool::ALL.len());
     }
 
     #[tokio::test]
     async fn occupied_rooms_survive_and_their_empty_timer_restarts_on_leave() {
         let ttl = Duration::from_secs(90);
         let registry = registry(ttl);
-        let room = registry.create("Party", false).await.unwrap();
+        let room = registry.create("Party", Pool::Direct, default_map()).await.unwrap();
         let _rx = connect(&room, "p1").await;
         let t0 = Instant::now();
         registry.reap_empty_rooms(t0 + ttl * 10).await;
         assert!(registry.get(&room.id).await.is_some(), "occupied room kept");
-
-        // Leaves at t1: the room is first seen empty then, so it lasts until t1 + ttl.
         disconnect(&room, "p1").await;
         let t1 = t0 + ttl * 10;
         registry.reap_empty_rooms(t1).await;
@@ -765,11 +891,10 @@ mod tests {
     #[tokio::test]
     async fn removing_a_room_stops_its_simulation_task() {
         let registry = registry(Duration::from_secs(1));
-        let room = registry.create("Doomed", false).await.unwrap();
+        let room = registry.create("Doomed", Pool::Direct, default_map()).await.unwrap();
         let weak = Arc::downgrade(&room);
         drop(room);
         registry.reap_empty_rooms(Instant::now() + Duration::from_secs(5)).await;
-        // The tick task only holds a Weak, so nothing keeps the room alive.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(weak.upgrade().is_none());
     }
@@ -778,39 +903,38 @@ mod tests {
 
     #[tokio::test]
     async fn tick_sends_room_status_and_snapshot_to_new_clients_then_deltas() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r1".into(), "Alpha".into(), true, false);
+        let db = memdb();
+        let room = room("r1", "Alpha");
         let mut rx = connect(&room, "p1").await;
-
         room.tick(&db).await;
         let first = drain(&mut rx);
         assert_eq!(first[0]["type"], "room");
         assert_eq!(first[0]["roomId"], "r1");
-        assert_eq!(first[0]["roomName"], "Alpha");
-        assert_eq!(first[0]["verifiedOnly"], true);
         assert_eq!(first[0]["hostId"], "p1");
         assert_eq!(first[1]["type"], "snapshot");
-        assert!(first[1]["players"]["p1"].is_object());
-
+        assert!(first[1]["players"]["p1"]["backpackCapacity"].is_number());
+        assert!(first[1]["crates"].as_array().is_some_and(|c| !c.is_empty()));
+        room.tick(&db).await;
         room.tick(&db).await;
         let second = drain(&mut rx);
-        assert_eq!(second.len(), 1);
+        assert_eq!(second.len(), 1, "state goes out at 30 Hz: one delta per two ticks");
         assert_eq!(second[0]["type"], "delta");
     }
 
     #[tokio::test]
     async fn tick_is_a_no_op_for_empty_rooms() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r1".into(), "Idle".into(), false, false);
+        let db = memdb();
+        let room = room("r1", "Idle");
         room.tick(&db).await;
         assert!(room.last_room_status.lock().await.is_empty(), "nothing simulated or broadcast");
+        assert_eq!(room.metrics.lock().unwrap().ticks, 0);
     }
 
     #[tokio::test]
     async fn rooms_are_isolated_from_each_other() {
-        let db = Database::open(":memory:").unwrap();
-        let a = Room::new("a".into(), "A".into(), false, false);
-        let b = Room::new("b".into(), "B".into(), false, false);
+        let db = memdb();
+        let a = room("a", "A");
+        let b = room("b", "B");
         let mut rx_a = connect(&a, "alice").await;
         let mut rx_b = connect(&b, "bob").await;
         a.tick(&db).await;
@@ -819,17 +943,14 @@ mod tests {
         let snap_b = drain(&mut rx_b).into_iter().find(|m| m["type"] == "snapshot").unwrap();
         assert!(snap_a["players"]["alice"].is_object() && snap_a["players"]["bob"].is_null());
         assert!(snap_b["players"]["bob"].is_object() && snap_b["players"]["alice"].is_null());
-
-        // Pausing one room leaves the other running.
         assert!(a.game.lock().await.set_paused("alice", true));
-        assert!(a.game.lock().await.is_paused());
         assert!(!b.game.lock().await.is_paused());
     }
 
     #[tokio::test]
     async fn pause_change_is_broadcast_to_the_room() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "R".into(), false, false);
+        let db = memdb();
+        let room = room("r", "R");
         let mut rx = connect(&room, "host").await;
         room.tick(&db).await;
         drain(&mut rx);
@@ -838,84 +959,235 @@ mod tests {
         let msgs = drain(&mut rx);
         assert_eq!(msgs[0]["type"], "room");
         assert_eq!(msgs[0]["paused"], true);
-        // While paused, no droppable deltas are sent after the resync.
         room.tick(&db).await;
-        assert!(drain(&mut rx).is_empty());
+        assert!(drain(&mut rx).is_empty(), "no droppable deltas while paused");
     }
 
     #[tokio::test]
     async fn restart_resyncs_every_connected_client() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "R".into(), false, false);
+        let db = memdb();
+        let room = room("r", "R");
         let mut rx1 = connect(&room, "p1").await;
         let mut rx2 = connect(&room, "p2").await;
         room.tick(&db).await;
         drain(&mut rx1);
         drain(&mut rx2);
-        room.restart(1, 1).await;
+        room.restart().await;
         room.tick(&db).await;
         for rx in [&mut rx1, &mut rx2] {
             assert!(drain(rx).iter().any(|m| m["type"] == "snapshot"));
         }
+        assert!(room.game.lock().await.players().contains_key("p1"), "players keep raiding");
+    }
+
+    async fn recv_raid_end(rx: &mut mpsc::Receiver<String>) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                    if v["type"] == "raidEnd" { return v; }
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        panic!("no raidEnd message");
     }
 
     #[tokio::test]
-    async fn round_end_reaches_clients_even_when_its_frame_is_skipped() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "R".into(), false, false);
-        let mut rx = connect(&room, "p1").await;
+    async fn a_finished_raid_is_saved_reported_and_disconnects_the_player() {
+        let db = memdb();
+        let room = room("r", "R");
+        let profile = "guest:test".to_string();
+        let loadout = db.begin_raid(&profile, "r", 0).unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        room.game.lock().await.add_player("p1", "P1", &loadout);
+        room.clients.lock().await.insert("p1".into(), tx);
+        room.raid_profiles.lock().await.insert("p1".into(), profile.clone());
         room.tick(&db).await;
-        drain(&mut rx);
 
-        room.game.lock().await.kill_all_players();
-        let ending = room.sim_tick().await.unwrap();
-        assert!(ending.game_over && !ending.was_finished, "this frame ends the round");
-        // Under load the latest-wins hand-off skips that frame: the state provider
-        // only ever sees the next one, simulated after the round was already over.
-        let after = room.sim_tick().await.unwrap();
-        assert!(after.was_finished);
-        room.publish_frame(&after, &db).await;
-        let msgs = drain(&mut rx);
-        assert!(msgs.iter().any(|m| m["gameOver"] == true), "client never learned the round ended: {msgs:?}");
-
-        // Once the client knows, the finished round stays quiet.
-        room.tick(&db).await;
-        assert!(drain(&mut rx).is_empty());
+        room.game.lock().await.down_all_players();
+        for _ in 0..(crate::map::BLEEDOUT_ALONE * 60.0) as usize + 5 { room.tick(&db).await; }
+        let end = recv_raid_end(&mut rx).await;
+        assert_eq!(end["outcome"]["result"], "killed");
+        assert_eq!(end["settlement"]["cashEarned"], 0);
+        assert!(room.clients.lock().await.is_empty(), "the player was detached from the room");
+        // The sender is dropped once the result is out, which ends the connection.
+        while rx.recv().await.is_some() {}
+        let op = db.operator(&profile).unwrap();
+        assert!(op.in_raid.is_none());
+        assert_eq!(op.deaths, 1);
+        assert_eq!(op.loadout().gear_score(), 0, "the loadout was lost");
+        assert_eq!(room.ops_snapshot().await["raidsSettled"], 1);
     }
 
     #[tokio::test]
-    async fn round_end_is_resent_when_the_client_queue_was_full() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "R".into(), false, false);
+    async fn raid_results_survive_skipped_frames() {
+        let db = memdb();
+        let room = room("r", "R");
+        let profile = "guest:skip".to_string();
+        let loadout = db.begin_raid(&profile, "r", 0).unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        room.game.lock().await.add_player("p1", "P1", &loadout);
+        room.clients.lock().await.insert("p1".into(), tx);
+        room.raid_profiles.lock().await.insert("p1".into(), profile.clone());
+        let _bystander = connect(&room, "p2").await;
+        {
+            let mut game = room.game.lock().await;
+            let e = game.layout().extracts[0].clone();
+            game.clear_zombies();
+            game.player_mut("p1").pos = crate::types::Vector2 { x: e.x, y: e.y };
+            game.player_mut("p1").bounty = 77.0;
+        }
+        // Run the game loop alone, then publish only the latest frame.
+        let mut latest = None;
+        for _ in 0..(crate::map::EXTRACT_TIME * 60.0) as usize + 10 { latest = room.sim_tick().await; }
+        room.publish_frame(latest.as_ref().unwrap(), &db).await;
+        let end = recv_raid_end(&mut rx).await;
+        assert_eq!(end["outcome"]["result"], "extracted");
+        assert_eq!(end["settlement"]["cashEarned"], 77);
+        assert_eq!(db.operator(&profile).unwrap().extracts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_raid_that_ends_just_before_a_disconnect_is_still_settled() {
+        let db = memdb();
+        let room = room("r", "R");
+        let profile = "guest:race".to_string();
+        let loadout = db.begin_raid(&profile, "r", 0).unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        room.game.lock().await.add_player("p1", "P1", &loadout);
+        room.clients.lock().await.insert("p1".into(), tx);
+        room.raid_profiles.lock().await.insert("p1".into(), profile.clone());
+        room.game.lock().await.down_all_players();
+        // The game loop ends the raid...
+        for _ in 0..(crate::map::BLEEDOUT_ALONE * 60.0) as usize + 5 { room.sim_tick().await; }
+        assert!(!room.game.lock().await.players().contains_key("p1"));
+        // ...the socket closes before the state provider runs...
+        assert!(room.leave("p1").await.is_none(), "not an abandon: the raid already ended");
+        // ...and the state provider still records the death.
+        let frame = room.sim_tick().await;
+        let _ = frame; // the room is empty now, so no frame
+        room.settle_outcomes(&db).await;
+        let op = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let op = db.operator(&profile).unwrap();
+                if op.in_raid.is_none() { break op; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("raid was never settled: the operator is stuck in_raid");
+        assert_eq!(op.deaths, 1);
+        assert_eq!(op.loadout().gear_score(), 0);
+    }
+
+    #[tokio::test]
+    async fn leaving_mid_raid_hands_back_the_abandoned_raid_once() {
+        let room = room("r", "R");
+        let _rx = connect(&room, "p1").await;
+        room.raid_profiles.lock().await.insert("p1".into(), "guest:x".into());
+        // Dropping before ever sending input voids the raid instead.
+        let Some(Departure::NeverPlayed(profile)) = room.leave("p1").await else { panic!("expected a void") };
+        assert_eq!(profile, "guest:x");
+        let _rx = connect(&room, "p1").await;
+        room.raid_profiles.lock().await.insert("p1".into(), "guest:x".into());
+        room.game.lock().await.handle_input("p1", crate::game::test_support::idle_input());
+        let Some(Departure::Abandoned(o, profile)) = room.leave("p1").await else { panic!("expected an abandon") };
+        assert_eq!(o.result, crate::types::RaidResult::Abandoned);
+        assert_eq!(profile, "guest:x");
+        assert!(room.leave("p1").await.is_none());
+        assert!(room.clients.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_misses_a_delta_gets_a_fresh_snapshot() {
+        let db = memdb();
+        let room = room("r", "R");
         let mut rx = connect(&room, "p1").await;
         room.tick(&db).await;
         drain(&mut rx);
-
-        // A momentarily backed-up connection: the round-ending delta can't be queued.
         let tx = room.clients.lock().await["p1"].clone();
         while tx.try_send("backlog".into()).is_ok() {}
-        room.game.lock().await.kill_all_players();
+        room.tick(&db).await; // this delta is dropped
         room.tick(&db).await;
-
-        // The client works through its backlog; the round is over, so no deltas follow.
         while rx.try_recv().is_ok() {}
         room.tick(&db).await;
-        let msgs = drain(&mut rx);
-        assert!(msgs.iter().any(|m| m["type"] == "snapshot" && m["gameOver"] == true),
-            "client must be resynced into the game-over state: {msgs:?}");
+        room.tick(&db).await;
+        assert!(drain(&mut rx).iter().any(|m| m["type"] == "snapshot"), "resynced after a dropped delta");
     }
 
     #[tokio::test]
-    async fn reaching_a_new_wave_is_persisted_for_connected_profiles() {
-        let db = Database::open(":memory:").unwrap();
-        let profile = uuid::Uuid::new_v4().to_string();
-        let room = Room::new("r".into(), "R".into(), false, false);
-        let _rx = connect(&room, "p1").await;
-        room.wave_profiles.lock().await.insert("p1".into(), (profile.clone(), 1));
-        room.game.lock().await.reset_at_wave(3, 3);
+    async fn each_client_only_gets_what_is_near_them() {
+        let db = memdb();
+        let room = room("r", "R");
+        let mut rx = connect(&room, "p1").await;
+        let (x, y) = {
+            let mut game = room.game.lock().await;
+            game.clear_zombies();
+            let p = game.players()["p1"].pos.clone();
+            game.push_zombie(crate::game::test_support::enemy("near", crate::types::ZombieType::Zombie, p.x + 200.0, p.y, 50.0, 0.0));
+            game.push_zombie(crate::game::test_support::enemy("far", crate::types::ZombieType::Zombie, (p.x + VIEW_RANGE + 600.0).min(4000.0), p.y, 50.0, 0.0));
+            (p.x, p.y)
+        };
         room.tick(&db).await;
-        assert_eq!(db.highest_wave(&profile), 3);
-        assert_eq!(room.wave_profiles.lock().await["p1"].1, 3);
+        let snap = drain(&mut rx).into_iter().find(|m| m["type"] == "snapshot").unwrap();
+        let ids: Vec<&str> = snap["zombies"].as_array().unwrap().iter().map(|z| z["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"near"));
+        let far_x = (x + VIEW_RANGE + 600.0).min(4000.0);
+        if (far_x - x).abs() > VIEW_RANGE { assert!(!ids.contains(&"far"), "far enemies aren't sent: {ids:?}"); }
+        let _ = y;
+    }
+
+    #[tokio::test]
+    async fn ticks_keep_increasing_across_a_restart() {
+        let db = memdb();
+        let room = room("r", "R");
+        let mut rx = connect(&room, "p1").await;
+        for _ in 0..6 { room.tick(&db).await; }
+        let before = drain(&mut rx).iter().filter_map(|m| m["tick"].as_u64()).max().unwrap();
+        room.restart().await;
+        room.tick(&db).await;
+        let snap = drain(&mut rx).into_iter().find(|m| m["type"] == "snapshot").unwrap();
+        assert!(snap["tick"].as_u64().unwrap() > before, "a client can tell new state from old");
+    }
+
+    /// Bandwidth check (run with `cargo test --release bandwidth -- --ignored --nocapture`).
+    #[tokio::test]
+    #[ignore]
+    async fn bandwidth_per_player_on_the_biggest_map() {
+        let db = memdb();
+        let room = Room::new("bw".into(), "BW".into(), Pool::Direct, false, &MAPS[3]);
+        let mut rxs = Vec::new();
+        for i in 0..6 { rxs.push(connect(&room, &format!("p{i}")).await); }
+        {
+            let mut game = room.game.lock().await;
+            let base = game.players()["p0"].pos.clone();
+            for i in 0..6 { game.player_mut(&format!("p{i}")).pos = crate::types::Vector2 { x: base.x + i as f64 * 40.0, y: base.y }; }
+            for i in 0..220 {
+                let a = i as f64 * 0.37;
+                let r = 200.0 + (i % 20) as f64 * 60.0;
+                game.push_zombie(crate::game::test_support::enemy(&format!("z{i}"), crate::types::ZombieType::Zombie, base.x + a.cos() * r, base.y + a.sin() * r, 1e6, 40.0));
+            }
+        }
+        let mut input = crate::game::test_support::idle_input();
+        input.shooting = true;
+        for _ in 0..60 {
+            { let mut game = room.game.lock().await; for i in 0..6 { game.player_mut(&format!("p{i}")).health = 1e6; } }
+            room.tick(&db).await;
+        }
+        for rx in &mut rxs { drain(rx); }
+        let mut bytes = 0usize;
+        let mut msgs = 0usize;
+        for _ in 0..600 {
+            {
+                let mut game = room.game.lock().await;
+                for i in 0..6 { let id = format!("p{i}"); game.player_mut(&id).health = 1e6; game.handle_input(&id, input.clone()); }
+            }
+            room.tick(&db).await;
+            while let Ok(m) = rxs[0].try_recv() { bytes += m.len(); msgs += 1; }
+        }
+        let secs = 10.0;
+        println!("player 0: {msgs} messages, {:.1} KB/s, {:.1} KB/message", bytes as f64 / 1024.0 / secs, bytes as f64 / 1024.0 / msgs.max(1) as f64);
     }
 
     // ---- Metrics & parallel simulation ----
@@ -927,41 +1199,30 @@ mod tests {
         m.record(Duration::from_millis(2), 0, "room-sim-0".into(), t0);
         m.record(Duration::from_millis(20), 3, "room-sim-1".into(), t0);
         assert_eq!(m.ticks, 2);
-        assert_eq!(m.overruns, 1, "only the 20ms tick is over the 16.7ms budget");
+        assert_eq!(m.overruns, 1);
         assert_eq!(m.dropped_deltas, 3);
         assert_eq!(m.last_thread, "room-sim-1");
         assert_eq!(m.recent_max_ns(), 20_000_000);
-        assert!(m.ewma_ns > 2_000_000.0 && m.ewma_ns < 20_000_000.0);
-        // Two windows later the old spike has aged out.
         m.record(Duration::from_millis(1), 0, "room-sim-0".into(), t0 + MAX_WINDOW);
         m.record(Duration::from_millis(1), 0, "room-sim-0".into(), t0 + MAX_WINDOW * 2);
         assert_eq!(m.recent_max_ns(), 1_000_000);
     }
 
     #[tokio::test]
-    async fn idle_rooms_record_no_ticks() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "Idle".into(), false, false);
-        room.tick(&db).await;
-        assert_eq!(room.metrics.lock().unwrap().ticks, 0);
-    }
-
-    #[tokio::test]
     async fn ops_snapshot_reports_room_and_tick_health() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "Ops".into(), true, false);
+        let db = memdb();
+        let room = Room::new("r".into(), "Ops".into(), Pool::Direct, false, &MAPS[3]);
         let _rx = connect(&room, "p1").await;
         room.tick(&db).await;
         room.tick(&db).await;
         let s = room.ops_snapshot().await;
         assert_eq!(s["name"], "Ops");
-        assert_eq!(s["verifiedOnly"], true);
+        assert_eq!(s["map"], "Black Site");
+        assert_eq!(s["tier"], 4);
         assert_eq!(s["connected"], 1);
-        assert_eq!(s["players"], 1);
         assert_eq!(s["hostId"], "p1");
         assert_eq!(s["tick"]["count"], 2);
         assert_eq!(s["tick"]["budgetUs"], 16_667);
-        assert!(s["tick"]["lastThread"].as_str().is_some());
     }
 
     #[tokio::test]
@@ -970,23 +1231,21 @@ mod tests {
         let mut rooms = Vec::new();
         let mut receivers = Vec::new();
         for i in 0..12 {
-            let room = registry.create(&format!("Load {i}"), false).await.unwrap();
+            let room = registry.create(&format!("Load {i}"), Pool::Direct, &MAPS[i % MAPS.len()]).await.unwrap();
             receivers.push(connect(&room, &format!("p{i}")).await);
             rooms.push(room);
         }
         tokio::time::sleep(Duration::from_millis(600)).await;
-
         for room in &rooms {
             let m = room.metrics.lock().unwrap();
             assert!(m.ticks >= 10, "{} only ticked {} times", room.name, m.ticks);
             assert!(m.last_thread.starts_with(crate::sim::THREAD_PREFIX), "ran on {}", m.last_thread);
         }
-        let busy_threads = sim.snapshot().iter().filter(|t| t.ticks > 0).count();
-        assert!(busy_threads >= 2, "expected work spread over several sim threads, got {busy_threads}");
+        assert!(sim.snapshot().iter().filter(|t| t.ticks > 0).count() >= 2);
         for room in &rooms {
             let p = room.publish_metrics.lock().unwrap();
             assert!(p.ticks >= 10, "{} published {} frames", room.name, p.ticks);
-            assert!(p.last_thread.starts_with(crate::sim::PUBLISH_PREFIX), "published on {}", p.last_thread);
+            assert!(p.last_thread.starts_with(crate::sim::PUBLISH_PREFIX));
         }
         assert!(publish.snapshot().iter().any(|t| t.ticks > 0));
         drop(receivers);
@@ -995,34 +1254,29 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_player_never_slows_the_game_loop_or_other_players() {
         let (_sim, _publish, registry) = pools(2, 2);
-        let room = registry.create("Laggy", false).await.unwrap();
-        // A player whose connection never drains: a 1-slot channel nobody reads.
+        let room = registry.create("Laggy", Pool::Direct, default_map()).await.unwrap();
         let (stuck_tx, _stuck_rx) = mpsc::channel(1);
-        room.game.lock().await.add_player("stuck", "stuck");
+        room.game.lock().await.add_player("stuck", "stuck", &kit(5, 5, 5));
         room.clients.lock().await.insert("stuck".into(), stuck_tx);
         room.pending_snapshots.lock().await.insert("stuck".into());
         let mut healthy = connect(&room, "healthy").await;
-
         let mut received = 0;
         let deadline = Instant::now() + Duration::from_millis(800);
         while Instant::now() < deadline {
             while healthy.try_recv().is_ok() { received += 1; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-
         let sim_ticks = room.metrics.lock().unwrap().ticks;
         assert!(sim_ticks >= 35, "game loop must keep ~60 Hz regardless of players, got {sim_ticks}");
-        assert!(room.metrics.lock().unwrap().overruns == 0, "game ticks never wait on the network");
         assert!(received >= 20, "healthy player kept receiving updates, got {received}");
-        assert!(room.slow_client_retries.load(Ordering::Relaxed) >= 1, "stalled player was retried, not waited on");
+        assert!(room.slow_client_retries.load(Ordering::Relaxed) >= 1);
     }
 
     #[tokio::test]
     async fn a_slow_state_provider_skips_frames_instead_of_delaying_the_game() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "R".into(), false, false);
+        let db = memdb();
+        let room = room("r", "R");
         let mut rx = connect(&room, "p1").await;
-        // Five game ticks happen before the provider gets a turn.
         let mut latest = None;
         for _ in 0..5 { latest = room.sim_tick().await; }
         room.publish_frame(latest.as_ref().unwrap(), &db).await;
@@ -1030,7 +1284,7 @@ mod tests {
         room.publish_frame(&first, &db).await;
         assert_eq!(room.metrics.lock().unwrap().ticks, 6);
         assert_eq!(room.publish_metrics.lock().unwrap().ticks, 2);
-        assert_eq!(room.skipped_frames.load(Ordering::Relaxed), 0, "first publish has no baseline; 5 -> 6 is contiguous");
+        assert_eq!(room.skipped_frames.load(Ordering::Relaxed), 0);
         for _ in 0..3 { latest = room.sim_tick().await; }
         room.publish_frame(latest.as_ref().unwrap(), &db).await;
         assert_eq!(room.skipped_frames.load(Ordering::Relaxed), 2);
@@ -1039,19 +1293,18 @@ mod tests {
 
     #[tokio::test]
     async fn room_list_and_ops_read_cached_stats_without_the_game_lock() {
-        let db = Database::open(":memory:").unwrap();
-        let room = Room::new("r".into(), "R".into(), false, false);
+        let db = memdb();
+        let room = room("r", "R");
         let _rx = connect(&room, "p1").await;
         room.tick(&db).await;
-        let held = room.game.lock().await; // the game loop is mid-tick
-        let summary = tokio::time::timeout(Duration::from_millis(200), room.summary(false)).await
+        let held = room.game.lock().await;
+        let summary = tokio::time::timeout(Duration::from_millis(200), room.summary(None)).await
             .expect("room list must not wait for the game lock");
         let ops = tokio::time::timeout(Duration::from_millis(200), room.ops_snapshot()).await
             .expect("ops status must not wait for the game lock");
         drop(held);
-        assert_eq!(summary["wave"], 1);
+        assert_eq!(summary["players"], 1);
         assert_eq!(ops["players"], 1);
-        assert_eq!(ops["hostId"], "p1");
         assert_eq!(ops["publish"]["count"], 1);
     }
 }

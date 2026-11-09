@@ -1,4 +1,5 @@
 mod types;
+mod gear;
 mod map;
 mod spatial_grid;
 mod game;
@@ -8,6 +9,7 @@ mod db;
 mod rooms;
 mod sim;
 mod ops;
+mod progression;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,12 +29,12 @@ use tokio::sync::mpsc;
 use crate::types::*;
 use crate::social::SocialState;
 use crate::db::Database;
-use crate::rooms::{RegistryConfig, RoomRegistry, OPEN_ROOM_ID};
+use crate::rooms::{Pool, RegistryConfig, RoomRegistry, OPEN_ROOM_ID};
 use crate::sim::SimRuntime;
 
 // Bounded channel: capacity = a few ticks of headroom.
 // If a client falls behind, we skip deltas rather than buffer indefinitely.
-const CLIENT_CHANNEL_CAPACITY: usize = 4;
+const CLIENT_CHANNEL_CAPACITY: usize = 16;
 
 struct AppState {
     rooms: Arc<RoomRegistry>,
@@ -40,12 +42,17 @@ struct AppState {
     db: Arc<Database>,
     google_client_id: String,
     google_client_secret: String,
+    /// Steam sign-in attempts in flight: nonce -> (account to link to, if any; when it started).
+    steam_logins: std::sync::Mutex<HashMap<String, (Option<String>, std::time::Instant)>>,
 }
 
 #[tokio::main]
 async fn main() {
     let db = Arc::new(Database::open("boxhead.db")
         .expect("Failed to open database"));
+    // A raid interrupted by a restart is voided: everyone gets their loadout back.
+    let voided = db.void_stale_raids();
+    if voided > 0 { println!("Voided {voided} raid(s) interrupted by the last shutdown"); }
 
     let google_client_id = std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default();
     let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default();
@@ -71,6 +78,7 @@ async fn main() {
         db,
         google_client_id,
         google_client_secret,
+        steam_logins: std::sync::Mutex::new(HashMap::new()),
     });
 
     // Periodic session cleanup (every hour)
@@ -90,14 +98,18 @@ async fn main() {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/rooms", get(rooms_list).post(rooms_create))
-        .route("/api/rooms/{id}/replay", post(room_replay))
+        .route("/api/matchmaking/crossplay", post(crossplay_set))
+        .route("/api/hideout", get(hideout))
+        .route("/api/hideout/{action}", post(hideout_action))
+        .route("/api/maps", get(maps_list))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/email/register", post(email_register))
         .route("/api/auth/email/login", post(email_login))
         .route("/api/auth/google/callback", get(google_callback))
         .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/steam/start", get(steam_start))
+        .route("/api/auth/steam/callback", get(steam_callback))
         .route("/api/config", get(api_config))
-        .route("/api/progress", get(wave_progress))
         .route("/api/friends", get(friends_list))
         .route("/api/friends/add", post(friends_add))
         .route("/api/friends/remove", post(friends_remove))
@@ -134,7 +146,8 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Client messages are tiny (join, input, pause); refuse anything large.
+    ws.max_message_size(16 * 1024).on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn send_join_error(ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>, error: &str) {
@@ -148,9 +161,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Wait for join message with player name, target room and optional auth token
-    let (player_name, auth_token, profile_id, starting_wave, room_id) = loop {
-        match ws_receiver.next().await {
+    // Wait for the join message: callsign, target raid and identity.
+    // A socket that never says which raid it wants is dropped after 10 seconds.
+    let join_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (player_name, auth_token, room_id, insure) = loop {
+        let next = match tokio::time::timeout_at(join_deadline, ws_receiver.next()).await {
+            Ok(next) => next,
+            Err(_) => return,
+        };
+        match next {
             Some(Ok(Message::Text(text))) => {
                 let text_str: &str = &text;
                 if let Ok(msg) = serde_json::from_str::<ClientMessage>(text_str) {
@@ -159,7 +178,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         let name = name.trim().chars().take(16).collect::<String>();
                         let name = if name.is_empty() { format!("Player_{}", &player_id[..4]) } else { name };
                         let room_id = msg.room_id.unwrap_or_else(|| OPEN_ROOM_ID.to_string());
-                        break (name, msg.token, msg.profile_id, msg.starting_wave.unwrap_or(1), room_id);
+                        break (name, msg.token, room_id, msg.insure.unwrap_or(false));
                     }
                 }
             }
@@ -169,90 +188,104 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Verification comes from the server-side session, never from the client.
-    let user_id = auth_token.as_deref().and_then(|t| state.db.validate_session(t));
-    let verified = user_id.as_deref().is_some_and(|id| state.db.is_verified(id));
-
-    let Some(room) = state.rooms.get(&room_id).await else {
-        send_join_error(&mut ws_sender, "That room no longer exists.").await;
-        return;
+    // (SQLite work runs on a blocking thread, never on the async runtime.)
+    let (matchmaking, profile_key) = {
+        let (db, token) = (state.db.clone(), auth_token.clone());
+        tokio::task::spawn_blocking(move || {
+            let mm = token.as_deref().and_then(|t| db.session_matchmaking(t));
+            let key = db.profile_key(token.as_deref());
+            (mm, key)
+        }).await.unwrap_or((None, None))
     };
-    if !rooms::can_join(room.verified_only, verified) {
-        send_join_error(&mut ws_sender, "This room is for signed-in accounts only. Sign in to join.").await;
+    let user_id = matchmaking.as_ref().map(|(id, _, _)| id.clone());
+    let pool = matchmaking.as_ref().map(|(_, platform, cross)| Pool::for_player(platform, *cross));
+
+    // Only signed-in accounts can drop in, and only as one of their operators.
+    if user_id.is_none() {
+        send_join_error(&mut ws_sender, "Sign in to play. Your stash lives on your account.").await;
         return;
     }
-
-    let profile_id = profile_id
-        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let unlocked_wave = state.db.highest_wave(&profile_id);
+    if profile_key.is_none() {
+        send_join_error(&mut ws_sender, "Create an operator in the hideout before you deploy.").await;
+        return;
+    }
+    let Some(pool) = pool else { return };
+    let Some(room) = state.rooms.resolve(&room_id, pool).await else {
+        send_join_error(&mut ws_sender, "That raid no longer exists.").await;
+        return;
+    };
+    if room.pool != pool {
+        send_join_error(&mut ws_sender, &pool_mismatch(room.pool, pool)).await;
+        return;
+    }
+    let Some(profile) = profile_key else { return };
+    // Gear score gate + lock the loadout into this raid (blocking DB work off the async thread).
+    let begin = {
+        let (db, profile, room_id, map) = (state.db.clone(), profile.clone(), room.id.clone(), room.map);
+        tokio::task::spawn_blocking(move || db.deploy(&profile, &room_id, map, insure)).await
+            .unwrap_or_else(|_| Err("Server error".into()))
+    };
+    let loadout = match begin {
+        Ok(loadout) => loadout,
+        Err(e) => { send_join_error(&mut ws_sender, &e).await; return; }
+    };
+    // Sealed items brought from the stash to decrypt in this raid.
+    let carried = {
+        let (db, profile) = (state.db.clone(), profile.clone());
+        tokio::task::spawn_blocking(move || db.raid_carry(&profile)).await.unwrap_or_default()
+    };
 
     // Bounded channel — drops deltas for slow clients instead of buffering
     let (tx, mut rx) = mpsc::channel::<String>(CLIENT_CHANNEL_CAPACITY);
-
-    // The first player chooses the new round; late joiners keep its current wave.
-    let joined_game;
-    {
+    let init_str = {
         let mut game = room.game.lock().await;
-        if game.start_empty_round(starting_wave, unlocked_wave) {
-            *room.delta_tracker.lock().await = delta::DeltaTracker::new();
-        }
-        let game_over = game.is_game_over();
-        let wave = game.wave();
-
-        if !game_over {
-            game.add_player(&player_id, &player_name);
-            state.db.record_wave(&profile_id, wave);
-            room.wave_profiles.lock().await.insert(player_id.clone(), (profile_id.clone(), wave));
-            room.clients.lock().await.insert(player_id.clone(), tx);
-            joined_game = true;
-        } else {
-            joined_game = false;
-        }
-
-        // Send init payload — always includes current game_over / wave so the
-        // client can immediately show the right screen without waiting for a snapshot.
+        game.add_player_carrying(&player_id, &player_name, &loadout, carried);
+        room.raid_profiles.lock().await.insert(player_id.clone(), profile.clone());
+        let layout = game.layout();
         let init = InitPayload {
             msg_type: "init".to_string(),
             id: player_id.clone(),
-            walls: game.walls().to_vec(),
-            map_width: game.map_dimensions().0,
-            map_height: game.map_dimensions().1,
+            map: game.map_info(),
+            walls: layout.walls.clone(),
+            map_width: layout.width,
+            map_height: layout.height,
             ammo_spawn_points: game.ammo_spawn_points(),
-            game_over,
-            wave,
+            extracts: layout.extracts.clone(),
+            crates: layout.crates.clone(),
+            nests: layout.nests.clone(),
+            uplinks: layout.uplinks.clone(),
         };
-        let init_str = serde_json::to_string(&init).unwrap();
-        let _ = ws_sender.send(Message::Text(init_str.into())).await;
-    }
+        serde_json::to_string(&init).unwrap()
+    };
+    // Mark the snapshot as owed before the client can receive anything, so its
+    // first state message is always a full snapshot, never a partial delta.
+    room.pending_snapshots.lock().await.insert(player_id.clone());
+    // Queue init first so it reaches the socket before any delta or snapshot.
+    // Nothing is sent on the socket while the game lock is held, so a client
+    // that stops reading can never stall the room's game loop.
+    let _ = tx.try_send(init_str);
+    room.clients.lock().await.insert(player_id.clone(), tx);
 
-    // If the game is over, don't register this socket as a game client — we
-    // already told them the state.  They'll reconnect when the game restarts.
-    if !joined_game {
-        return;
-    }
-
-    // Link player to auth identity for friends' online presence
     if let Some(ref user_id) = user_id {
         state.social.lock().await.link_player(&player_id, user_id);
     }
-
-    room.pending_snapshots.lock().await.insert(player_id.clone());
 
     let pid_send = player_id.clone();
     let pid_recv = player_id.clone();
     let room_recv = room.clone();
 
-    // Task: forward channel messages to WebSocket
-    let send_task = tokio::spawn(async move {
+    // Forward channel messages to the WebSocket. The channel closes when the
+    // room drops this player's sender (after their raid result is sent).
+    let mut send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_sender.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
+        let _ = ws_sender.send(Message::Close(None)).await;
     });
 
-    // Task: receive messages from WebSocket
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             if let Message::Text(text) = msg {
                 let text_str: &str = &text;
@@ -269,21 +302,31 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
         }
-        pid_recv
     });
 
-    // Wait for either task to finish (client disconnected)
-    let pid_cleanup = tokio::select! {
-        _ = send_task => pid_send.clone(),
-        result = recv_task => result.unwrap_or(pid_send.clone()),
-    };
+    tokio::select! {
+        _ = &mut send_task => { recv_task.abort(); }
+        _ = &mut recv_task => {}
+    }
 
-    // Cleanup
-    room.wave_profiles.lock().await.remove(&pid_cleanup);
-    room.game.lock().await.remove_player(&pid_cleanup);
-    room.clients.lock().await.remove(&pid_cleanup);
-    room.pending_snapshots.lock().await.remove(&pid_cleanup);
-    state.social.lock().await.unlink_player(&pid_cleanup);
+    // Leaving mid-raid forfeits it. If the raid already ended the game has no
+    // record of the player and the room has settled it.
+    let departure = room.leave(&pid_send).await;
+    state.social.lock().await.unlink_player(&pid_send);
+    match departure {
+        Some(rooms::Departure::Abandoned(outcome, profile)) => {
+            rooms::settle_with_retry(state.db.clone(), profile, room.id.clone(), outcome).await;
+        }
+        Some(rooms::Departure::NeverPlayed(profile)) => {
+            // Your gear is safe, but the entry fee isn't refunded: the snapshot you
+            // received already showed the whole raid.
+            let (db, room_id) = (state.db.clone(), room.id.clone());
+            let _ = tokio::task::spawn_blocking(move || db.void_raid(&profile, &room_id, 0)).await;
+        }
+        None => {}
+    }
+    // Let the forwarder flush a final raid result if one is in flight.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send_task).await;
 }
 
 // --- Rooms API ---
@@ -292,66 +335,306 @@ async fn rooms_list(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let verified = state.db.session_is_verified(params.get("token").map(String::as_str));
+    let mm = session_pool(&state, params.get("token").map(String::as_str).unwrap_or("")).await;
+    let pool = mm.as_ref().map(|m| m.pool);
+    // Signed-out visitors can look at the cross-platform raids but not join.
     let mut rooms = Vec::new();
-    for room in state.rooms.all().await {
-        rooms.push(room.summary(verified).await);
+    for room in state.rooms.in_pool(pool.unwrap_or(Pool::Cross)).await {
+        rooms.push(room.summary(pool).await);
     }
-    Json(serde_json::json!({ "ok": true, "verified": verified, "rooms": rooms }))
+    Json(serde_json::json!({
+        "ok": true,
+        "verified": mm.is_some(),
+        "rooms": rooms,
+        "matchmaking": mm.map(|m| m.json()),
+    }))
+}
+
+/// How one signed-in session matchmakes.
+struct SessionPool { user_id: String, platform: Pool, crossplay: bool, pool: Pool }
+
+impl SessionPool {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "platform": self.platform.json(), "crossplay": self.crossplay, "pool": self.pool.json() })
+    }
+}
+
+async fn session_pool(state: &Arc<AppState>, token: &str) -> Option<SessionPool> {
+    let (db, token) = (state.db.clone(), token.to_string());
+    let (user_id, platform, crossplay) = tokio::task::spawn_blocking(move || db.session_matchmaking(&token)).await.ok()??;
+    Some(SessionPool {
+        user_id,
+        platform: Pool::for_player(&platform, false),
+        crossplay,
+        pool: Pool::for_player(&platform, crossplay),
+    })
+}
+
+/// Why a player can't join a raid in another matchmaking pool, and how to fix it.
+fn pool_mismatch(room: Pool, player: Pool) -> String {
+    match (room, player) {
+        (Pool::Cross, _) => "That raid is cross-platform. Turn on cross-platform play to join it.".into(),
+        (_, Pool::Cross) => format!("That raid is for {} players only. Turn off cross-platform play to join it.", room.label()),
+        _ => format!("That raid is for {} players only. Turn on cross-platform play to meet players from other platforms.", room.label()),
+    }
+}
+
+/// Turn cross-platform matchmaking on or off for the signed-in account.
+async fn crossplay_set(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let token = body["token"].as_str().unwrap_or("");
+    let Some(mm) = session_pool(&state, token).await else {
+        return Json(serde_json::json!({ "ok": false, "error": "Sign in to change matchmaking" }));
+    };
+    let Some(on) = body["enabled"].as_bool() else {
+        return Json(serde_json::json!({ "ok": false, "error": "Say whether cross-platform play is on" }));
+    };
+    let (db, user) = (state.db.clone(), mm.user_id.clone());
+    if let Err(e) = tokio::task::spawn_blocking(move || db.set_crossplay(&user, on)).await.unwrap_or_else(|_| Err("Server error".into())) {
+        return Json(serde_json::json!({ "ok": false, "error": e }));
+    }
+    let mm = SessionPool { pool: if on { Pool::Cross } else { mm.platform }, crossplay: on, ..mm };
+    Json(serde_json::json!({ "ok": true, "matchmaking": mm.json() }))
 }
 
 async fn rooms_create(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let verified = state.db.session_is_verified(body["token"].as_str());
-    let verified_only = body["verifiedOnly"].as_bool().unwrap_or(false);
-    if verified_only && !verified {
-        return Json(serde_json::json!({ "ok": false, "error": "Only verified accounts can create verified rooms" }));
-    }
-    match state.rooms.create(body["name"].as_str().unwrap_or(""), verified_only).await {
-        Ok(room) => Json(serde_json::json!({ "ok": true, "room": room.summary(verified).await })),
+    let Some(mm) = session_pool(&state, body["token"].as_str().unwrap_or("")).await else {
+        return Json(serde_json::json!({ "ok": false, "error": "Sign in to host a lobby" }));
+    };
+    let Some(map) = body["map"].as_str().map_or(Some(gear::default_map()), gear::map_by_id) else {
+        return Json(serde_json::json!({ "ok": false, "error": "Unknown map" }));
+    };
+    // A hosted lobby is in its host's pool: only players who matchmake with them can join.
+    match state.rooms.create(body["name"].as_str().unwrap_or(""), mm.pool, map).await {
+        Ok(room) => Json(serde_json::json!({ "ok": true, "room": room.summary(Some(mm.pool)).await })),
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
     }
 }
 
-/// "Play again" after a squad is overrun. Same access rules as joining, and it
-/// only restarts rounds that have actually ended. Operator restarts live in the
-/// ops API used by the dashboard service.
-async fn room_replay(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let Some(room) = state.rooms.get(&id).await else {
-        return Json(serde_json::json!({ "ok": false, "error": "Room not found" }));
-    };
-    let verified = state.db.session_is_verified(body["token"].as_str());
-    if !rooms::can_join(room.verified_only, verified) {
-        return Json(serde_json::json!({ "ok": false, "error": "Verified accounts only" }));
-    }
-    if !room.game.lock().await.is_game_over() {
-        return Json(serde_json::json!({ "ok": false, "error": "Round is still active" }));
-    }
-    let requested = body["startingWave"].as_u64().unwrap_or(1).clamp(1, 999) as u32;
-    let unlocked = body["profileId"].as_str()
-        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-        .map(|id| state.db.highest_wave(id)).unwrap_or(1);
-    room.restart(requested, unlocked).await;
-    Json(serde_json::json!({ "ok": true }))
+// --- Hideout API (stash, loadout, trader, maps) ---
+
+fn maps_json(gear_score: u32, operations: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::Value::Array(gear::MAPS.iter().map(|m| {
+        let ops = operations.iter().find(|o| o["map"] == m.id);
+        serde_json::json!({
+        "id": m.id, "name": m.name, "tier": m.tier, "minGearScore": m.min_gear_score,
+        "threat": m.threat(), "blurb": m.blurb, "raidSecs": m.raid_secs,
+        "lootPower": [m.loot_power.0, m.loot_power.1], "width": m.width(), "height": m.height(),
+        "enemyHealth": m.enemy_health, "enemyDamage": m.enemy_damage, "eliteChance": m.elite_chance,
+        "entryFee": ops.map_or(serde_json::json!(m.entry_fee), |o| o["entryFee"].clone()),
+        "baseEntryFee": m.entry_fee,
+        "opsRank": ops.map_or(serde_json::json!(0), |o| o["rank"].clone()),
+        "unlocked": gear::can_deploy(m, gear_score),
+    })}).collect())
 }
 
-// --- Config API ---
+fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
+    let Some(op) = db.operator(profile) else { return serde_json::Value::Null };
+    let ctx = db.context(profile, now);
+    let mut loadout = op.loadout();
+    loadout.boost = ctx.raid_boost();
+    let gs = loadout.gear_score();
+    let stash: Vec<&gear::Item> = op.items.iter().filter(|s| s.slot.is_none()).map(|s| &s.item).collect();
+    let cap = progression::tier_cap(op.raidable);
+    let next_tier = progression::tier_cost(op.tier + 1).filter(|c| c.tier <= cap);
+    let tier_items = db.tier_valuables(profile);
+    let facilities: Vec<serde_json::Value> = progression::FACILITIES.iter().map(|&f| {
+        let level = ctx.facility(f);
+        let next = (level < progression::MAX_TIER).then_some(level + 1);
+        serde_json::json!({
+            "id": f.as_str(), "name": f.label(), "level": level, "maxLevel": op.tier,
+            "effect": f.effect(level),
+            "next": next.map(|n| serde_json::json!({ "level": n, "cost": f.cost(n), "effect": f.effect(n), "needsTier": n > op.tier })),
+        })
+    }).collect();
+    let operations: Vec<serde_json::Value> = db.operations(profile).into_iter().map(|(m, xp)| {
+        let rank = progression::ops_rank(xp);
+        serde_json::json!({
+            "map": m.id, "name": m.name, "xp": xp, "rank": rank, "maxRank": progression::MAX_OPS_RANK,
+            "next": progression::ops_next(xp), "prev": rank.checked_sub(1).map_or(0, |r| progression::OPS_THRESHOLDS[r as usize]),
+            "entryFee": progression::ops_fee(m, rank), "baseEntryFee": m.entry_fee,
+            "bountyBonus": progression::ops_bounty_bonus(rank),
+        })
+    }).collect();
+    serde_json::json!({
+        "id": op.id, "name": op.name, "raidable": op.raidable,
+        "carryCapacity": loadout.pack.as_ref().map_or(gear::NO_PACK_CAPACITY, |p| gear::pack_capacity(p.power)),
+        "cash": op.cash, "raids": op.raids, "extracts": op.extracts, "deaths": op.deaths,
+        "inRaid": op.in_raid.is_some(),
+        "gearScore": gs,
+        "loadout": loadout,
+        "boost": { "maxHealth": loadout.boost.max_health, "damage": loadout.boost.damage },
+        "stash": stash,
+        "carry": op.items.iter().filter(|s| s.carry).map(|s| s.item.id.clone()).collect::<Vec<_>>(),
+        "stashCapacity": ctx.stash_capacity(),
+        "insuranceCost": gear::insurance_cost_at(&loadout, ctx.insurance_rate()),
+        "insuranceRate": ctx.insurance_rate(),
+        "offers": gear::trader_offers_with(ctx.armory_powers()),
+        "maps": maps_json(gs, &operations),
+        "operations": operations,
+        "homefront": {
+            "tier": op.tier, "maxTier": cap, "topTier": progression::MAX_TIER, "safeTier": progression::SAFE_TIER_CAP,
+            "next": next_tier.map(|c| serde_json::json!({
+                "tier": c.tier, "cash": c.cash, "valuables": c.valuables, "minRarity": c.min_rarity,
+                "have": tier_items.len(), "uses": tier_items,
+            })),
+            "facilities": facilities,
+            "workshop": {
+                "stored": ctx.workshop_stored(now),
+                "perHour": progression::workshop_rate(ctx.facility(progression::Facility::Workshop)),
+                "capacity": progression::workshop_rate(ctx.facility(progression::Facility::Workshop)) * progression::WORKSHOP_HOURS,
+            },
+        },
+    })
+}
 
-async fn wave_progress(
+/// The hideout: the account (operators, season, Legacy) and the active operator.
+fn hideout_json(db: &Database, user: &str) -> serde_json::Value {
+    let now = db::now_secs();
+    let season = progression::season_at(now);
+    let account = db.account_state(user);
+    let active = db.active_operator(user);
+    let operator = active.as_deref().map_or(serde_json::Value::Null, |p| operator_json(db, p, now));
+    let perks: Vec<serde_json::Value> = progression::PERKS.iter().map(|&p| serde_json::json!({
+        "id": p.as_str(), "name": p.label(), "perRank": p.per_rank(), "rank": account.perks.get(p), "maxRank": progression::PERK_MAX_RANK,
+    })).collect();
+    let mut out = serde_json::json!({
+        "ok": true,
+        "account": true,
+        "operators": db.operator_summaries(user),
+        "maxOperators": progression::MAX_OPERATORS,
+        "needsOperator": active.is_none(),
+        "season": {
+            "id": season.id, "name": season.name, "endsAt": season.ends_at,
+            "relocationOpensAt": season.relocation_opens_at, "relocationOpen": season.relocation_open(now),
+            "now": now,
+        },
+        "legacy": {
+            "earned": account.legacy_earned, "available": account.legacy_available, "cap": progression::LEGACY_CAP,
+            "stashBonus": account.stash_bonus, "stashBonusCap": progression::STASH_BONUS_CAP,
+            "relocations": account.relocations, "lastRelocation": account.last_relocation,
+            "boostLevel": if account.boost_season.as_deref() == Some(season.id.as_str()) { account.boost_level } else { 0 },
+            "badges": account.badges, "perks": perks,
+        },
+        "relocation": {
+            "minTier": progression::RELOCATION_MIN_TIER,
+            "blocker": db.relocation_blocker(user, now),
+            "reward": db.relocation_preview(user, now),
+        },
+        "operator": operator.clone(),
+    });
+    // The active operator's fields also sit at the top level, where the
+    // hideout screens have always read them.
+    if let (Some(top), Some(op)) = (out.as_object_mut(), operator.as_object()) {
+        for (k, v) in op { if !top.contains_key(k) { top.insert(k.clone(), v.clone()); } }
+    }
+    if active.is_none() {
+        // No operator yet: empty defaults, so every screen still renders.
+        let defaults = serde_json::json!({
+            "cash": 0, "raids": 0, "extracts": 0, "deaths": 0, "inRaid": false, "gearScore": 0,
+            "loadout": gear::Loadout::default(), "stash": [], "carry": [], "carryCapacity": 0,
+            "stashCapacity": gear::STASH_CAPACITY, "insuranceCost": 0, "offers": [], "operations": [],
+            "maps": maps_json(0, &[]),
+        });
+        if let (Some(top), Some(d)) = (out.as_object_mut(), defaults.as_object()) {
+            for (k, v) in d { top.insert(k.clone(), v.clone()); }
+        }
+    }
+    out
+}
+
+fn request_user(state: &AppState, token: Option<&str>) -> Result<String, Json<serde_json::Value>> {
+    token.filter(|t| !t.is_empty()).and_then(|t| state.db.validate_session(t))
+        .ok_or_else(|| Json(serde_json::json!({ "ok": false, "signedOut": true, "error": "Sign in to open your hideout" })))
+}
+
+async fn hideout(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let highest = params.get("profileId")
-        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-        .map(|id| state.db.highest_wave(id)).unwrap_or(1);
-    Json(serde_json::json!({ "highestWave": highest }))
+    let user = match request_user(&state, params.get("token").map(String::as_str)) {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let db = state.db.clone();
+    Json(tokio::task::spawn_blocking(move || hideout_json(&db, &user)).await.unwrap_or_default())
 }
+
+/// POST /api/hideout/{action}: equip, unequip, sell or buy. Replies with the new hideout state.
+async fn hideout_action(
+    State(state): State<Arc<AppState>>,
+    Path(action): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let user = match request_user(&state, body["token"].as_str()) {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let db = state.db.clone();
+    Json(tokio::task::spawn_blocking(move || {
+        let now = db::now_secs();
+        let slot = body["slot"].as_str().and_then(gear::Slot::parse);
+        let item = body["itemId"].as_str().unwrap_or("");
+        // Account actions work with or without an operator.
+        let account_result = match action.as_str() {
+            "createOperator" => Some(db.create_operator(&user, body["name"].as_str().unwrap_or(""), body["raidable"].as_bool().unwrap_or(false), now).map(|_| ())),
+            "switchOperator" => Some(db.switch_operator(&user, body["operatorId"].as_str().unwrap_or(""))),
+            "relocate" => Some(if body["confirm"].as_bool() == Some(true) { db.relocate(&user, now).map(|_| ()) } else { Err("Confirm the retirement".into()) }),
+            "buyPerk" => Some(match body["perk"].as_str().and_then(progression::Perk::parse) {
+                Some(perk) => db.buy_perk(&user, perk).map(|_| ()),
+                None => Err("Unknown perk".into()),
+            }),
+            _ => None,
+        };
+        let result = if let Some(r) = account_result { r } else {
+        let Some(profile) = db.active_operator(&user) else {
+            let mut state = hideout_json(&db, &user);
+            state["ok"] = false.into();
+            state["error"] = "Create an operator first.".into();
+            return state;
+        };
+        match (action.as_str(), slot) {
+            ("upgradeTier", _) => db.upgrade_tier(&profile).map(|_| ()),
+            ("upgradeFacility", _) => match body["facility"].as_str().and_then(progression::Facility::parse) {
+                Some(f) => db.upgrade_facility(&profile, f, now).map(|_| ()),
+                None => Err("Unknown facility".into()),
+            },
+            ("collectWorkshop", _) => db.collect_workshop(&profile, now).map(|_| ()),
+            ("equip", Some(slot)) => db.equip(&profile, item, slot),
+            ("unequip", Some(slot)) => db.unequip(&profile, slot),
+            ("sell", _) => db.sell(&profile, item).map(|_| ()),
+            ("buy", _) => db.buy(&profile, body["offerId"].as_str().unwrap_or("")).map(|_| ()),
+            ("sellMany", _) => {
+                let ids: Vec<String> = body["itemIds"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                db.sell_many(&profile, &ids).map(|_| ())
+            }
+            ("carry", _) => db.set_carry(&profile, item, body["carry"].as_bool().unwrap_or(true)),
+            ("equip" | "unequip", None) => Err("Pick a slot: primary, secondary, armor or pack".into()),
+            _ => Err("Unknown action".into()),
+        }
+        };
+        match result {
+            Ok(()) => hideout_json(&db, &user),
+            Err(e) => {
+                let mut state = hideout_json(&db, &user);
+                state["ok"] = false.into();
+                state["error"] = e.into();
+                state
+            }
+        }
+    }).await.unwrap_or_default())
+}
+
+async fn maps_list() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true, "maps": maps_json(0, &[]) }))
+}
+
+// --- Config API ---
 
 async fn api_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -374,6 +657,13 @@ async fn auth_login(
 
     match social::bsky_login(handle, password).await {
         Ok(session) => {
+            // Signed in already: attach this Bluesky identity to that account.
+            if let Some(user_id) = body["token"].as_str().filter(|t| !t.is_empty()).and_then(|t| state.db.validate_session(t)) {
+                return Json(match state.db.link_account(&user_id, "bluesky", &session.did, &session.handle) {
+                    Ok(()) => serde_json::json!({ "ok": true, "linked": "bluesky", "handle": session.handle }),
+                    Err(e) => serde_json::json!({ "ok": false, "error": e }),
+                });
+            }
             // Find or create internal user account linked to this Bluesky DID
             let user_id = match state.db.find_or_create_user(
                 "bluesky",
@@ -385,7 +675,7 @@ async fn auth_login(
                 Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
             };
 
-            let token = match state.db.create_session(&user_id) {
+            let token = match state.db.create_session(&user_id, "bluesky") {
                 Ok(t) => t,
                 Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
             };
@@ -421,7 +711,7 @@ async fn email_register(
 
     match state.db.register_email_user(&email, password) {
         Ok(user_id) => {
-            let token = match state.db.create_session(&user_id) {
+            let token = match state.db.create_session(&user_id, "direct") {
                 Ok(t) => t,
                 Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
             };
@@ -451,7 +741,7 @@ async fn email_login(
 
     match state.db.verify_email_login(&email, password) {
         Ok(user_id) => {
-            let token = match state.db.create_session(&user_id) {
+            let token = match state.db.create_session(&user_id, "direct") {
                 Ok(t) => t,
                 Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
             };
@@ -513,7 +803,7 @@ async fn google_callback(
                 }
             };
 
-            let token = match state.db.create_session(&user_id) {
+            let token = match state.db.create_session(&user_id, "direct") {
                 Ok(t) => t,
                 Err(e) => {
                     return Html(format!("<html><body><script>window.close();</script>Error: {}</body></html>", e));
@@ -581,6 +871,8 @@ async fn auth_me(
     };
 
     let handle = state.db.get_user_handle(&user_id).unwrap_or_default();
+    let linked: Vec<serde_json::Value> = state.db.linked_accounts(&user_id).into_iter()
+        .map(|(provider, handle)| serde_json::json!({ "provider": provider, "handle": handle })).collect();
 
     Json(serde_json::json!({
         "ok": true,
@@ -588,7 +880,119 @@ async fn auth_me(
         "display_name": user.display_name,
         "handle": handle,
         "verified": state.db.is_verified(&user.id),
+        "linked": linked,
+        "matchmaking": session_pool(&state, token).await.map(|m| m.json()),
     }))
+}
+
+// --- Steam (OpenID 2.0) ---
+
+const STEAM_OPENID: &str = "https://steamcommunity.com/openid/login";
+
+/// The site's own origin, for Steam's return address: BASE_URL if set, else the request's Host.
+fn site_origin(headers: &axum::http::HeaderMap) -> String {
+    if let Ok(base) = std::env::var("BASE_URL") { return base.trim_end_matches('/').to_string(); }
+    let host = headers.get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3001");
+    format!("http://{host}")
+}
+
+/// GET /api/auth/steam/start[?link=<session>]: send the browser to Steam's sign-in page.
+/// With a session token the Steam identity is linked to that account instead.
+async fn steam_start(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let link_to = match params.get("link").filter(|t| !t.is_empty()) {
+        Some(token) => match state.db.validate_session(token) {
+            Some(user) => Some(user),
+            None => return Html(auth_popup_html("steam-auth", &serde_json::json!({ "ok": false, "error": "Your session expired. Sign in again." }))).into_response(),
+        },
+        None => None,
+    };
+    let nonce = uuid::Uuid::new_v4().to_string();
+    {
+        let mut logins = state.steam_logins.lock().unwrap();
+        logins.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
+        logins.insert(nonce.clone(), (link_to, std::time::Instant::now()));
+    }
+    let origin = site_origin(&headers);
+    let return_to = format!("{origin}/api/auth/steam/callback?nonce={nonce}");
+    let query = [
+        ("openid.ns", "http://specs.openid.net/auth/2.0"),
+        ("openid.mode", "checkid_setup"),
+        ("openid.return_to", return_to.as_str()),
+        ("openid.realm", origin.as_str()),
+        ("openid.identity", "http://specs.openid.net/auth/2.0/identifier_select"),
+        ("openid.claimed_id", "http://specs.openid.net/auth/2.0/identifier_select"),
+    ];
+    let url = reqwest::Url::parse_with_params(STEAM_OPENID, &query).expect("valid Steam URL");
+    axum::response::Redirect::to(url.as_str()).into_response()
+}
+
+/// Steam sends the browser back here. Verify the assertion with Steam, then
+/// sign in (or link) the account that owns this SteamID.
+async fn steam_callback(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Html<String> {
+    let fail = |e: &str| Html(auth_popup_html("steam-auth", &serde_json::json!({ "ok": false, "error": e })));
+    let Some(nonce) = params.get("nonce") else { return fail("Steam sign-in didn't come from this site.") };
+    let Some((link_to, _)) = state.steam_logins.lock().unwrap().remove(nonce) else {
+        return fail("That Steam sign-in expired. Try again.");
+    };
+    if params.get("openid.mode").map(String::as_str) != Some("id_res") { return fail("Steam sign-in was cancelled."); }
+    let expected_return = format!("{}/api/auth/steam/callback?nonce={nonce}", site_origin(&headers));
+    if params.get("openid.return_to") != Some(&expected_return) || params.get("openid.op_endpoint").map(String::as_str) != Some(STEAM_OPENID) {
+        return fail("Steam sign-in didn't match this site.");
+    }
+    let steam_id = match params.get("openid.claimed_id").and_then(|c| c.strip_prefix("https://steamcommunity.com/openid/id/")) {
+        Some(id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => id.to_string(),
+        _ => return fail("Steam didn't say which account signed in."),
+    };
+    if let Err(e) = social::steam_verify(&params).await { return fail(&e); }
+    let name = social::steam_persona(&steam_id).await.unwrap_or_else(|| format!("Steam {}", &steam_id[steam_id.len().saturating_sub(4)..]));
+
+    let db = state.db.clone();
+    let payload = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        if let Some(user_id) = link_to {
+            db.link_account(&user_id, "steam", &steam_id, &name)?;
+            return Ok(serde_json::json!({ "ok": true, "linked": "steam", "handle": name }));
+        }
+        let user_id = db.find_or_create_user("steam", &steam_id, &name, &name)?;
+        let token = db.create_session(&user_id, "steam")?;
+        Ok(serde_json::json!({ "ok": true, "token": token, "user_id": user_id, "handle": name, "display_name": name, "verified": true }))
+    }).await.unwrap_or_else(|_| Err("Server error".into()));
+    match payload {
+        Ok(p) => Html(auth_popup_html("steam-auth", &p)),
+        Err(e) => fail(&e),
+    }
+}
+
+/// A page that hands a sign-in result back to the game window (popup), or
+/// stores it and returns to the game when opened in the same tab.
+fn auth_popup_html(kind: &str, payload: &serde_json::Value) -> String {
+    let mut msg = payload.clone();
+    msg["type"] = kind.into();
+    // JSON inside a script: escape '<' so the payload can never close the tag.
+    let json = msg.to_string().replace('<', "\\u003c");
+    let ok = payload["ok"].as_bool().unwrap_or(false);
+    let text = if ok { "Signed in! This window will close automatically.".to_string() } else { format!("Sign-in failed: {}", payload["error"].as_str().unwrap_or("unknown error")) };
+    let text = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>BoxHead sign-in</title></head>
+<body style="background:#0b0d12;color:#e7e9ee;font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0">
+<p>{text}</p>
+<script>
+const msg = {json};
+if (window.opener) {{
+  window.opener.postMessage(msg, window.location.origin);
+  setTimeout(() => window.close(), msg.ok ? 600 : 3000);
+}} else {{
+  try {{ localStorage.setItem('boxhead_pending_auth', JSON.stringify(msg)); }} catch (e) {{}}
+  setTimeout(() => {{ window.location.href = '/'; }}, msg.ok ? 300 : 3000);
+}}
+</script></body></html>"#)
 }
 
 async fn friends_list(
