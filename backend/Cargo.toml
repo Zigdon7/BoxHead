@@ -15,3 +15,5 @@ futures = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 bcrypt = "0.16"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-native-tls", "hostname"] }
+sha2 = "0.10"

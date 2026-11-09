@@ -1327,6 +1327,26 @@
       .crossplay-row { padding: 10px; gap: 10px; }
       .badge--pool { display: none; } /* the list header already names the pool */
     }
+
+    /* Accounts: email confirmation, password reset, deletion */
+    .email-banner { flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 12px 10px 18px; position: relative;
+      background: linear-gradient(90deg, rgba(233, 169, 58, 0.12), transparent); border: 1px solid rgba(233, 169, 58, 0.35); }
+    .email-banner::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 8px; background: var(--hazard); }
+    .email-banner[hidden] { display: none; }
+    .email-banner > p:first-child { flex: 1 1 220px; font-size: 15px; }
+    .email-banner .field-hint:empty { display: none; }
+    .email-banner .field-hint { flex: 1 0 100%; }
+    .home-notice { padding: 8px 12px; border: 1px solid var(--health); color: var(--health); font-size: 15px; background: rgba(140, 193, 82, 0.08); }
+    .home-notice.bad { border-color: var(--danger-text); color: var(--danger-text); background: rgba(212, 69, 43, 0.08); }
+    .home-notice[hidden] { display: none; }
+    .forgot-box { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; margin-top: 6px; }
+    .forgot-box[hidden] { display: none; }
+    .forgot-box .field-hint:empty { display: none; }
+    .danger-zone { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+    .danger-zone .stack[hidden] { display: none; }
+    .danger-btn:not(:disabled) { border-color: var(--danger-text); color: var(--danger-text); }
+    #resetSection[hidden], #authSectionOut[hidden] { display: none; }
+    .choice--faction.soon { opacity: 0.55; cursor: not-allowed; filter: saturate(0.3); }
   </style>
 </head>
 <body>
@@ -1389,15 +1409,31 @@
         <button id="friendsBtn" class="btn btn-secondary btn-block hidden"><svg class="icon"><use href="#i-users"/></svg><span id="friendsBtnLabel">Add friends</span></button>
       </div>
 
+      <p id="homeNotice" class="home-notice" role="status" hidden></p>
+
       <div id="authSectionIn" class="account hidden">
         <span id="accountAvatar" class="avatar" aria-hidden="true">?</span>
         <div class="account-id">
-          <p class="account-name-row"><span id="loggedInStatus" class="account-name">Operative</span><span class="badge badge--verified"><svg class="icon"><use href="#i-check"/></svg>Verified</span></p>
+          <p class="account-name-row"><span id="loggedInStatus" class="account-name">Operative</span><span id="verifiedBadge" class="badge badge--verified"><svg class="icon"><use href="#i-check"/></svg>Verified</span></p>
           <p id="accountSummary" class="meta">Gear score 0</p>
         </div>
         <button id="logoutBtn" class="link link--muted" type="button">Sign out</button>
-        <details class="account-more"><summary>Linked accounts</summary>
+        <div id="emailBanner" class="email-banner" role="status" hidden>
+          <p><b>Confirm your email to deploy.</b> We sent a link to <span id="emailBannerAddr"></span>.</p>
+          <button id="resendEmailBtn" class="btn btn-secondary btn-sm" type="button">Resend link</button>
+          <p id="emailBannerMsg" class="field-hint"></p>
+        </div>
+        <details class="account-more"><summary>Account &amp; linked sign-ins</summary>
         <div id="linkedAccounts" class="linked-list" aria-label="Linked accounts"></div>
+        <div class="danger-zone">
+          <button id="deleteAccountBtn" class="link link--muted" type="button">Delete account…</button>
+          <div id="deleteConfirm" class="stack" hidden>
+            <p class="field-hint">This permanently deletes your account: every operator, stash, Homefront and Legacy. It can't be undone. Type <b>DELETE</b> to confirm.</p>
+            <input id="deleteConfirmInput" class="input" type="text" maxlength="6" autocomplete="off" aria-label="Type DELETE to confirm" />
+            <button id="deleteAccountGo" class="btn btn-secondary btn-sm danger-btn" type="button" disabled>Delete my account forever</button>
+            <p id="deleteAccountErr" class="error-text" role="alert"></p>
+          </div>
+        </div>
         </details>
         <div id="homeFriendsBox" class="hidden">
           <span id="homeFriendsSummary">0/0 online</span>
@@ -1565,9 +1601,16 @@
 
     <section id="menuSignIn" class="panel menu-view hidden" aria-label="Sign in">
       <header class="dialog-head">
-        <div class="panel-title-group"><h2 class="panel-title">Sign in</h2><p id="signInSub" class="meta">You need an account to play. Steam, Bluesky, Google and email all sign in to the same kind of BoxHead account, and you can link more later.</p></div>
+        <div class="panel-title-group"><h2 id="signInTitle" class="panel-title">Sign in</h2><p id="signInSub" class="meta">You need an account to play. Steam, Bluesky, Google and email all sign in to the same kind of BoxHead account, and you can link more later.</p></div>
         <button class="close-btn" data-menu-view="home" title="Close (Esc)" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg><kbd class="kbd">Esc</kbd></button>
       </header>
+
+      <div id="resetSection" class="stack" hidden>
+        <label class="field"><span class="field-label">New password</span>
+          <input id="resetPassInput" class="input" type="password" maxlength="128" minlength="8" autocomplete="new-password" placeholder="At least 8 characters" /></label>
+        <button id="resetPassBtn" class="btn btn-primary btn-hero btn-block submit">Set new password</button>
+        <p id="resetErr" class="error-text" role="alert"></p>
+      </div>
 
       <div id="authSectionOut" class="stack">
         <div id="authTabEmail" class="auth-tab-content stack">
@@ -1575,7 +1618,11 @@
           <div class="field">
             <span class="field-label-row"><label class="field-label" for="emailPassInput">Password</label><button id="forgotPwBtn" class="link link--muted" type="button">Forgot password?</button></span>
             <span class="pw-field"><input id="emailPassInput" class="input" type="password" maxlength="128" autocomplete="current-password" /><button type="button" class="pw-toggle" data-pw-toggle="emailPassInput" aria-label="Show password"><svg class="icon"><use href="#i-eye"/></svg></button></span>
-            <p id="forgotPwHint" class="field-hint" hidden>Password resets aren't available yet. Use Google or Bluesky below, or create a new account.</p>
+            <div id="forgotPwHint" class="forgot-box" hidden>
+              <p class="field-hint">Enter your email above and we'll send you a link to choose a new password.</p>
+              <button id="forgotSendBtn" class="btn btn-secondary btn-sm" type="button">Email me a reset link</button>
+              <p id="forgotMsg" class="field-hint" role="status"></p>
+            </div>
           </div>
           <button id="emailLoginBtn" class="btn btn-primary btn-hero btn-block submit">Sign in <kbd class="kbd">Enter</kbd></button>
           <p class="meta center-text">No account? <button id="emailRegisterBtn" class="link" type="button">Create one</button></p>

@@ -72,6 +72,8 @@ export interface Hideout {
   cash: number; raids: number; extracts: number; deaths: number; inRaid: boolean;
   gearScore: number; loadout: Partial<Record<Slot, Item | null>>; stash: Item[]; stashCapacity: number;
   offers: Offer[]; maps: MapSummary[];
+  /** Raidable operators (PvP) are available on this server. */
+  pvpEnabled?: boolean;
   /** What insuring the current loadout for one raid costs. */
   insuranceCost: number;
   /** Ids of sealed stash items marked to come along on the next raid. */

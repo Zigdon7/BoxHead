@@ -150,6 +150,7 @@ fn parse_ttl(raw: Option<String>) -> Duration {
 pub enum Pool { Steam, Bluesky, Direct, Cross }
 
 impl Pool {
+    #[cfg(test)]
     pub const ALL: [Pool; 4] = [Pool::Steam, Pool::Bluesky, Pool::Direct, Pool::Cross];
 
     /// The pool for a session's sign-in platform and the account's cross-play setting.

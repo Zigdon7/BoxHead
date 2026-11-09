@@ -144,6 +144,15 @@ impl OperatorContext {
     }
 }
 
+/// The login error for both an unknown email and a wrong password.
+pub const WRONG_LOGIN: &str = "Wrong email or password";
+
+/// Tokens in links are stored hashed, so a leaked database can't be used to sign in.
+fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
@@ -167,6 +176,10 @@ impl Database {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path)
             .map_err(|e| format!("Failed to open database: {}", e))?;
+        // WAL + synchronous=NORMAL: commits append to the log without an fsync each
+        // (durable across crashes of the process; a power cut can lose the last few).
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = OFF;")
+            .map_err(|e| format!("Failed to configure database: {}", e))?;
 
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS operators (
@@ -280,6 +293,18 @@ impl Database {
         // Matchmaking: the platform a session signed in with, and the account's cross-platform opt-in.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN platform TEXT NOT NULL DEFAULT 'direct'", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN crossplay INTEGER NOT NULL DEFAULT 0", []);
+        // Email confirmation. Accounts from before it existed count as confirmed.
+        let _ = conn.execute("ALTER TABLE email_credentials ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1", []);
+        conn.execute_batch("
+            -- One-time links (confirm email, reset password). Only a hash of the token is stored.
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS sessions_by_user ON sessions(user_id);
+        ").map_err(|e| format!("Failed to create auth schema: {}", e))?;
 
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -1036,18 +1061,23 @@ impl Database {
         ).ok()
     }
 
-    /// Every signed-in account (email, Google or Bluesky) is verified; guests are not.
-    /// Email confirmation is planned before launch — gate email accounts here once it exists.
+    /// An account is verified once it exists and any email sign-in on it is confirmed
+    /// (or it also signs in through Steam, Bluesky or Google).
+    #[cfg(test)]
     pub fn is_verified(&self, user_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
-            params![user_id],
-            |row| row.get::<_, bool>(0),
-        ).unwrap_or(false)
+        let exists = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+                params![user_id],
+                |row| row.get::<_, bool>(0),
+            ).unwrap_or(false)
+        };
+        exists && self.unconfirmed_email(user_id).is_none()
     }
 
     /// Verification status for a session token; invalid or missing tokens are unverified.
+    #[cfg(test)]
     pub fn session_is_verified(&self, token: Option<&str>) -> bool {
         token.filter(|t| !t.is_empty())
             .and_then(|t| self.validate_session(t))
@@ -1137,7 +1167,7 @@ impl Database {
             params![user_id, email],
         ).map_err(|e| format!("Failed to link account: {}", e))?;
         tx.execute(
-            "INSERT INTO email_credentials (user_id, email, password_hash) VALUES (?1, ?2, ?3)",
+            "INSERT INTO email_credentials (user_id, email, password_hash, confirmed) VALUES (?1, ?2, ?3, 0)",
             params![user_id, email, hash],
         ).map_err(|e| format!("Failed to store credentials: {}", e))?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -1154,12 +1184,114 @@ impl Database {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ).ok()
         };
-        // Verify outside the lock so logins never stall raid settlement.
+        // Verify outside the lock so logins never stall raid settlement. One message
+        // for both failures, so the form never reveals which emails have accounts.
         match row {
             Some((user_id, hash)) if bcrypt::verify(password, &hash).unwrap_or(false) => Ok(user_id),
-            Some(_) => Err("Invalid password".to_string()),
-            None => Err("Email not found".to_string()),
+            _ => Err(WRONG_LOGIN.to_string()),
         }
+    }
+
+    // ---------- Email confirmation, password reset, account deletion ----------
+
+    /// Issue a one-time token for `kind` ("confirm" or "reset"), replacing older
+    /// ones of the same kind. Returns the token to put in the link.
+    pub fn issue_auth_token(&self, user_id: &str, kind: &str, ttl_secs: i64) -> Result<String, String> {
+        let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM auth_tokens WHERE (user_id = ?1 AND kind = ?2) OR expires_at < ?3", params![user_id, kind, now_secs()])
+            .map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO auth_tokens (token_hash, user_id, kind, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![token_hash(&token), user_id, kind, now_secs() + ttl_secs]).map_err(|e| e.to_string())?;
+        Ok(token)
+    }
+
+    /// Use up a one-time token. Returns its account if it was valid and unexpired.
+    pub fn take_auth_token(&self, token: &str, kind: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        let hash = token_hash(token);
+        let user: Option<String> = conn.query_row(
+            "SELECT user_id FROM auth_tokens WHERE token_hash = ?1 AND kind = ?2 AND expires_at >= ?3",
+            params![hash, kind, now_secs()], |r| r.get(0)).ok();
+        if user.is_some() { let _ = conn.execute("DELETE FROM auth_tokens WHERE token_hash = ?1", params![hash]); }
+        user
+    }
+
+    /// The account's sign-in email and whether it is confirmed.
+    pub fn account_email(&self, user_id: &str) -> Option<(String, bool)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT email, confirmed FROM email_credentials WHERE user_id = ?1", params![user_id],
+            |r| Ok((r.get(0)?, r.get(1)?))).ok()
+    }
+
+    /// The account that signs in with this email, if any.
+    pub fn user_by_email(&self, email: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT user_id FROM email_credentials WHERE email = ?1", params![email], |r| r.get(0)).ok()
+    }
+
+    pub fn confirm_email(&self, user_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE email_credentials SET confirmed = 1 WHERE user_id = ?1", params![user_id]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The unconfirmed email holding this account back, if any. Accounts that also
+    /// sign in through Steam, Bluesky or Google are already proven and never wait.
+    pub fn unconfirmed_email(&self, user_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        let (email, confirmed): (String, bool) = conn.query_row(
+            "SELECT email, confirmed FROM email_credentials WHERE user_id = ?1", params![user_id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?;
+        if confirmed { return None; }
+        let other: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM linked_accounts WHERE user_id = ?1 AND provider IN ('steam', 'bluesky', 'google'))",
+            params![user_id], |r| r.get(0)).unwrap_or(false);
+        (!other).then_some(email)
+    }
+
+    /// Set a new password and sign the account out everywhere. Proving you can read
+    /// the inbox (the reset link) also confirms the email.
+    pub fn reset_password(&self, user_id: &str, password: &str) -> Result<(), String> {
+        let hash = bcrypt::hash(password, 10).map_err(|e| format!("Failed to hash password: {}", e))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let n = tx.execute("UPDATE email_credentials SET password_hash = ?1, confirmed = 1 WHERE user_id = ?2", params![hash, user_id])
+            .map_err(|e| e.to_string())?;
+        if n == 0 { return Err("This account doesn't use a password.".into()); }
+        tx.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM auth_tokens WHERE user_id = ?1 AND kind = 'reset'", params![user_id]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Delete an account and everything it owns: operators, stash, Homefront,
+    /// Legacy, friends, linked sign-ins and sessions. Refused mid-raid.
+    pub fn delete_account(&self, user_id: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)", params![user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !exists { return Err("Account not found".into()); }
+        let deployed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operators WHERE account = ?1 AND in_raid IS NOT NULL)", params![user_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if deployed { return Err("One of your operators is in a raid. Finish it first.".into()); }
+        for table in ["items", "facilities", "operations"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE profile IN (SELECT profile FROM operators WHERE account = ?1)"), params![user_id])
+                .map_err(|e| e.to_string())?;
+        }
+        for sql in [
+            "DELETE FROM operators WHERE account = ?1",
+            "DELETE FROM accounts WHERE user_id = ?1",
+            "DELETE FROM account_perks WHERE user_id = ?1",
+            "DELETE FROM account_badges WHERE user_id = ?1",
+            "DELETE FROM friends WHERE user_id = ?1 OR friend_id = ?1",
+            "DELETE FROM sessions WHERE user_id = ?1",
+            "DELETE FROM auth_tokens WHERE user_id = ?1",
+            "DELETE FROM email_credentials WHERE user_id = ?1",
+            "DELETE FROM linked_accounts WHERE user_id = ?1",
+            "DELETE FROM users WHERE id = ?1",
+        ] {
+            tx.execute(sql, params![user_id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Clean up expired sessions.
@@ -1582,15 +1714,94 @@ mod stash_tests {
     }
 
     #[test]
-    fn every_signed_in_account_is_verified_guests_are_not() {
+    fn accounts_are_verified_once_their_email_is_confirmed() {
         let db = Database::open(":memory:").unwrap();
         let email_user = db.register_email_user("a@example.com", "secret1").unwrap();
         let google_user = db.find_or_create_user("google", "sub-1", "g@example.com", "G").unwrap();
-        assert!(db.is_verified(&email_user) && db.is_verified(&google_user));
+        assert!(!db.is_verified(&email_user) && db.is_verified(&google_user));
         assert!(!db.is_verified("no-such-user"));
         let token = db.create_session(&email_user, "direct").unwrap();
+        assert!(!db.session_is_verified(Some(&token)));
+        db.confirm_email(&email_user).unwrap();
         assert!(db.session_is_verified(Some(&token)));
         assert!(!db.session_is_verified(Some("bogus")) && !db.session_is_verified(Some("")) && !db.session_is_verified(None));
+    }
+
+    #[test]
+    fn new_email_accounts_must_confirm_and_tokens_work_once() {
+        let db = Database::open(":memory:").unwrap();
+        let user = db.register_email_user("new@example.com", "secret1").unwrap();
+        assert_eq!(db.unconfirmed_email(&user).as_deref(), Some("new@example.com"));
+        assert!(!db.is_verified(&user));
+        let token = db.issue_auth_token(&user, "confirm", 3600).unwrap();
+        assert_eq!(db.take_auth_token(&token, "reset"), None, "kinds don't mix");
+        assert_eq!(db.take_auth_token(&token, "confirm").as_deref(), Some(user.as_str()));
+        assert_eq!(db.take_auth_token(&token, "confirm"), None, "one use only");
+        db.confirm_email(&user).unwrap();
+        assert!(db.unconfirmed_email(&user).is_none() && db.is_verified(&user));
+        // A newer link replaces the old one; expired links don't work.
+        let old = db.issue_auth_token(&user, "reset", 3600).unwrap();
+        let new = db.issue_auth_token(&user, "reset", 3600).unwrap();
+        assert_eq!(db.take_auth_token(&old, "reset"), None);
+        assert!(db.take_auth_token(&new, "reset").is_some());
+        let stale = db.issue_auth_token(&user, "reset", -1).unwrap();
+        assert_eq!(db.take_auth_token(&stale, "reset"), None);
+    }
+
+    #[test]
+    fn linking_another_sign_in_skips_email_confirmation() {
+        let db = Database::open(":memory:").unwrap();
+        let user = db.register_email_user("x@example.com", "secret1").unwrap();
+        db.link_account(&user, "steam", "765", "Gabe").unwrap();
+        assert!(db.unconfirmed_email(&user).is_none());
+        assert_eq!(db.account_email(&user), Some(("x@example.com".into(), false)));
+    }
+
+    #[test]
+    fn logins_do_not_reveal_which_emails_exist() {
+        let db = Database::open(":memory:").unwrap();
+        db.register_email_user("a@example.com", "secret1").unwrap();
+        assert_eq!(db.verify_email_login("a@example.com", "nope").unwrap_err(), WRONG_LOGIN);
+        assert_eq!(db.verify_email_login("ghost@example.com", "nope").unwrap_err(), WRONG_LOGIN);
+    }
+
+    #[test]
+    fn a_password_reset_signs_out_everywhere_and_confirms_the_email() {
+        let db = Database::open(":memory:").unwrap();
+        let user = db.register_email_user("r@example.com", "secret1").unwrap();
+        let session = db.create_session(&user, "direct").unwrap();
+        db.reset_password(&user, "brand-new-pw").unwrap();
+        assert_eq!(db.validate_session(&session), None);
+        assert!(db.verify_email_login("r@example.com", "secret1").is_err());
+        assert_eq!(db.verify_email_login("r@example.com", "brand-new-pw").unwrap(), user);
+        assert!(db.unconfirmed_email(&user).is_none());
+        let steam = db.find_or_create_user("steam", "1", "S", "S").unwrap();
+        assert!(db.reset_password(&steam, "whatever1").is_err(), "no password to reset");
+    }
+
+    #[test]
+    fn deleting_an_account_removes_everything_it_owns() {
+        let db = Database::open(":memory:").unwrap();
+        let user = db.register_email_user("d@example.com", "secret1").unwrap();
+        let friend = db.register_email_user("f@example.com", "secret1").unwrap();
+        db.link_account(&user, "steam", "42", "Del").unwrap();
+        db.add_friend(&user, &friend).unwrap();
+        let session = db.create_session(&user, "direct").unwrap();
+        let op = db.create_operator(&user, "Ghost", false, 0).unwrap();
+        db.deploy(&op, "outskirts-direct", crate::gear::default_map(), false).unwrap();
+        assert!(db.delete_account(&user).unwrap_err().contains("in a raid"));
+        assert!(db.void_raid(&op, "outskirts-direct", 0));
+        db.delete_account(&user).unwrap();
+        assert_eq!(db.validate_session(&session), None);
+        assert!(db.get_user(&user).is_none() && db.operator(&op).is_none());
+        assert!(db.user_by_email("d@example.com").is_none());
+        assert!(db.get_friends(&friend).is_empty(), "gone from friends' lists too");
+        // The email and the Steam identity are free to use again.
+        db.register_email_user("d@example.com", "secret1").unwrap();
+        assert_ne!(db.find_or_create_user("steam", "42", "Del", "Del").unwrap(), user);
+        let conn = db.conn.lock().unwrap();
+        let items: i64 = conn.query_row("SELECT COUNT(*) FROM items WHERE profile = ?1", params![op], |r| r.get(0)).unwrap();
+        assert_eq!(items, 0);
     }
 
     #[test]

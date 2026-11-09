@@ -544,7 +544,12 @@ export class HideoutView {
     name.value = this.newName;
     name.addEventListener('input', () => { this.newName = name.value; });
     nameLabel.append(el('span', 'label', 'Name (optional)'), name);
-    const warn = el('p', 'warn-line', '⚠ Safe or Raidable is permanent for this operator. You can create more operators later.');
+    // Until PvP ships, every new operator is Safe and Raidable is shown as coming soon.
+    const pvp = h.pvpEnabled !== false;
+    if (!pvp) this.newRaidable = false;
+    const warn = el('p', 'warn-line', pvp
+      ? '⚠ Safe or Raidable is permanent for this operator. You can create more operators later.'
+      : '⚠ Raidable operators arrive with PvP in a later season. Until then every operator is Safe.');
     const grid = el('div', 'choice-grid');
     grid.setAttribute('role', 'radiogroup');
     grid.setAttribute('aria-label', 'Safe or Raidable');
@@ -552,8 +557,10 @@ export class HideoutView {
     const safeTier = h.homefront?.safeTier ?? 3;
     const choice = (raidable: boolean, title: string, line: string, stats: [string, string, 'good' | 'bad' | 'neutral'][], note?: string) => {
       const picked = this.newRaidable === raidable;
-      const b = el('button', `choice choice--faction ${raidable ? 'raid' : 'safe'}`);
+      const soon = raidable && !pvp;
+      const b = el('button', `choice choice--faction ${raidable ? 'raid' : 'safe'}${soon ? ' soon' : ''}`);
       b.type = 'button';
+      b.disabled = soon;
       b.setAttribute('role', 'radio');
       b.setAttribute('aria-checked', String(picked));
       const emblem = el('span', `choice-emblem ${raidable ? 'raid' : 'safe'}`);
@@ -561,6 +568,7 @@ export class HideoutView {
       const tl = el('span', 'choice-title', title);
       const tags = el('span', 'choice-tags');
       if (note) tags.append(el('span', 'tag tag--safe', note));
+      if (soon) tags.append(el('span', 'tag', 'Coming soon'));
       if (picked) tags.append(el('span', 'tag tag--you', 'Selected'));
       const list = el('div', 'choice-stats');
       for (const [label, value, tone] of stats) {
@@ -574,7 +582,7 @@ export class HideoutView {
     };
     grid.append(
       choice(false, 'Safe', 'Zombies only. Other players can never attack you or raid your base.',
-        [['PvP', 'Off', 'good'], ['Base raids', 'Immune', 'good'], ['Base max', `Tier ${safeTier}`, 'neutral']], 'Recommended'),
+        [['PvP', 'Off', 'good'], ['Base raids', 'Immune', 'good'], ['Base max', `Tier ${safeTier}`, 'neutral']], pvp ? 'Recommended' : undefined),
       choice(true, 'Raidable', 'Zombies and players. Others can attack you (PvP) and raid your base.',
         [['PvP', 'On', 'bad'], ['Base raids', 'Exposed', 'bad'], ['Base max', `Tier ${top}`, 'neutral']]),
     );

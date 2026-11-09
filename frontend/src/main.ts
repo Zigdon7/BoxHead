@@ -517,10 +517,12 @@ const menuViews: Record<MenuView, HTMLElement> = {
   browser: document.getElementById('menuBrowser')!,
   signin: document.getElementById('menuSignIn')!,
 };
+/** The token from a password-reset link, while its form is open. */
+let resetToken = '';
 function showMenuView(view: MenuView) {
   // Everything past the home screen needs an account.
   if (!isLoggedIn && (view === 'hideout' || view === 'browser')) view = 'signin';
-  if (view !== 'signin') bskyLinkMode = false;
+  if (view !== 'signin') { bskyLinkMode = false; if (resetToken) hideResetForm(); }
   menuView = view;
   for (const [name, el] of Object.entries(menuViews)) el.classList.toggle('hidden', name !== view);
   if (view === 'browser') { void refreshRooms(); void hideoutView.refresh(); }
@@ -748,6 +750,7 @@ function refreshMe() {
       if (!data.ok) { clearAuthState(); return; }
       linkedAccounts = data.linked || [];
       renderLinkedAccounts();
+      renderEmailStatus(data.emailUnconfirmed ?? null);
     })
     .catch(() => {});
 }
@@ -828,6 +831,7 @@ function clearAuthState() {
   localStorage.removeItem('boxhead_auth_user_id');
   matchmaking = null;
   linkedAccounts = [];
+  renderEmailStatus(null);
   updateFriendsDOM();
   if (menuView === 'hideout' || menuView === 'browser') showMenuView('home');
   void refreshRooms();
@@ -885,12 +889,127 @@ async function emailAuth(endpoint: string) {
     const data = await res.json();
     if (data.ok) {
       setAuthState(data.token, data.handle, data.user_id, data.display_name);
+      if (endpoint === 'register') showHomeNotice(data.mailError
+        ? `Account created, but the confirmation email didn't send: ${data.mailError} Use "Resend link" below.`
+        : `Account created. We sent a confirmation link to ${data.handle}: confirm it to deploy.`, !!data.mailError);
     } else {
       loginErrorMsg.textContent = data.error || 'Auth failed';
     }
   } catch {
     loginErrorMsg.textContent = 'Network error';
   }
+}
+
+// --- Email confirmation, password reset and account deletion ---
+let minPassword = 8;
+
+function showHomeNotice(text: string, bad = false) {
+  const n = document.getElementById('homeNotice')!;
+  n.textContent = text;
+  n.classList.toggle('bad', bad);
+  n.hidden = !text;
+}
+
+/** The "confirm your email" banner on the home screen, from /api/auth/me. */
+function renderEmailStatus(unconfirmed: string | null) {
+  document.getElementById('emailBanner')!.hidden = !unconfirmed;
+  document.getElementById('emailBannerAddr')!.textContent = unconfirmed ?? '';
+  document.getElementById('verifiedBadge')!.hidden = !!unconfirmed;
+}
+
+async function postJson(url: string, body: unknown): Promise<any> {
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return res.json();
+}
+
+document.getElementById('resendEmailBtn')!.addEventListener('click', async () => {
+  const msg = document.getElementById('emailBannerMsg')!;
+  msg.textContent = 'Sending…';
+  try {
+    const data = await postJson('/api/auth/email/resend', { token: authToken });
+    msg.textContent = data.ok ? (data.alreadyConfirmed ? 'Already confirmed.' : `Sent. Check ${data.sentTo} (and the spam folder).`) : (data.error || 'Could not send');
+    if (data.alreadyConfirmed) refreshMe();
+  } catch { msg.textContent = 'Network error'; }
+});
+
+document.getElementById('forgotSendBtn')!.addEventListener('click', async () => {
+  const msg = document.getElementById('forgotMsg')!;
+  const email = emailInputEl.value.trim();
+  if (!email) { msg.textContent = 'Enter your email above first.'; emailInputEl.focus(); return; }
+  msg.textContent = 'Sending…';
+  try {
+    const data = await postJson('/api/auth/password/forgot', { email });
+    msg.textContent = data.ok ? data.message : (data.error || 'Could not send');
+  } catch { msg.textContent = 'Network error'; }
+});
+
+/** Opened from a reset email (/?reset=<token>): show only the new-password form. */
+function showResetForm(token: string) {
+  resetToken = token;
+  showMenuView('signin');
+  document.getElementById('signInTitle')!.textContent = 'New password';
+  document.getElementById('signInSub')!.textContent = 'Choose a new password. This signs you out on every other device.';
+  document.getElementById('resetSection')!.hidden = false;
+  document.getElementById('authSectionOut')!.hidden = true;
+  (document.getElementById('resetPassInput') as HTMLInputElement).focus();
+}
+const signInSubDefault = document.getElementById('signInSub')!.textContent ?? '';
+function hideResetForm() {
+  resetToken = '';
+  document.getElementById('signInSub')!.textContent = signInSubDefault;
+  document.getElementById('signInTitle')!.textContent = 'Sign in';
+  document.getElementById('resetSection')!.hidden = true;
+  document.getElementById('authSectionOut')!.hidden = false;
+}
+
+async function submitReset() {
+  const err = document.getElementById('resetErr')!;
+  const password = (document.getElementById('resetPassInput') as HTMLInputElement).value;
+  err.textContent = '';
+  if (password.length < minPassword) { err.textContent = `Use at least ${minPassword} characters.`; return; }
+  try {
+    const data = await postJson('/api/auth/password/reset', { token: resetToken, password });
+    if (!data.ok) { err.textContent = data.error || 'Could not reset the password'; return; }
+    hideResetForm();
+    setAuthState(data.token, data.handle, data.user_id, data.display_name);
+    showHomeNotice('Password changed. You are signed in, and every other device was signed out.');
+  } catch { err.textContent = 'Network error'; }
+}
+document.getElementById('resetPassBtn')!.addEventListener('click', () => void submitReset());
+document.getElementById('resetPassInput')!.addEventListener('keydown', e => { if ((e as KeyboardEvent).key === 'Enter') void submitReset(); });
+
+const deleteInput = document.getElementById('deleteConfirmInput') as HTMLInputElement;
+const deleteGo = document.getElementById('deleteAccountGo') as HTMLButtonElement;
+document.getElementById('deleteAccountBtn')!.addEventListener('click', () => {
+  const box = document.getElementById('deleteConfirm')!;
+  box.hidden = !box.hidden;
+  if (!box.hidden) deleteInput.focus();
+});
+deleteInput.addEventListener('input', () => { deleteGo.disabled = deleteInput.value.trim().toUpperCase() !== 'DELETE'; });
+deleteGo.addEventListener('click', async () => {
+  const err = document.getElementById('deleteAccountErr')!;
+  err.textContent = '';
+  try {
+    const data = await postJson('/api/account/delete', { token: authToken, confirm: 'DELETE' });
+    if (!data.ok) { err.textContent = data.error || 'Could not delete the account'; return; }
+    deleteInput.value = '';
+    deleteGo.disabled = true;
+    document.getElementById('deleteConfirm')!.hidden = true;
+    clearAuthState();
+    showMenuView('home');
+    showHomeNotice('Your account was deleted.');
+  } catch { err.textContent = 'Network error'; }
+});
+
+// Links from emails land here: /?email=confirmed|expired or /?reset=<token>.
+{
+  const params = new URLSearchParams(window.location.search);
+  const email = params.get('email');
+  const reset = params.get('reset');
+  if (email || reset) window.history.replaceState(null, '', window.location.pathname);
+  if (email === 'confirmed') showHomeNotice('Email confirmed. You can deploy now.');
+  else if (email === 'expired') showHomeNotice('That confirmation link has expired or was already used. Sign in and press "Resend link" for a new one.', true);
+  if (reset && /^[0-9a-f]{16,128}$/.test(reset)) queueMicrotask(() => showResetForm(reset));
 }
 
 window.addEventListener('message', (e) => {
@@ -907,7 +1026,7 @@ window.addEventListener('message', (e) => {
 
 fetch('/api/config')
   .then(r => r.json())
-  .then(data => { (window as any).__GOOGLE_CLIENT_ID = data.google_client_id || ''; })
+  .then(data => { (window as any).__GOOGLE_CLIENT_ID = data.google_client_id || ''; minPassword = data.minPassword || minPassword; })
   .catch(() => {});
 
 if (isLoggedIn) refreshMe();

@@ -10,6 +10,9 @@ mod rooms;
 mod sim;
 mod ops;
 mod progression;
+mod ratelimit;
+mod mail;
+mod auth;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +47,14 @@ struct AppState {
     google_client_secret: String,
     /// Steam sign-in attempts in flight: nonce -> (account to link to, if any; when it started).
     steam_logins: std::sync::Mutex<HashMap<String, (Option<String>, std::time::Instant)>>,
+    limiter: Arc<ratelimit::RateLimiter>,
+    mailer: mail::Mailer,
+}
+
+/// PvP (raidable operators, base raids) is off until it is built: `BOXHEAD_PVP=1` turns it on.
+fn pvp_enabled() -> bool {
+    static PVP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PVP.get_or_init(|| std::env::var("BOXHEAD_PVP").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on")))
 }
 
 #[tokio::main]
@@ -79,15 +90,20 @@ async fn main() {
         google_client_id,
         google_client_secret,
         steam_logins: std::sync::Mutex::new(HashMap::new()),
+        limiter: Arc::new(ratelimit::RateLimiter::from_env()),
+        mailer: mail::Mailer::from_env(),
     });
+    if !pvp_enabled() { println!("PvP is off: new operators are Safe (set BOXHEAD_PVP=1 to allow Raidable)"); }
 
-    // Periodic session cleanup (every hour)
+    // Periodic cleanup: expired sessions, refilled rate-limit buckets.
     let cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
         loop {
             interval.tick().await;
-            cleanup_state.db.delete_expired_sessions();
+            let db = cleanup_state.db.clone();
+            let _ = tokio::task::spawn_blocking(move || db.delete_expired_sessions()).await;
+            cleanup_state.limiter.prune();
         }
     });
 
@@ -103,8 +119,13 @@ async fn main() {
         .route("/api/hideout/{action}", post(hideout_action))
         .route("/api/maps", get(maps_list))
         .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/email/register", post(email_register))
-        .route("/api/auth/email/login", post(email_login))
+        .route("/api/auth/email/register", post(auth::register))
+        .route("/api/auth/email/login", post(auth::login))
+        .route("/api/auth/email/confirm", get(auth::confirm))
+        .route("/api/auth/email/resend", post(auth::resend))
+        .route("/api/auth/password/forgot", post(auth::forgot))
+        .route("/api/auth/password/reset", post(auth::reset))
+        .route("/api/account/delete", post(auth::delete_account))
         .route("/api/auth/google/callback", get(google_callback))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/steam/start", get(steam_start))
@@ -114,13 +135,17 @@ async fn main() {
         .route("/api/friends/add", post(friends_add))
         .route("/api/friends/remove", post(friends_remove))
         .fallback_service(ServeDir::new(static_dir))
+        .layer(axum::middleware::from_fn_with_state(state.limiter.clone(), ratelimit::middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .unwrap();
     println!("Server listening on port {}", port);
-    axum::serve(listener, app).await.unwrap();
+    // Game traffic is many small messages: send them immediately (no Nagle delay).
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| { let _ = tcp.set_nodelay(true); });
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }
 
 /// Serve the internal ops API (for the dashboard service) on its own,
@@ -203,6 +228,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Only signed-in accounts can drop in, and only as one of their operators.
     if user_id.is_none() {
         send_join_error(&mut ws_sender, "Sign in to play. Your stash lives on your account.").await;
+        return;
+    }
+    if let Some(why) = auth::email_gate(&state, user_id.as_deref().unwrap_or_default()).await {
+        send_join_error(&mut ws_sender, &why).await;
         return;
     }
     if profile_key.is_none() {
@@ -406,6 +435,9 @@ async fn rooms_create(
     let Some(mm) = session_pool(&state, body["token"].as_str().unwrap_or("")).await else {
         return Json(serde_json::json!({ "ok": false, "error": "Sign in to host a lobby" }));
     };
+    if let Some(why) = auth::email_gate(&state, &mm.user_id).await {
+        return Json(serde_json::json!({ "ok": false, "error": why }));
+    }
     let Some(map) = body["map"].as_str().map_or(Some(gear::default_map()), gear::map_by_id) else {
         return Json(serde_json::json!({ "ok": false, "error": "Unknown map" }));
     };
@@ -545,6 +577,7 @@ fn hideout_json(db: &Database, user: &str) -> serde_json::Value {
             for (k, v) in d { top.insert(k.clone(), v.clone()); }
         }
     }
+    out["pvpEnabled"] = pvp_enabled().into();
     out
 }
 
@@ -582,7 +615,10 @@ async fn hideout_action(
         let item = body["itemId"].as_str().unwrap_or("");
         // Account actions work with or without an operator.
         let account_result = match action.as_str() {
-            "createOperator" => Some(db.create_operator(&user, body["name"].as_str().unwrap_or(""), body["raidable"].as_bool().unwrap_or(false), now).map(|_| ())),
+            "createOperator" => Some(match body["raidable"].as_bool().unwrap_or(false) {
+                true if !pvp_enabled() => Err("Raidable operators arrive with PvP. For now every new operator is Safe.".into()),
+                raidable => db.create_operator(&user, body["name"].as_str().unwrap_or(""), raidable, now).map(|_| ()),
+            }),
             "switchOperator" => Some(db.switch_operator(&user, body["operatorId"].as_str().unwrap_or(""))),
             "relocate" => Some(if body["confirm"].as_bool() == Some(true) { db.relocate(&user, now).map(|_| ()) } else { Err("Confirm the retirement".into()) }),
             "buyPerk" => Some(match body["perk"].as_str().and_then(progression::Perk::parse) {
@@ -639,6 +675,8 @@ async fn maps_list() -> Json<serde_json::Value> {
 async fn api_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "google_client_id": state.google_client_id,
+        "pvp": pvp_enabled(),
+        "minPassword": auth::MIN_PASSWORD,
     }))
 }
 
@@ -695,69 +733,6 @@ async fn auth_login(
     }
 }
 
-async fn email_register(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let email = body["email"].as_str().unwrap_or("").trim().to_lowercase();
-    let password = body["password"].as_str().unwrap_or("");
-
-    if email.is_empty() || !email.contains('@') {
-        return Json(serde_json::json!({ "ok": false, "error": "Valid email required" }));
-    }
-    if password.len() < 6 {
-        return Json(serde_json::json!({ "ok": false, "error": "Password must be at least 6 characters" }));
-    }
-
-    match state.db.register_email_user(&email, password) {
-        Ok(user_id) => {
-            let token = match state.db.create_session(&user_id, "direct") {
-                Ok(t) => t,
-                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
-            };
-            Json(serde_json::json!({
-                "ok": true,
-                "token": token,
-                "user_id": user_id,
-                "handle": email,
-                "display_name": email,
-                "verified": state.db.is_verified(&user_id),
-            }))
-        }
-        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
-    }
-}
-
-async fn email_login(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let email = body["email"].as_str().unwrap_or("").trim().to_lowercase();
-    let password = body["password"].as_str().unwrap_or("");
-
-    if email.is_empty() || password.is_empty() {
-        return Json(serde_json::json!({ "ok": false, "error": "Email and password required" }));
-    }
-
-    match state.db.verify_email_login(&email, password) {
-        Ok(user_id) => {
-            let token = match state.db.create_session(&user_id, "direct") {
-                Ok(t) => t,
-                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
-            };
-            Json(serde_json::json!({
-                "ok": true,
-                "token": token,
-                "user_id": user_id,
-                "handle": email,
-                "display_name": email,
-                "verified": state.db.is_verified(&user_id),
-            }))
-        }
-        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
-    }
-}
-
 /// Google OAuth callback — receives auth code, exchanges for user info,
 /// creates/finds user, creates session, returns HTML that messages the opener.
 async fn google_callback(
@@ -791,65 +766,18 @@ async fn google_callback(
     match result {
         Ok(info) => {
             let display_name = if info.name.is_empty() { info.email.clone() } else { info.name.clone() };
-            let user_id = match state.db.find_or_create_user(
-                "google",
-                &info.sub,
-                &info.email,
-                &display_name,
-            ) {
-                Ok(id) => id,
-                Err(e) => {
-                    return Html(format!("<html><body><script>window.close();</script>Error: {}</body></html>", e));
-                }
-            };
-
-            let token = match state.db.create_session(&user_id, "direct") {
-                Ok(t) => t,
-                Err(e) => {
-                    return Html(format!("<html><body><script>window.close();</script>Error: {}</body></html>", e));
-                }
-            };
-
-            // Return HTML that posts the result back to the opener window and closes
-            Html(format!(r#"<!DOCTYPE html>
-<html><body>
-<p>Signed in! This window will close automatically.</p>
-<script>
-if (window.opener) {{
-    window.opener.postMessage({{
-        type: 'google-auth',
-        ok: true,
-        token: '{}',
-        user_id: '{}',
-        handle: '{}',
-        display_name: '{}',
-        verified: true
-    }}, window.location.origin);
-}}
-setTimeout(() => window.close(), 1000);
-</script>
-</body></html>"#,
-                token,
-                user_id,
-                info.email.replace('\'', "\\'"),
-                display_name.replace('\'', "\\'"),
-            ))
+            let db = state.db.clone();
+            let payload = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+                let user_id = db.find_or_create_user("google", &info.sub, &info.email, &display_name)?;
+                let token = db.create_session(&user_id, "direct")?;
+                Ok(serde_json::json!({ "ok": true, "token": token, "user_id": user_id, "handle": info.email, "display_name": display_name, "verified": true }))
+            }).await.unwrap_or_else(|_| Err("Server error".into()));
+            match payload {
+                Ok(p) => Html(auth_popup_html("google-auth", &p)),
+                Err(e) => Html(auth_popup_html("google-auth", &serde_json::json!({ "ok": false, "error": e }))),
+            }
         }
-        Err(e) => {
-            Html(format!(r#"<!DOCTYPE html>
-<html><body>
-<p>Login failed: {}</p>
-<script>
-if (window.opener) {{
-    window.opener.postMessage({{ type: 'google-auth', ok: false, error: '{}' }}, window.location.origin);
-}}
-setTimeout(() => window.close(), 3000);
-</script>
-</body></html>"#,
-                e,
-                e.replace('\'', "\\'"),
-            ))
-        }
+        Err(e) => Html(auth_popup_html("google-auth", &serde_json::json!({ "ok": false, "error": e }))),
     }
 }
 
@@ -860,29 +788,31 @@ async fn auth_me(
 ) -> Json<serde_json::Value> {
     let token = params.get("token").map(|s| s.as_str()).unwrap_or("");
 
-    let user_id = match state.db.validate_session(token) {
-        Some(id) => id,
-        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
+    let (db, t) = (state.db.clone(), token.to_string());
+    let info = tokio::task::spawn_blocking(move || {
+        let user_id = db.validate_session(&t)?;
+        let user = db.get_user(&user_id)?;
+        let handle = db.get_user_handle(&user_id).unwrap_or_default();
+        let linked: Vec<serde_json::Value> = db.linked_accounts(&user_id).into_iter()
+            .map(|(provider, handle)| serde_json::json!({ "provider": provider, "handle": handle })).collect();
+        let unconfirmed = db.unconfirmed_email(&user_id);
+        let email = db.account_email(&user_id).map(|(e, _)| e);
+        Some(serde_json::json!({
+            "ok": true,
+            "user_id": user.id,
+            "display_name": user.display_name,
+            "handle": handle,
+            "verified": unconfirmed.is_none(),
+            "linked": linked,
+            "email": email,
+            "emailUnconfirmed": unconfirmed,
+        }))
+    }).await.ok().flatten();
+    let Some(mut info) = info else {
+        return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" }));
     };
-
-    let user = match state.db.get_user(&user_id) {
-        Some(u) => u,
-        None => return Json(serde_json::json!({ "ok": false, "error": "User not found" })),
-    };
-
-    let handle = state.db.get_user_handle(&user_id).unwrap_or_default();
-    let linked: Vec<serde_json::Value> = state.db.linked_accounts(&user_id).into_iter()
-        .map(|(provider, handle)| serde_json::json!({ "provider": provider, "handle": handle })).collect();
-
-    Json(serde_json::json!({
-        "ok": true,
-        "user_id": user.id,
-        "display_name": user.display_name,
-        "handle": handle,
-        "verified": state.db.is_verified(&user.id),
-        "linked": linked,
-        "matchmaking": session_pool(&state, token).await.map(|m| m.json()),
-    }))
+    info["matchmaking"] = session_pool(&state, token).await.map(|m| m.json()).into();
+    Json(info)
 }
 
 // --- Steam (OpenID 2.0) ---

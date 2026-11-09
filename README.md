@@ -97,6 +97,28 @@ The guides live at `/learn.html` (Learn to Play) and `/about.html`.
 - **Steam** uses OpenID 2.0: `GET /api/auth/steam/start[?link=<session token>]` redirects to Steam, and `/api/auth/steam/callback` checks the one-time nonce and return address, confirms the assertion with Steam (`check_authentication`), then signs in or links. No API key is needed. If `STEAM_API_KEY` is set, the persona name comes from the Web API; otherwise it comes from the public profile. Set `BASE_URL` when the server sits behind a proxy, so the return address matches.
 - **Bluesky** signs in with a handle and app password. `POST /api/auth/login {handle, password, token?}`: with a session token it links Bluesky to that account instead.
 - `GET /api/auth/me?token=` returns the account and its `linked` identities.
+- **Email accounts confirm by link.** Sign-up emails a confirmation link (valid 3 days). Until it is followed the account can use the hideout but can't deploy or host. Accounts that also sign in through Steam, Bluesky or Google skip this. Accounts created before confirmation existed count as confirmed. `POST /api/auth/email/resend {token}` sends a new link.
+- **Password reset.** `POST /api/auth/password/forgot {email}` emails a one-hour link to `/?reset=<token>` and answers the same way whether or not the account exists. `POST /api/auth/password/reset {token, password}` sets the password, signs out every session and signs this one in. Link tokens are stored only as SHA-256 hashes. Passwords need at least 8 characters.
+- **Account deletion.** `POST /api/account/delete {token, confirm: "DELETE"}` removes the account and everything it owns (operators, stash, Homefront, Legacy, friends, linked sign-ins). It is refused while an operator is in a raid.
+- **Matchmaking pools.** Players are matched by the platform they signed in with this session (Steam, Bluesky, or email/Google). Turning on cross-platform play (`POST /api/matchmaking/crossplay {token, enabled}`) moves the account into one shared pool.
+
+## Server settings
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PORT` | `3001` | Public HTTP/WebSocket port. |
+| `BASE_URL` | request host | Public origin (e.g. `https://play.example.com`), used in Steam return addresses and email links. **Set it in production.** |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `MAIL_FROM` | unset | Outgoing email. Port 587 uses STARTTLS, 465 uses TLS. Without `SMTP_HOST`, links are printed to the server log. |
+| `BOXHEAD_MAIL_OUTBOX` | unset | Write emails as JSON files to this folder instead of sending (tests, local development). |
+| `BOXHEAD_TRUST_PROXY` | off | Behind one reverse proxy, read the client IP from the last `X-Forwarded-For` entry (for rate limits). Only enable when the proxy sets that header. |
+| `BOXHEAD_RATE_LIMIT` | on | `off` disables per-IP rate limits (load tests only). |
+| `BOXHEAD_PVP` | off | `1` allows Raidable operators. Off until PvP raids exist. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | unset | Google sign-in. |
+| `STEAM_API_KEY` | unset | Optional: Steam persona names from the Web API. |
+
+Rate limits (per client IP, token buckets): sign-ups 10 then 20/hour, sign-ins 10 then 120/hour (plus 10 then 40/hour per email), reset and confirmation emails 5 then 10/hour, hosting 10 then 120/hour, game joins 30 then 600/hour, other API calls 120 then 20/second. Over the limit the server answers `429` with `Retry-After`.
+
+The database runs in WAL mode (`synchronous=NORMAL`): commits don't wait on a disk flush, and a crash of the process loses nothing; a power cut can lose the last moments. Back up `boxhead.db` with SQLite's online backup (`sqlite3 boxhead.db ".backup backup.db"`), not a file copy, while the server runs.
 
 ## Servers
 

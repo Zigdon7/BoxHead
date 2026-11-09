@@ -10,7 +10,7 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath, resolve } from 'node:path';
 import { createServer } from 'node:net';
@@ -35,6 +35,7 @@ let wsUrl;
 let opsBase;
 let dashBase;
 let deadServer;
+let outbox;
 const extraProcesses = [];
 
 // ---------------------------------------------------------------- helpers
@@ -91,12 +92,34 @@ async function mustCreate(name, opts) {
   return res;
 }
 
-/** A fresh account. By default it also creates a safe operator, since an
+/** Emails the server "sent" to `to` (the e2e server writes mail to an outbox folder). */
+function mailTo(to, dir = outbox) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).map(f => JSON.parse(readFileSync(joinPath(dir, f), 'utf8'))).filter(m => m.to === to);
+}
+
+/** Wait for an email to `to` whose body matches `pattern`; returns the first capture group. */
+async function linkFromMail(to, pattern, dir = outbox) {
+  return waitUntil(() => {
+    for (const m of mailTo(to, dir)) { const hit = m.body.match(pattern); if (hit) return hit[1]; }
+    return null;
+  }, { timeout: 4000, message: `email to ${to}` });
+}
+
+/** Follow the confirmation link emailed to `email`. */
+async function confirmEmail(email) {
+  const token = await linkFromMail(email, /email\/confirm\?token=([0-9a-f]+)/);
+  const res = await fetch(`${base}/api/auth/email/confirm?token=${token}`, { redirect: 'manual' });
+  assert.equal(res.headers.get('location'), '/?email=confirmed');
+}
+
+/** A fresh, email-confirmed account. By default it also creates a safe operator, since an
  *  account can't deploy or trade without one; pass `{ operator: false }` to skip. */
-async function signUp({ operator = true, raidable = false } = {}) {
+async function signUp({ operator = true, raidable = false, confirm = true } = {}) {
   const email = `tester-${randomUUID()}@example.com`;
   const res = await api('/api/auth/email/register', { method: 'POST', body: { email, password: 'hunter22' } });
   assert.equal(res.ok, true, JSON.stringify(res));
+  if (confirm) await confirmEmail(email);
   if (operator) {
     const made = await api('/api/hideout/createOperator', { method: 'POST', body: { token: res.token, name: 'Tester', raidable } });
     assert.equal(made.ok, true, JSON.stringify(made));
@@ -199,6 +222,7 @@ before(async () => {
   assert.ok(existsSync(BIN), `Server binary not found at ${BIN}. Run cargo build in backend/ first.`);
   assert.ok(existsSync(DASH_BIN), `Dashboard binary not found at ${DASH_BIN}. Run cargo build in dashboard/ first.`);
   workDir = mkdtempSync(joinPath(tmpdir(), 'boxhead-e2e-'));
+  outbox = joinPath(workDir, 'outbox');
   const [port, opsPort, dashPort, deadPort] = [await freePort(), await freePort(), await freePort(), await freePort()];
   base = `http://127.0.0.1:${port}`;
   wsUrl = `ws://127.0.0.1:${port}/ws`;
@@ -217,6 +241,10 @@ before(async () => {
       BOXHEAD_SIM_THREADS: String(SIM_THREADS),
       BOXHEAD_PUBLISH_THREADS: String(PUBLISH_THREADS),
       BOXHEAD_MAX_ROOMS: String(MAX_ROOMS),
+      BOXHEAD_MAIL_OUTBOX: outbox,
+      // The suite signs up hundreds of accounts from one address; limits get their own server below.
+      BOXHEAD_RATE_LIMIT: 'off',
+      BOXHEAD_PVP: '1',
     },
     ready: () => listRooms('').then(r => r.ok).catch(() => false),
   });
@@ -364,9 +392,9 @@ describe('server browser API', () => {
 // ---------------------------------------------------------------- auth
 
 describe('accounts', () => {
-  test('register, login and /me all report verified', async () => {
+  test('register, login and /me all report verified once the email is confirmed', async () => {
     const user = await signUp();
-    assert.equal(user.verified, true);
+    assert.equal(user.verified, false, 'register answers before the confirmation');
     const login = await api('/api/auth/email/login', { method: 'POST', body: { email: user.email, password: user.password } });
     assert.equal(login.ok, true);
     assert.equal(login.verified, true);
@@ -377,10 +405,13 @@ describe('accounts', () => {
 
   test('bad credentials and invalid registrations are refused', async () => {
     const user = await signUp();
-    assert.equal((await api('/api/auth/email/login', { method: 'POST', body: { email: user.email, password: 'wrong-pass' } })).ok, false);
-    assert.equal((await api('/api/auth/email/login', { method: 'POST', body: { email: 'nobody@example.com', password: 'whatever' } })).ok, false);
+    const wrongPass = await api('/api/auth/email/login', { method: 'POST', body: { email: user.email, password: 'wrong-pass' } });
+    const noAccount = await api('/api/auth/email/login', { method: 'POST', body: { email: 'nobody@example.com', password: 'whatever' } });
+    assert.equal(wrongPass.ok, false);
+    assert.equal(noAccount.ok, false);
+    assert.equal(wrongPass.error, noAccount.error, 'never reveals which emails have accounts');
     assert.equal((await api('/api/auth/email/register', { method: 'POST', body: { email: user.email, password: 'hunter22' } })).ok, false, 'duplicate');
-    assert.equal((await api('/api/auth/email/register', { method: 'POST', body: { email: 'short@example.com', password: '123' } })).ok, false, 'short password');
+    assert.equal((await api('/api/auth/email/register', { method: 'POST', body: { email: 'short@example.com', password: 'seven77' } })).ok, false, 'short password');
     assert.equal((await api('/api/auth/email/register', { method: 'POST', body: { email: 'not-an-email', password: 'hunter22' } })).ok, false, 'bad email');
     assert.equal((await api('/api/auth/me?token=bogus')).ok, false);
   });
@@ -425,6 +456,66 @@ describe('accounts', () => {
     const user = await signUp();
     const res = await api('/api/auth/login', { method: 'POST', body: { handle: '', password: '', token: user.token } });
     assert.equal(res.ok, false);
+  });
+
+  test('new email accounts confirm by link before they can deploy or host', async () => {
+    const user = await signUp({ confirm: false });
+    assert.equal(user.emailUnconfirmed, user.email);
+    let me = await api(`/api/auth/me?token=${user.token}`);
+    assert.deepEqual([me.verified, me.emailUnconfirmed, me.email], [false, user.email, user.email]);
+    assert.match((await joinRefused({ roomId: 'outskirts', token: user.token })).error, /Confirm your email/);
+    assert.match((await createRoom('Early', { token: user.token })).error, /Confirm your email/);
+    // The hideout works meanwhile.
+    assert.equal((await api(`/api/hideout?token=${user.token}`)).ok, true);
+    // Resending replaces the first link.
+    const first = await linkFromMail(user.email, /token=([0-9a-f]+)/);
+    const resent = await api('/api/auth/email/resend', { method: 'POST', body: { token: user.token } });
+    assert.deepEqual([resent.ok, resent.sentTo], [true, user.email]);
+    await waitUntil(() => mailTo(user.email).length === 2, { message: 'second email' });
+    const stale = await fetch(`${base}/api/auth/email/confirm?token=${first}`, { redirect: 'manual' });
+    assert.equal(stale.headers.get('location'), '/?email=expired');
+    const second = mailTo(user.email).map(m => m.body.match(/token=([0-9a-f]+)/)[1]).find(t => t !== first);
+    const ok = await fetch(`${base}/api/auth/email/confirm?token=${second}`, { redirect: 'manual' });
+    assert.equal(ok.headers.get('location'), '/?email=confirmed');
+    me = await api(`/api/auth/me?token=${user.token}`);
+    assert.deepEqual([me.verified, me.emailUnconfirmed], [true, null]);
+    const c = await joinOk({ roomId: 'outskirts', token: user.token });
+    await c.close();
+    assert.equal((await api('/api/auth/email/resend', { method: 'POST', body: { token: user.token } })).alreadyConfirmed, true);
+  });
+
+  test('password reset by emailed link signs out other devices', async () => {
+    const user = await signUp({ operator: false });
+    const unknown = await api('/api/auth/password/forgot', { method: 'POST', body: { email: 'ghost@example.com' } });
+    const known = await api('/api/auth/password/forgot', { method: 'POST', body: { email: user.email.toUpperCase() } });
+    assert.equal(unknown.message, known.message, 'same answer whether or not the account exists');
+    assert.equal(mailTo('ghost@example.com').length, 0);
+    const token = await linkFromMail(user.email, /\?reset=([0-9a-f]+)/);
+    assert.equal((await api('/api/auth/password/reset', { method: 'POST', body: { token, password: 'short' } })).ok, false);
+    const reset = await api('/api/auth/password/reset', { method: 'POST', body: { token, password: 'fresh-pass-1' } });
+    assert.equal(reset.ok, true, JSON.stringify(reset));
+    assert.ok(reset.token && reset.token !== user.token);
+    assert.equal((await api(`/api/auth/me?token=${user.token}`)).ok, false, 'old session signed out');
+    assert.equal((await api(`/api/auth/me?token=${reset.token}`)).ok, true);
+    assert.equal((await api('/api/auth/email/login', { method: 'POST', body: { email: user.email, password: 'hunter22' } })).ok, false);
+    assert.equal((await api('/api/auth/email/login', { method: 'POST', body: { email: user.email, password: 'fresh-pass-1' } })).ok, true);
+    assert.match((await api('/api/auth/password/reset', { method: 'POST', body: { token, password: 'another-pass' } })).error, /expired or was already used/);
+  });
+
+  test('deleting an account removes it for good', async () => {
+    const user = await signUp();
+    assert.match((await api('/api/account/delete', { method: 'POST', body: { token: user.token } })).error, /DELETE/);
+    const c = await joinOk({ roomId: 'outskirts', token: user.token });
+    assert.match((await api('/api/account/delete', { method: 'POST', body: { token: user.token, confirm: 'DELETE' } })).error, /in a raid/);
+    await c.close();
+    await waitUntil(async () => !(await api(`/api/hideout?token=${user.token}`)).inRaid, { message: 'raid to end' });
+    assert.equal((await api('/api/account/delete', { method: 'POST', body: { token: user.token, confirm: 'DELETE' } })).ok, true);
+    assert.equal((await api(`/api/auth/me?token=${user.token}`)).ok, false);
+    assert.equal((await api('/api/auth/email/login', { method: 'POST', body: { email: user.email, password: user.password } })).ok, false);
+    // The email can sign up again, as a brand-new account.
+    const again = await api('/api/auth/email/register', { method: 'POST', body: { email: user.email, password: 'hunter22' } });
+    assert.equal(again.ok, true);
+    assert.notEqual(again.user_id, user.user_id);
   });
 
   test('email is case-insensitive', async () => {
@@ -967,6 +1058,63 @@ describe('ops API (internal, for the dashboard)', () => {
     await waitUntil(() => fetch(`http://127.0.0.1:${port}/api/rooms`).then(r => r.ok).catch(() => false), { message: 'second server' });
     await assert.rejects(fetch(`http://127.0.0.1:${opsPort}/ops/v1/status`), 'ops port must be closed');
     child.kill();
+  });
+});
+
+// ---------------------------------------------------------------- production defaults
+
+describe('production defaults (rate limits on, PvP off)', () => {
+  let prod;
+  let prodBase;
+  let prodOutbox;
+  before(async () => {
+    const dir = mkdtempSync(joinPath(tmpdir(), 'boxhead-e2e-prod-'));
+    prodOutbox = joinPath(dir, 'outbox');
+    const port = await freePort();
+    prodBase = `http://127.0.0.1:${port}`;
+    prod = await launch(BIN, {
+      cwd: dir,
+      env: { PORT: String(port), STATIC_DIR: joinPath(ROOT, 'frontend', 'dist'), BOXHEAD_MAIL_OUTBOX: prodOutbox,
+        BOXHEAD_RATE_LIMIT: '', BOXHEAD_PVP: '', BOXHEAD_OPS_TOKEN: '' },
+      ready: () => fetch(`${prodBase}/api/config`).then(r => r.ok).catch(() => false),
+    });
+    extraProcesses.push(prod);
+  });
+  const post = (path, body) => fetch(prodBase + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  test('new operators are Safe until PvP ships', async () => {
+    assert.equal((await (await fetch(`${prodBase}/api/config`)).json()).pvp, false);
+    const reg = await (await post('/api/auth/email/register', { email: `pvp-${randomUUID()}@example.com`, password: 'hunter22' })).json();
+    assert.equal(reg.ok, true, JSON.stringify(reg));
+    const raid = await (await post('/api/hideout/createOperator', { token: reg.token, name: 'Wolf', raidable: true })).json();
+    assert.equal(raid.ok, false);
+    assert.match(raid.error, /arrive with PvP/);
+    assert.equal(raid.pvpEnabled, false);
+    const safe = await (await post('/api/hideout/createOperator', { token: reg.token, name: 'Lamb', raidable: false })).json();
+    assert.equal(safe.ok, true, JSON.stringify(safe));
+  });
+
+  test('sign-ups from one address are rate limited', async () => {
+    const statuses = [];
+    for (let i = 0; i < 12; i++) {
+      const res = await post('/api/auth/email/register', { email: `flood-${i}-${randomUUID()}@example.com`, password: 'hunter22' });
+      statuses.push(res.status);
+      if (res.status === 429) {
+        assert.ok(Number(res.headers.get('retry-after')) > 0);
+        const body = await res.json();
+        assert.deepEqual([body.ok, body.rateLimited], [false, true]);
+        assert.match(body.error, /Too many attempts/);
+      }
+    }
+    const firstLimited = statuses.indexOf(429);
+    assert.ok(firstLimited > 0 && firstLimited <= 10, statuses.join());
+    assert.ok(statuses.slice(0, firstLimited).every(s => s === 200) && statuses.slice(firstLimited).every(s => s === 429), statuses.join());
+  });
+
+  test('password guessing against one email is rate limited', async () => {
+    const statuses = [];
+    for (let i = 0; i < 11; i++) statuses.push((await post('/api/auth/email/login', { email: 'victim@example.com', password: `guess-${i}` })).status);
+    assert.deepEqual([statuses[0], statuses.at(-1)], [200, 429]);
   });
 });
 
