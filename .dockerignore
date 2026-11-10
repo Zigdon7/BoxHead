@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+**/node_modules
+**/target
+**/dist
+**/*.db
+**/*.db-wal
+**/*.db-shm
+# The toolchain files pin the Windows development toolchain; the image uses its own.
+**/rust-toolchain.toml
+backups
+tests
+docs
+README.md

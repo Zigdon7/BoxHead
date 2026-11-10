@@ -1,0 +1,7 @@
+# Used by the "caddy" profile in compose.yaml: HTTPS for DOMAIN with an
+# automatic Let's Encrypt certificate, in front of the game server.
+# Needs ports 80 and 443 forwarded from your router to this machine.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy game:3001
+}

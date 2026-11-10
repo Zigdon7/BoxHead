@@ -681,6 +681,32 @@ describe('hideout: operators, Homefront and Legacy', () => {
     await c.close();
   });
 
+  test('an operator can be deleted to free its slot, but not mid-raid', async () => {
+    const { token } = await signUp();
+    let h = await hideoutAct('createOperator', { token, name: 'Spare', raidable: false });
+    assert.equal(h.operators.length, 2);
+    const spare = h.operators.find(o => o.name === 'Spare').id;
+    assert.match((await hideoutAct('deleteOperator', { token, operatorId: spare })).error, /Confirm/);
+    const c = await joinOk({ roomId: 'outskirts', token });
+    assert.match((await hideoutAct('deleteOperator', { token, operatorId: spare, confirm: true })).error, /in a raid/);
+    assert.match((await hideoutAct('createOperator', { token, name: 'Third', raidable: false })).error, /Finish your raid/);
+    await c.close();
+    await waitUntil(async () => !(await hideout(token)).inRaid, { message: 'raid to be voided' });
+    h = await hideoutAct('deleteOperator', { token, operatorId: spare, confirm: true });
+    assert.equal(h.ok, true, JSON.stringify(h));
+    assert.deepEqual(h.operators.map(o => o.name), ['Tester']);
+    assert.equal(h.name, 'Tester', 'the remaining operator is active');
+    h = await hideoutAct('deleteOperator', { token, operatorId: h.operators[0].id, confirm: true });
+    assert.equal(h.needsOperator, true, 'deleting the last operator leaves the create screen');
+  });
+
+  test('a safe operator is never offered a facility level it cannot build', async () => {
+    const { token } = await signUp();
+    const h = await hideout(token);
+    assert.equal(h.homefront.maxTier, 3);
+    for (const f of h.homefront.facilities) assert.equal(f.next.level <= h.homefront.maxTier, true, f.id);
+  });
+
   test('facilities follow the tier, and relocation and perks wait for their time', async () => {
     const { token } = await signUp();
     let h = await hideoutAct('upgradeFacility', { token, facility: 'storage' });
@@ -817,6 +843,17 @@ describe('hideout: stash, trader and loadout', () => {
     const after = await waitUntil(async () => { const h = await hideout(token); return h.inRaid ? null : h; }, { message: 'raid to be voided' });
     assert.equal(after.deaths, 0);
     assert.equal(after.gearScore, 3, 'the starter kit is still equipped');
+  });
+
+  test('insurance bought for a raid that was never played is paid back', async () => {
+    const { token } = await signUp();
+    const before = await hideout(token);
+    assert.equal(before.insuranceCost > 0, true);
+    const c = await joinOk({ roomId: 'outskirts', token, insure: true });
+    assert.equal((await hideout(token)).cash, before.cash - before.insuranceCost);
+    await c.close();
+    const after = await waitUntil(async () => { const h = await hideout(token); return h.inRaid ? null : h; }, { message: 'raid to be voided' });
+    assert.equal(after.cash, before.cash);
   });
 
   test('insurance brings the loadout back after a lost raid', async () => {

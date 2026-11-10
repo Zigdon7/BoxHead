@@ -1,0 +1,102 @@
+# BoxHead on one machine: game server, ops dashboard and database backups.
+# Settings come from .env (copy .env.example). Full walkthrough: docs/HOSTING.md
+#
+#   docker compose up -d --build                      game + dashboard + backups
+#   docker compose --profile tunnel up -d --build     ...plus a Cloudflare Tunnel
+#   docker compose --profile caddy up -d --build      ...plus Caddy (HTTPS, port forward)
+
+name: boxhead
+
+services:
+  game:
+    build: .
+    image: boxhead:local
+    restart: unless-stopped
+    environment:
+      BASE_URL: ${BASE_URL:?Set BASE_URL in .env, for example https://play.example.com}
+      BOXHEAD_OPS_TOKEN: ${BOXHEAD_OPS_TOKEN:?Set BOXHEAD_OPS_TOKEN in .env (openssl rand -hex 24)}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      STEAM_API_KEY: ${STEAM_API_KEY:-}
+      BOXHEAD_SIM_THREADS: ${BOXHEAD_SIM_THREADS:-}
+      BOXHEAD_MAX_ROOMS: ${BOXHEAD_MAX_ROOMS:-}
+      BOXHEAD_PVP: ${BOXHEAD_PVP:-}
+      BOXHEAD_DB: /data/boxhead.db
+      # Every public request arrives through the tunnel or Caddy, which report the real client address.
+      BOXHEAD_TRUST_PROXY: "1"
+      # The ops API is reachable only by the dashboard, inside this compose network.
+      BOXHEAD_OPS_ADDR: 0.0.0.0:3901
+    volumes:
+      - boxhead-data:/data
+    ports:
+      # For testing from this machine or your LAN. Players come in through the tunnel or Caddy.
+      - "${GAME_BIND:-127.0.0.1}:${GAME_PORT:-3001}:3001"
+    stop_grace_period: 10s
+
+  dashboard:
+    image: boxhead:local
+    restart: unless-stopped
+    depends_on: [game]
+    command: boxhead-dashboard
+    environment:
+      BOXHEAD_OPS_TOKEN: ${BOXHEAD_OPS_TOKEN:?Set BOXHEAD_OPS_TOKEN in .env}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?Set DASHBOARD_PASSWORD in .env}
+      GAME_SERVERS: http://game:3901
+      DASHBOARD_ADDR: 0.0.0.0:3900
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-3900}:3900"
+    healthcheck:
+      disable: true
+
+  backup:
+    image: boxhead:local
+    restart: unless-stopped
+    depends_on: [game]
+    command: boxhead-backup
+    environment:
+      BOXHEAD_DB: /data/boxhead.db
+      BACKUP_EVERY_HOURS: ${BACKUP_EVERY_HOURS:-6}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - boxhead-data:/data
+      - ${BACKUP_DIR:-boxhead-backups}:/backups
+    healthcheck:
+      disable: true
+
+  # Option A: Cloudflare Tunnel. No open ports, and your home address stays private.
+  tunnel:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on: [game]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+
+  # Option B: Caddy with an automatic HTTPS certificate. Needs ports 80 and 443 forwarded.
+  caddy:
+    profiles: [caddy]
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [game]
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  boxhead-data:
+  boxhead-backups:
+  caddy-data:
+  caddy-config:

@@ -247,6 +247,8 @@ impl Database {
             "account TEXT", "name TEXT NOT NULL DEFAULT 'Operator 1'", "raidable INTEGER NOT NULL DEFAULT 0",
             "created_at INTEGER NOT NULL DEFAULT 0", "tier INTEGER NOT NULL DEFAULT 1",
             "produced_at INTEGER NOT NULL DEFAULT 0", "raid_map TEXT",
+            // What the current raid cost, so a voided raid can pay it back.
+            "raid_fee INTEGER NOT NULL DEFAULT 0", "raid_premium INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE operators ADD COLUMN {column}"), []);
         }
@@ -531,8 +533,8 @@ impl Database {
                 format!("This map's entry fee is ${fee}. You have ${}.", op.cash)
             });
         }
-        tx.execute("UPDATE operators SET in_raid = ?1, cash = cash - ?3, insured = ?4, raid_map = ?5 WHERE profile = ?2",
-            params![room_id, profile, fee + premium, (premium > 0) as i32, map.map(|m| m.id)]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE operators SET in_raid = ?1, cash = cash - ?3, insured = ?4, raid_map = ?5, raid_fee = ?6, raid_premium = ?7 WHERE profile = ?2",
+            params![room_id, profile, fee + premium, (premium > 0) as i32, map.map(|m| m.id), fee, premium]).map_err(|e| e.to_string())?;
         // Sealed items marked to come along go into the pack, as many as fit.
         let room = loadout.pack.as_ref().map_or(gear::NO_PACK_CAPACITY, |p| gear::pack_capacity(p.power));
         tx.execute("UPDATE items SET carry = 2 WHERE id IN (SELECT id FROM items WHERE profile = ?1 AND carry = 1 AND slot IS NULL LIMIT ?2)",
@@ -605,26 +607,34 @@ impl Database {
                 ranked_up: prog::ops_rank(xp) > prog::ops_rank(old_xp), next: prog::ops_next(xp),
             });
         }
-        tx.execute("UPDATE operators SET raids = raids + 1, in_raid = NULL, insured = 0, raid_map = NULL WHERE profile = ?1", params![profile]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE operators SET raids = raids + 1, in_raid = NULL, insured = 0, raid_map = NULL, raid_fee = 0, raid_premium = 0 WHERE profile = ?1", params![profile]).map_err(|e| e.to_string())?;
         settlement.cash = Self::cash_of(&tx, profile)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(settlement)
     }
 
     /// Void one raid that never really started (the player dropped before
-    /// playing): the loadout stays, and the entry fee is refunded.
-    pub fn void_raid(&self, profile: &str, room_id: &str, refund: u32) -> bool {
+    /// playing): the loadout stays and the insurance premium comes back, since
+    /// it insured nothing. The entry fee comes back only if `refund_fee`.
+    pub fn void_raid(&self, profile: &str, room_id: &str, refund_fee: bool) -> bool {
         let conn = self.conn.lock().unwrap();
-        let voided = conn.execute("UPDATE operators SET in_raid = NULL, insured = 0, cash = cash + ?3 WHERE profile = ?1 AND in_raid = ?2", params![profile, room_id, refund]).map(|n| n > 0).unwrap_or(false);
+        let voided = conn.execute(
+            "UPDATE operators SET cash = cash + raid_premium + CASE WHEN ?3 THEN raid_fee ELSE 0 END,
+                in_raid = NULL, insured = 0, raid_map = NULL, raid_fee = 0, raid_premium = 0
+             WHERE profile = ?1 AND in_raid = ?2", params![profile, room_id, refund_fee]).map(|n| n > 0).unwrap_or(false);
         if voided { let _ = conn.execute("UPDATE items SET carry = 1 WHERE profile = ?1 AND carry = 2", params![profile]); }
         voided
     }
 
-    /// Raids interrupted by a server restart are voided: gear goes back to the stash.
+    /// Raids interrupted by a server restart are voided: gear goes back to the
+    /// stash, and the entry fee and insurance premium are paid back.
     pub fn void_stale_raids(&self) -> usize {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("UPDATE items SET carry = 1 WHERE carry = 2", []);
-        conn.execute("UPDATE operators SET in_raid = NULL WHERE in_raid IS NOT NULL", []).unwrap_or(0)
+        conn.execute(
+            "UPDATE operators SET cash = cash + raid_fee + raid_premium,
+                in_raid = NULL, insured = 0, raid_map = NULL, raid_fee = 0, raid_premium = 0
+             WHERE in_raid IS NOT NULL", []).unwrap_or(0)
     }
 
     /// Stash identity: the signed-in account's active operator. There is no
@@ -729,8 +739,12 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let count = Self::account_operator_ids(&tx, user).len();
         if count >= prog::MAX_OPERATORS {
-            return Err(format!("An account can have {} operators. Retire one to make room.", prog::MAX_OPERATORS));
+            return Err(format!("An account can have {} operators. Retire or delete one to make room.", prog::MAX_OPERATORS));
         }
+        // The new operator becomes the active one, which can't change mid-raid.
+        let deployed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operators WHERE account = ?1 AND in_raid IS NOT NULL)", params![user], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if deployed { return Err("Finish your raid before creating another operator.".into()); }
         let name = prog::clean_operator_name(name, count + 1)?;
         let profile = format!("op:{}", uuid::Uuid::new_v4());
         tx.execute("INSERT INTO operators (profile, cash, account, name, raidable, created_at, produced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
@@ -754,6 +768,22 @@ impl Database {
         if let Some(current) = Self::active_in(&tx, user) { Self::not_in_raid(&tx, &current)?; }
         Self::set_active_in(&tx, user, profile)?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Delete one operator and everything it owns, for nothing in return (unlike
+    /// retiring). Frees its slot. Returns the operator's name.
+    pub fn delete_operator(&self, user: &str, profile: &str) -> Result<String, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        if !Self::account_operator_ids(&tx, user).iter().any(|id| id == profile) { return Err("That operator isn't on your account".into()); }
+        Self::not_in_raid(&tx, profile).map_err(|_| "That operator is in a raid. Finish it first.".to_string())?;
+        let name: String = tx.query_row("SELECT name FROM operators WHERE profile = ?1", params![profile], |r| r.get(0)).map_err(|e| e.to_string())?;
+        for table in ["items", "facilities", "operations", "operators"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE profile = ?1"), params![profile]).map_err(|e| e.to_string())?;
+        }
+        tx.execute("UPDATE accounts SET active_operator = NULL WHERE user_id = ?1 AND active_operator = ?2", params![user, profile]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(name)
     }
 
     /// Raise the Homefront one tier, paying cash and valuables from the stash.
@@ -889,9 +919,13 @@ impl Database {
         let next = prog::next_season(now);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        // Re-check inside the transaction: a raid may have started since.
+        // Re-check inside the transaction: a raid may have started since, or a
+        // second request may have retired an operator a moment ago.
         Self::not_in_raid(&tx, &profile)?;
+        if Self::active_in(&tx, user).as_deref() != Some(profile.as_str()) { return Err("Your active operator changed. Try again.".into()); }
         tx.execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (?1)", params![user]).map_err(|e| e.to_string())?;
+        let last: Option<String> = tx.query_row("SELECT last_relocation FROM accounts WHERE user_id = ?1", params![user], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if last.as_deref() == Some(season.id.as_str()) { return Err("Your account already retired an operator this season.".into()); }
         tx.execute(
             "UPDATE accounts SET legacy_earned = legacy_earned + ?2, stash_bonus = stash_bonus + ?3, relocations = relocations + 1,
                 last_relocation = ?4, boost_level = ?5, boost_season = ?6, active_operator = NULL WHERE user_id = ?1",
@@ -908,11 +942,13 @@ impl Database {
 
     /// Spend a Legacy point on a perk rank. Perks apply to every operator.
     pub fn buy_perk(&self, user: &str, perk: Perk) -> Result<u32, String> {
-        let st = self.account_state(user);
-        if st.legacy_available == 0 { return Err("No Legacy points to spend. Retire an operator to earn them.".into()); }
-        let rank = st.perks.get(perk) + 1;
-        if rank > prog::PERK_MAX_RANK { return Err(format!("{} is already at rank {}.", perk.label(), prog::PERK_MAX_RANK)); }
+        // One lock for the check and the write, so two requests can't spend the same point.
         let conn = self.conn.lock().unwrap();
+        let earned: u32 = conn.query_row("SELECT legacy_earned FROM accounts WHERE user_id = ?1", params![user], |r| r.get(0)).unwrap_or(0);
+        let perks = Self::perks_in(&conn, user);
+        if earned <= perks.spent() { return Err("No Legacy points to spend. Retire an operator to earn them.".into()); }
+        let rank = perks.get(perk) + 1;
+        if rank > prog::PERK_MAX_RANK { return Err(format!("{} is already at level {}.", perk.label(), prog::PERK_MAX_RANK)); }
         conn.execute("INSERT INTO account_perks (user_id, perk, rank) VALUES (?1, ?2, ?3) ON CONFLICT(user_id, perk) DO UPDATE SET rank = ?3",
             params![user, perk.as_str(), rank]).map_err(|e| e.to_string())?;
         Ok(rank)
@@ -1294,6 +1330,11 @@ impl Database {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Whether the database answers a trivial query.
+    pub fn ping(&self) -> bool {
+        self.conn.lock().unwrap().query_row("SELECT 1", [], |r| r.get::<_, i32>(0)).is_ok()
+    }
+
     /// Clean up expired sessions.
     pub fn delete_expired_sessions(&self) {
         let conn = self.conn.lock().unwrap();
@@ -1364,8 +1405,8 @@ mod stash_tests {
         db.ensure_operator("p").unwrap();
         db.begin_raid_paying("p", "r1", 0, 150, false).unwrap();
         assert_eq!(db.operator("p").unwrap().cash, gear::STARTING_CASH - 150);
-        assert!(!db.void_raid("p", "other", 150), "only the raid you're in");
-        assert!(db.void_raid("p", "r1", 150));
+        assert!(!db.void_raid("p", "other", true), "only the raid you're in");
+        assert!(db.void_raid("p", "r1", true));
         let op = db.operator("p").unwrap();
         assert_eq!(op.cash, gear::STARTING_CASH);
         assert!(op.in_raid.is_none());
@@ -1449,6 +1490,18 @@ mod stash_tests {
             let op = db.operator("p").unwrap();
             assert!(op.in_raid.is_none());
             assert_eq!(op.items.len(), 3, "a voided raid keeps the loadout");
+            // A restart is the server's fault: the fee and the premium come back too.
+            db.begin_raid_paying("p", "rustyard", 0, 150, true).unwrap();
+            assert!(db.operator("p").unwrap().cash < gear::STARTING_CASH - 150);
+        }
+        {
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            assert_eq!(db.void_stale_raids(), 1);
+            assert_eq!(db.operator("p").unwrap().cash, gear::STARTING_CASH);
+            assert_eq!(db.void_stale_raids(), 0);
+            // Insurance from the voided raid doesn't leak into the next one.
+            db.begin_raid("p", "r", 0).unwrap();
+            assert!(!db.finish_raid("p", &outcome(RaidResult::Killed, vec![], 0)).unwrap().insured);
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -1692,7 +1745,7 @@ mod stash_tests {
         let id = db.operator("p").unwrap().items.into_iter().find(|s| s.item.kind == ItemKind::Encrypted).unwrap().item.id;
         db.set_carry("p", &id, true).unwrap();
         db.begin_raid("p", "r", 0).unwrap();
-        assert!(db.void_raid("p", "r", 0));
+        assert!(db.void_raid("p", "r", false));
         assert!(db.operator("p").unwrap().items.iter().any(|s| s.item.id == id && s.carry));
         // Dying loses them.
         db.begin_raid("p", "r", 0).unwrap();
@@ -1790,7 +1843,7 @@ mod stash_tests {
         let op = db.create_operator(&user, "Ghost", false, 0).unwrap();
         db.deploy(&op, "outskirts-direct", crate::gear::default_map(), false).unwrap();
         assert!(db.delete_account(&user).unwrap_err().contains("in a raid"));
-        assert!(db.void_raid(&op, "outskirts-direct", 0));
+        assert!(db.void_raid(&op, "outskirts-direct", false));
         db.delete_account(&user).unwrap();
         assert_eq!(db.validate_session(&session), None);
         assert!(db.get_user(&user).is_none() && db.operator(&op).is_none());
@@ -1818,5 +1871,41 @@ mod stash_tests {
         assert!(!db.session_matchmaking(&steam).unwrap().2);
         assert_eq!(db.session_matchmaking("bogus"), None);
         assert_eq!(db.session_matchmaking(""), None);
+    }
+
+    #[test]
+    fn a_never_played_raid_returns_the_premium_but_keeps_the_fee() {
+        let db = Database::open(":memory:").unwrap();
+        db.ensure_operator("p").unwrap();
+        let premium = gear::insurance_cost(&db.operator("p").unwrap().loadout());
+        db.begin_raid_paying("p", "r", 0, 100, true).unwrap();
+        assert_eq!(db.operator("p").unwrap().cash, gear::STARTING_CASH - 100 - premium);
+        assert!(db.void_raid("p", "r", false));
+        assert_eq!(db.operator("p").unwrap().cash, gear::STARTING_CASH - 100, "the premium insured nothing, so it comes back");
+        assert!(!db.void_raid("p", "r", true), "a raid is voided once");
+    }
+
+    #[test]
+    fn operators_can_be_deleted_but_not_mid_raid_or_by_someone_else() {
+        let db = Database::open(":memory:").unwrap();
+        let (user, other) = (account(&db), account(&db));
+        let a = db.create_operator(&user, "Alpha", false, 0).unwrap();
+        let b = db.create_operator(&user, "Bravo", false, 0).unwrap();
+        db.upgrade_facility(&b, Facility::Storage, 0).unwrap();
+        assert!(db.delete_operator(&other, &a).is_err(), "not your operator");
+        db.begin_raid(&b, "r", 0).unwrap();
+        assert!(db.delete_operator(&user, &b).unwrap_err().contains("in a raid"));
+        assert!(db.create_operator(&user, "Charlie", false, 0).unwrap_err().contains("Finish your raid"));
+        assert!(db.void_raid(&b, "r", true));
+        assert_eq!(db.delete_operator(&user, &b).unwrap(), "Bravo");
+        assert!(db.operator(&b).is_none());
+        assert_eq!(db.active_operator(&user).as_deref(), Some(a.as_str()), "the remaining operator takes over");
+        assert_eq!(db.delete_operator(&user, &a).unwrap(), "Alpha");
+        assert!(db.active_operator(&user).is_none());
+        let conn = db.conn.lock().unwrap();
+        for table in ["items", "facilities", "operations", "operators"] {
+            let n: u32 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{table} is empty");
+        }
     }
 }

@@ -217,6 +217,7 @@ export class HideoutView {
       } else if (action === 'sell' || action === 'sellMany') this.note(`Sold for ${money(before?.cash !== undefined ? data.cash - before.cash : 0)}.`);
       else if (action === 'carry') this.note(body.carry ? 'Packed: it starts your next raid in your pack. Decrypt it at an uplink, then extract.' : 'Unpacked: it stays in your stash.');
       else if (action === 'equip') this.note('Equipped.');
+      else if (action === 'deleteOperator') this.note('Operator deleted.');
       else if (action === 'createOperator') { this.newName = ''; this.newRaidable = null; this.creating = false; this.tab = 'stash'; this.render(); this.note(`${data.name} reporting in. Starter kit and $${data.cash} are in the stash.`); }
       else if (action === 'switchOperator') this.note(`Now playing ${data.name}.`);
       else if (action === 'upgradeTier') this.note(`Homefront raised to tier ${data.homefront?.tier}.`);
@@ -315,7 +316,7 @@ export class HideoutView {
     const pips = el('div', 'tier-pips');
     for (let t = 1; t <= hf.topTier; t++) {
       const pip = el('span', `tier-pip${t <= hf.tier ? ' on' : ''}${t > hf.maxTier ? ' locked' : ''}`);
-      pip.title = t > hf.maxTier ? `Tier ${t}: raidable operators only` : `Tier ${t}`;
+      pip.title = t <= hf.maxTier ? `Tier ${t}` : h.pvpEnabled === false ? `Tier ${t}: arrives with PvP` : `Tier ${t}: Raidable operators only`;
       pips.append(pip);
     }
     titleGroup.append(pips);
@@ -359,7 +360,9 @@ export class HideoutView {
         parts.push(el('p', 'hf-sub', `Uses your cheapest qualifying valuables: ${names}.`));
       }
     } else if (hf.tier < hf.topTier) {
-      parts.push(el('p', 'hf-sub', `Tier ${hf.safeTier} is the top tier for a Safe operator: its Homefront can't be raided, so it can't build higher.`));
+      parts.push(el('p', 'hf-sub', h.pvpEnabled === false
+        ? `Tier ${hf.safeTier} is the top tier for now. Tier ${hf.topTier} arrives with PvP in a later season.`
+        : `Tier ${hf.safeTier} is the top tier for a Safe operator: its Homefront can't be raided, so it can't build higher.`));
     } else {
       parts.push(el('p', 'hf-sub', 'Your Homefront is at its top tier.'));
     }
@@ -372,7 +375,8 @@ export class HideoutView {
       tile.append(this.deps.icon(FACILITY_ICON[f.id] ?? 'i-crate'));
       const nameBox = el('div', 'fac-title');
       const lvl = el('div', 'fac-level-row');
-      lvl.append(segMeter(f.level, hf.topTier, `Level ${f.level} of ${hf.topTier}`, f.maxLevel), el('span', 'fac-level num', `${f.level}/${hf.topTier}`));
+      // Count to the highest level this operator can ever build, not one it can't reach.
+      lvl.append(segMeter(f.level, hf.maxTier, `Level ${f.level} of ${hf.maxTier}`, f.maxLevel), el('span', 'fac-level num', `${f.level}/${hf.maxTier}`));
       nameBox.append(el('span', 'fac-name', f.name), lvl);
       top.append(tile, nameBox);
       card.append(top, el('p', 'fac-what', FACILITY_WHAT[f.id]));
@@ -496,6 +500,12 @@ export class HideoutView {
         btn.addEventListener('click', () => void this.act('switchOperator', { operatorId: o.id }));
         row.append(btn);
       }
+      if (!o.inRaid && !h.inRaid) {
+        const del = confirmButton('link link--muted op-delete', 'Delete', `Click again: ${o.name} and everything they own is gone for good`,
+          () => void this.act('deleteOperator', { operatorId: o.id, confirm: true }));
+        del.title = `Delete ${o.name} to free the slot. Nothing is kept and no Legacy is earned.`;
+        row.append(del);
+      }
       return row;
     }));
 
@@ -512,7 +522,7 @@ export class HideoutView {
     const box = this.q('opCreate');
     box.classList.toggle('hf-card', !!h.needsOperator || this.creating);
     if (count >= (h.maxOperators ?? 3)) {
-      box.replaceChildren(el('p', 'hf-sub', `You have ${count} operators, the most an account can hold. Retire one at the end of a season to make room.`));
+      box.replaceChildren(el('p', 'hf-sub', `You have ${count} operators, the most an account can hold. Retire one at the end of a season, or delete one, to make room.`));
       return;
     }
     if (!h.needsOperator && !this.creating) {

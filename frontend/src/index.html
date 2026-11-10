@@ -1214,6 +1214,9 @@
     .op-info { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
     .op-row-name { font-size: 22px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; flex-wrap: wrap; }
     .op-row.active { border-color: var(--you); box-shadow: inset 3px 0 0 var(--you); }
+    .op-row > .op-delete { grid-column: 1 / -1; justify-self: end; font-size: 12px; color: var(--text-secondary); }
+    #opRelocate .btn { white-space: normal; height: auto; min-height: 44px; line-height: 1.25; padding-block: 10px; }
+    .op-row > .op-delete.armed { color: var(--danger-text); font-weight: 700; }
     .readouts { display: flex; flex-wrap: wrap; gap: 6px; }
     .readout { display: inline-flex; align-items: baseline; gap: 8px; padding: 3px 10px; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--border); }
     .readout-label { font-family: var(--font-display); font-size: 12px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); }

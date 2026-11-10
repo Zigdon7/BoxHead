@@ -59,8 +59,9 @@ fn pvp_enabled() -> bool {
 
 #[tokio::main]
 async fn main() {
-    let db = Arc::new(Database::open("boxhead.db")
-        .expect("Failed to open database"));
+    let db_path = std::env::var("BOXHEAD_DB").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "boxhead.db".to_string());
+    let db = Arc::new(Database::open(&db_path)
+        .unwrap_or_else(|e| panic!("Failed to open database {db_path}: {e}")));
     // A raid interrupted by a restart is voided: everyone gets their loadout back.
     let voided = db.void_stale_raids();
     if voided > 0 { println!("Voided {voided} raid(s) interrupted by the last shutdown"); }
@@ -93,6 +94,10 @@ async fn main() {
         limiter: Arc::new(ratelimit::RateLimiter::from_env()),
         mailer: mail::Mailer::from_env(),
     });
+    match std::env::var("BASE_URL") {
+        Ok(base) => println!("Public address: {}", base.trim_end_matches('/')),
+        Err(_) => println!("WARNING: BASE_URL is not set, so email and Steam links follow each request's Host header. Set it before letting the public in."),
+    }
     if !pvp_enabled() { println!("PvP is off: new operators are Safe (set BOXHEAD_PVP=1 to allow Raidable)"); }
 
     // Periodic cleanup: expired sessions, refilled rate-limit buckets.
@@ -131,6 +136,7 @@ async fn main() {
         .route("/api/auth/steam/start", get(steam_start))
         .route("/api/auth/steam/callback", get(steam_callback))
         .route("/api/config", get(api_config))
+        .route("/healthz", get(healthz))
         .route("/api/friends", get(friends_list))
         .route("/api/friends/add", post(friends_add))
         .route("/api/friends/remove", post(friends_remove))
@@ -347,10 +353,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             rooms::settle_with_retry(state.db.clone(), profile, room.id.clone(), outcome).await;
         }
         Some(rooms::Departure::NeverPlayed(profile)) => {
-            // Your gear is safe, but the entry fee isn't refunded: the snapshot you
-            // received already showed the whole raid.
+            // Your gear is safe and unused insurance is paid back, but the entry fee
+            // isn't refunded: the snapshot you received already showed the whole raid.
             let (db, room_id) = (state.db.clone(), room.id.clone());
-            let _ = tokio::task::spawn_blocking(move || db.void_raid(&profile, &room_id, 0)).await;
+            let _ = tokio::task::spawn_blocking(move || db.void_raid(&profile, &room_id, false)).await;
         }
         None => {}
     }
@@ -477,7 +483,8 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
     let tier_items = db.tier_valuables(profile);
     let facilities: Vec<serde_json::Value> = progression::FACILITIES.iter().map(|&f| {
         let level = ctx.facility(f);
-        let next = (level < progression::MAX_TIER).then_some(level + 1);
+        // Levels past this operator's top tier can never be built, so they aren't offered.
+        let next = (level < cap).then_some(level + 1);
         serde_json::json!({
             "id": f.as_str(), "name": f.label(), "level": level, "maxLevel": op.tier,
             "effect": f.effect(level),
@@ -620,6 +627,9 @@ async fn hideout_action(
                 raidable => db.create_operator(&user, body["name"].as_str().unwrap_or(""), raidable, now).map(|_| ()),
             }),
             "switchOperator" => Some(db.switch_operator(&user, body["operatorId"].as_str().unwrap_or(""))),
+            "deleteOperator" => Some(if body["confirm"].as_bool() == Some(true) {
+                db.delete_operator(&user, body["operatorId"].as_str().unwrap_or("")).map(|_| ())
+            } else { Err("Confirm the deletion".into()) }),
             "relocate" => Some(if body["confirm"].as_bool() == Some(true) { db.relocate(&user, now).map(|_| ()) } else { Err("Confirm the retirement".into()) }),
             "buyPerk" => Some(match body["perk"].as_str().and_then(progression::Perk::parse) {
                 Some(perk) => db.buy_perk(&user, perk).map(|_| ()),
@@ -664,6 +674,15 @@ async fn hideout_action(
             }
         }
     }).await.unwrap_or_default())
+}
+
+/// GET /healthz: 200 when the server and its database answer (for uptime checks).
+async fn healthz(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.ping()).await {
+        Ok(true) => "ok".into_response(),
+        _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response(),
+    }
 }
 
 async fn maps_list() -> Json<serde_json::Value> {

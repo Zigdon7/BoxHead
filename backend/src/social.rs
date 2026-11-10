@@ -195,7 +195,7 @@ pub async fn steam_verify(params: &HashMap<String, String>) -> Result<(), String
 /// The Steam persona name: via the Web API when STEAM_API_KEY is set, else the public profile.
 pub async fn steam_persona(steam_id: &str) -> Option<String> {
     let client = reqwest::Client::new();
-    if let Ok(key) = std::env::var("STEAM_API_KEY") {
+    if let Some(key) = std::env::var("STEAM_API_KEY").ok().filter(|k| !k.trim().is_empty()) {
         let url = format!("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={key}&steamids={steam_id}");
         if let Ok(res) = client.get(&url).send().await {
             if let Ok(v) = res.json::<serde_json::Value>().await {

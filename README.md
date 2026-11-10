@@ -52,7 +52,7 @@ Rarity adds 0–15 power. Each map's common loot tops out just below the next ga
 - Every raid is hosted and simulated by the server. Raids are persistent: you can drop into one already running, and each operator has their own raid clock. Squadmates who deploy within 30 seconds share an insertion point.
 - A downed operator bleeds out after 25 seconds (3 seconds if nobody else in the raid is alive). Stand next to them for 3 seconds to revive them.
 - With a full pack, gear you walk over replaces your weakest gear (by power) and valuables your cheapest valuable. **G** drops the last item you picked up.
-- Leaving or disconnecting mid-raid counts as abandoning it (gear lost). Dropping before you've sent any input voids the raid (gear kept, entry fee not refunded); a server restart voids raids and returns everything.
+- Leaving or disconnecting mid-raid counts as abandoning it (gear lost). Dropping before you've sent any input voids the raid (gear kept, insurance premium refunded, entry fee not refunded); a server restart voids raids and returns the gear, the entry fee and the premium.
 - You can pause (`P`) only while you are alone in a raid. It freezes everything, raid clock included, and anyone joining resumes it.
 
 ## Quick Start (Local Development)
@@ -102,11 +102,17 @@ The guides live at `/learn.html` (Learn to Play) and `/about.html`.
 - **Account deletion.** `POST /api/account/delete {token, confirm: "DELETE"}` removes the account and everything it owns (operators, stash, Homefront, Legacy, friends, linked sign-ins). It is refused while an operator is in a raid.
 - **Matchmaking pools.** Players are matched by the platform they signed in with this session (Steam, Bluesky, or email/Google). Turning on cross-platform play (`POST /api/matchmaking/crossplay {token, enabled}`) moves the account into one shared pool.
 
+## Hosting
+
+`Dockerfile` and `compose.yaml` run the game server, the ops dashboard and scheduled database backups on one machine, with a Cloudflare Tunnel or Caddy in front for HTTPS. The walkthrough is in [docs/HOSTING.md](docs/HOSTING.md). `GET /healthz` answers `ok` while the server and its database are up.
+
 ## Server settings
 
 | Variable | Default | What it does |
 |---|---|---|
 | `PORT` | `3001` | Public HTTP/WebSocket port. |
+| `BOXHEAD_DB` | `boxhead.db` | Path of the SQLite database file. |
+| `STATIC_DIR` | `../frontend/dist` | Folder with the built website. |
 | `BASE_URL` | request host | Public origin (e.g. `https://play.example.com`), used in Steam return addresses and email links. **Set it in production.** |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `MAIL_FROM` | unset | Outgoing email. Port 587 uses STARTTLS, 465 uses TLS. Without `SMTP_HOST`, links are printed to the server log. |
 | `BOXHEAD_MAIL_OUTBOX` | unset | Write emails as JSON files to this folder instead of sending (tests, local development). |
@@ -125,13 +131,12 @@ The database runs in WAL mode (`synchronous=NORMAL`): commits don't wait on a di
 
 - Every server (room) is hosted and simulated by the backend. Each room runs its own 60 Hz authoritative game loop, and clients never host.
 - Room loops run in parallel on a dedicated simulation thread pool (`room-sim-0..N`), separate from the threads serving HTTP and WebSockets, so a busy round never delays networking. Size it with `BOXHEAD_SIM_THREADS` (default: one per CPU core). `BOXHEAD_MAX_ROOMS` caps rooms per server (default 256).
-- Every signed-in account counts as verified. Email confirmation is planned before launch: once it exists, gate unconfirmed email accounts in `Database::is_verified`.
 - **Play** opens the hideout. **Choose a raid** opens the deploy screen: pick a map, then a raid on it (double-click to deploy immediately), or host your own.
-- Every map has one permanent raid (id = the map id). Any signed-in player can host more. A raid a player created shuts down after it has been empty for 90 seconds.
+- Every map has one permanent raid per matchmaking pool (id = `<map>-<pool>`; a bare map id resolves to the player's own pool). Any signed-in player can host more. A raid a player created shuts down after it has been empty for 90 seconds.
 - **Stashes** belong to the account, on any device.
 - API:
-  - `GET /api/rooms?token=` lists raids with their map and `canJoin`. `POST /api/rooms {token, name, verifiedOnly, map}` creates one.
-  - `GET /api/hideout?token=` returns the stash, loadout, cash, gear score, trader offers, maps and which sealed items are packed for the next raid. `POST /api/hideout/{equip|unequip|sell|sellMany|buy|carry} {token, itemId?, itemIds?, slot?, offerId?, carry?}` changes them and returns the new state. Gear is locked while you're in a raid.
+  - `GET /api/rooms?token=` lists raids with their map and `canJoin`. `POST /api/rooms {token, name, map}` creates one in the host's pool.
+  - `GET /api/hideout?token=` returns the stash, loadout, cash, gear score, trader offers, maps and which sealed items are packed for the next raid. `POST /api/hideout/{equip|unequip|sell|sellMany|buy|carry} {token, itemId?, itemIds?, slot?, offerId?, carry?}` changes them and returns the new state. Account actions use the same route: `createOperator {name, raidable}`, `switchOperator {operatorId}`, `deleteOperator {operatorId, confirm: true}` (frees the slot, earns nothing, refused mid-raid), `upgradeTier`, `upgradeFacility {facility}`, `collectWorkshop`, `relocate {confirm: true}` and `buyPerk {perk}`. Gear is locked while you're in a raid.
   - `GET /api/maps` lists the maps.
 - The WebSocket `join` message takes `roomId` and `token`. The server checks verification and gear score, then locks the loadout into the raid. When a raid ends the server sends `raidEnd` (outcome + stash settlement) and closes the socket.
 
