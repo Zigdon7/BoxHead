@@ -168,7 +168,7 @@ function renderServer(s) {
     el('div', { class: 'server-head' },
       el('h2', { text: s.serverId || s.url }),
       el('span', { class: `pill ${s.up ? 'up' : 'down'}`, text: s.up ? 'up' : 'down' }),
-      el('span', { class: 'meta', text: `${s.url} · v${s.version ?? '?'} · up ${fmtUptime(s.uptimeMs)} · ${s.simThreadCount ?? '?'} game + ${s.publishThreadCount ?? '?'} state threads · ${t.rooms ?? 0}/${s.roomLimit ?? '?'} rooms · ${t.connected ?? 0} players` }),
+      el('span', { class: 'meta', text: `${s.url} · v${s.version ?? '?'}${s.build ? ` (${s.build})` : ''} · up ${fmtUptime(s.uptimeMs)} · ${s.simThreadCount ?? '?'} game + ${s.publishThreadCount ?? '?'} state threads · ${t.rooms ?? 0}/${s.roomLimit ?? '?'} rooms · ${t.connected ?? 0} players` }),
       el('span', { class: 'spacer' }),
       el('button', { class: 'danger', text: 'Restart all rooms', onclick: () => action(`/api/servers/${s.index}/restart-all`, `Restart every room on ${s.serverId || s.url}`) })),
     s.up ? null : el('p', { class: 'error', text: `Unreachable: ${s.lastError || 'no response yet'}${s.lastOkAgoMs != null ? ` (last seen ${fmtUptime(s.lastOkAgoMs)} ago)` : ''}` }),

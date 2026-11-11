@@ -11,7 +11,7 @@ Everything runs from `compose.yaml`: the game server (which also serves the webs
 ## 1. First start
 
 ```sh
-git clone <this repo> boxhead && cd boxhead
+git clone https://github.com/Zigdon7/BoxHead boxhead && cd boxhead
 cp .env.example .env
 ```
 
@@ -26,10 +26,12 @@ Fill in the three required values in `.env`:
 Then build and start:
 
 ```sh
-docker compose up -d --build
+BOXHEAD_BUILD=$(git rev-parse --short HEAD) docker compose up -d --build
 curl http://127.0.0.1:3001/healthz     # prints "ok"
-docker compose logs -f game            # startup log: public address, email mode, PvP
+docker compose logs -f game            # startup log: version, public address, email mode, PvP
 ```
+
+`BOXHEAD_BUILD` is optional. It stamps the image with the commit it was built from, which then shows next to the version on the home screen, in the startup log and on the dashboard.
 
 The game now answers on `http://127.0.0.1:3001` on that machine only. To try it from another device on your network, set `GAME_BIND=0.0.0.0` in `.env` and run `docker compose up -d` again.
 
@@ -67,7 +69,19 @@ Without `SMTP_HOST` the links are only printed in `docker compose logs game`. Th
 
 - **Steam** works once `BASE_URL` is right. `STEAM_API_KEY` is optional.
 - **Bluesky** needs nothing.
-- **Google** needs `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with `<BASE_URL>/api/auth/google/callback` listed as an authorized redirect URI in the Google Cloud console.
+- **Google** needs `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with `<BASE_URL>/api/auth/google/callback` listed as an authorized redirect URI in the Google Cloud console. Without them the sign-in screen doesn't show a Google button.
+
+## Telling players about the build
+
+Three optional settings change what the home and sign-in screens say. They matter most during a playtest (see [PLAYTEST.md](PLAYTEST.md)).
+
+| Setting | Effect |
+|---|---|
+| `BOXHEAD_NOTICE` | One line under the title, for example `Playtest build. Progress may be wiped.` |
+| `BOXHEAD_FEEDBACK_URL` | Adds **Report a bug** to the home screen, the sign-in screen and the pause menu. Any `http(s)` address works: a form, a Discord invite, an issue tracker. |
+| `BOXHEAD_BUILD` | A label for the build, shown as `Build 3.0.0-playtest.1 · abc1234` next to **Report a bug**. Pass it when you build (above), not in `.env`. |
+
+`BOXHEAD_NOTICE` and `BOXHEAD_FEEDBACK_URL` go in `.env`. Changing them restarts the game server on the next `docker compose up -d`.
 
 ## Ops dashboard
 
@@ -103,7 +117,7 @@ docker compose start game
 
 ```sh
 git pull
-docker compose up -d --build
+BOXHEAD_BUILD=$(git rev-parse --short HEAD) docker compose up -d --build
 ```
 
 The server restarts in a few seconds. Raids in progress are cancelled: every operator in one gets their gear, entry fee and insurance premium back. The database is upgraded in place on start. Take a backup first if the update is a big one.
@@ -118,6 +132,9 @@ Containers restart on their own after a crash or a reboot (`restart: unless-stop
 
 ## Before you invite the public
 
+For a playtest with invited testers, use the shorter checklist in [PLAYTEST.md](PLAYTEST.md). This one is for opening the doors to everyone.
+
+- [ ] `npm run release:check -- --docker` passes on the commit you are deploying.
 - [ ] `BASE_URL` is the real HTTPS address, and the startup log prints it as "Public address".
 - [ ] Sign up with a real email address and receive the confirmation email.
 - [ ] `BACKUP_DIR` points at another disk, and one restore has been tried.
@@ -132,5 +149,7 @@ Containers restart on their own after a crash or a reboot (`restart: unless-stop
 | `Set BASE_URL in .env` when starting | A required value in `.env` is empty. |
 | Site loads but raids won't connect | The proxy must pass WebSockets to `/ws`. Cloudflare Tunnel and Caddy do by default. |
 | Steam sign-in returns to the wrong address | `BASE_URL` doesn't match the address in the browser. |
+| Email sign-ups say "Confirm your email to deploy" and no email arrives | `SMTP_HOST` isn't set, so the links only go to `docker compose logs game`. Set up SMTP, or have players sign in with Steam or Bluesky. |
+| No build label on the home screen | The image was built without `BOXHEAD_BUILD`. The version still shows. |
 | "Too many attempts" for everyone at once | The server isn't seeing real client addresses. Players must come in through the tunnel or Caddy, not a second proxy in front of them. |
 | Dashboard shows the server as unreachable | `BOXHEAD_OPS_TOKEN` changed without restarting both: `docker compose up -d`. |

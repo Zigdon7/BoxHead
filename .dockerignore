@@ -12,5 +12,6 @@
 **/rust-toolchain.toml
 backups
 tests
+scripts
 docs
 README.md

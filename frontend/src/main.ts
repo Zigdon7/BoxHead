@@ -16,6 +16,7 @@ import { theme, withAlpha, font } from './theme';
 import {
   RoomInfo, Friend, Matchmaking, OPEN_ROOM_ID, resolveSelectedRoom, roomStatusText,
   matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel, roomsForMap,
+  ServerInfo, buildLabel, safeLink, signInIntro,
 } from './lobby';
 import {
   Player,
@@ -953,7 +954,7 @@ function showResetForm(token: string) {
   document.getElementById('authSectionOut')!.hidden = true;
   (document.getElementById('resetPassInput') as HTMLInputElement).focus();
 }
-const signInSubDefault = document.getElementById('signInSub')!.textContent ?? '';
+let signInSubDefault = signInIntro(false);
 function hideResetForm() {
   resetToken = '';
   document.getElementById('signInSub')!.textContent = signInSubDefault;
@@ -1024,9 +1025,31 @@ window.addEventListener('message', (e) => {
   }
 });
 
+/** Show what the server says about this build: version, operator notice and where to send feedback. */
+function showServerInfo(info: ServerInfo) {
+  const text = buildLabel(info);
+  const notice = (info.notice ?? '').trim();
+  const url = safeLink(info.feedbackUrl);
+  const each = <T extends HTMLElement>(selector: string, fn: (el: T) => void) => document.querySelectorAll<T>(selector).forEach(fn);
+  each('[data-build-label]', el => { el.textContent = text; el.hidden = !text; });
+  each('[data-server-notice]', el => { el.textContent = notice; el.hidden = !notice; });
+  each<HTMLAnchorElement>('[data-feedback-link]', a => { if (url) a.href = url; a.hidden = !url; });
+  each('[data-build-line]', el => { el.hidden = !text && !url; });
+}
+
 fetch('/api/config')
   .then(r => r.json())
-  .then(data => { (window as any).__GOOGLE_CLIENT_ID = data.google_client_id || ''; minPassword = data.minPassword || minPassword; })
+  .then(data => {
+    (window as any).__GOOGLE_CLIENT_ID = data.google_client_id || '';
+    minPassword = data.minPassword || minPassword;
+    // Google sign-in needs keys on the server; without them the button would open a Google error page.
+    const google = !!data.google_client_id;
+    googleLoginBtn.hidden = !google;
+    const sub = document.getElementById('signInSub')!;
+    if (sub.textContent === signInSubDefault) sub.textContent = signInIntro(google);
+    signInSubDefault = signInIntro(google);
+    showServerInfo(data);
+  })
   .catch(() => {});
 
 if (isLoggedIn) refreshMe();

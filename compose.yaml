@@ -9,7 +9,12 @@ name: boxhead
 
 services:
   game:
-    build: .
+    build:
+      context: .
+      args:
+        # Shown next to the version on the home screen. Set it when you build:
+        #   BOXHEAD_BUILD=$(git rev-parse --short HEAD) docker compose up -d --build
+        BOXHEAD_BUILD: ${BOXHEAD_BUILD:-}
     image: boxhead:local
     restart: unless-stopped
     environment:
@@ -26,6 +31,8 @@ services:
       BOXHEAD_SIM_THREADS: ${BOXHEAD_SIM_THREADS:-}
       BOXHEAD_MAX_ROOMS: ${BOXHEAD_MAX_ROOMS:-}
       BOXHEAD_PVP: ${BOXHEAD_PVP:-}
+      BOXHEAD_NOTICE: ${BOXHEAD_NOTICE:-}
+      BOXHEAD_FEEDBACK_URL: ${BOXHEAD_FEEDBACK_URL:-}
       BOXHEAD_DB: /data/boxhead.db
       # Every public request arrives through the tunnel or Caddy, which report the real client address.
       BOXHEAD_TRUST_PROXY: "1"

@@ -1,7 +1,8 @@
 {
-  "name": "boxhead-remake",
-  "version": "2.0.0",
-  "description": "BoxHead remake — Rust backend + TypeScript/Vite frontend",
+  "name": "boxhead",
+  "version": "3.0.0-playtest.1",
+  "private": true,
+  "description": "BoxHead: a co-op zombie extraction shooter. Rust game server and ops dashboard, TypeScript/Vite client.",
   "scripts": {
     "dev:frontend": "cd frontend && npm run dev",
     "dev:backend": "cd backend && cargo watch -x run",
@@ -10,12 +11,14 @@
     "build:backend": "cd backend && cargo build --release",
     "build": "npm run build:frontend && npm run build:backend && npm run build:dashboard",
     "generate:types": "cd frontend && npm run generate:types",
+    "typecheck": "cd frontend && npm run typecheck",
     "test:backend": "cd backend && cargo test",
     "test:frontend": "cd frontend && npm test",
     "test:e2e": "npm run build:frontend && cd backend && cargo build && cd ../dashboard && cargo build && cd .. && node --test --test-reporter=spec tests/e2e/server.test.mjs",
     "test": "npm run test:backend && npm run test:dashboard && npm run test:frontend && npm run test:e2e",
     "dev:dashboard": "cd dashboard && cargo run",
     "build:dashboard": "cd dashboard && cargo build --release",
-    "test:dashboard": "cd dashboard && cargo test"
+    "test:dashboard": "cd dashboard && cargo test",
+    "release:check": "node scripts/release-check.mjs"
   }
 }

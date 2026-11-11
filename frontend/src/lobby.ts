@@ -72,3 +72,30 @@ export function accountLabel(handle: string): string {
 export function friendsSummary(friends: Friend[]): string {
   return `${friends.filter(f => f.online).length}/${friends.length} online`;
 }
+
+/** The line under "Sign in": the ways in this server offers. Google needs server-side keys, so it is optional. */
+export function signInIntro(google: boolean): string {
+  const ways = google ? 'Steam, Bluesky, Google and email' : 'Steam, Bluesky and email';
+  return `You need an account to play. ${ways} all sign in to the same kind of BoxHead account, and you can link more later.`;
+}
+
+/** What `/api/config` says about the server's build (all optional: older servers send none of it). */
+export interface ServerInfo { version?: string; build?: string; feedbackUrl?: string; notice?: string }
+
+/** The build line on the home screen, for bug reports: "Build 3.0.0 · abc1234". Empty when the server says nothing. */
+export function buildLabel(info: ServerInfo): string {
+  const version = (info.version ?? '').trim();
+  const build = (info.build ?? '').trim();
+  if (!version) return '';
+  return build ? `Build ${version} · ${build}` : `Build ${version}`;
+}
+
+/** An absolute http(s) address, or '' for anything else: a link from server
+ *  settings never becomes a `javascript:` or relative href. */
+export function safeLink(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.trim()) return '';
+  try {
+    const url = new URL(raw.trim());
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch { return ''; }
+}

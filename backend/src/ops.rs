@@ -81,7 +81,8 @@ async fn status(State(state): State<Arc<OpsState>>, headers: HeaderMap) -> Respo
     Json(serde_json::json!({
         "ok": true,
         "serverId": state.server_id,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::buildinfo::VERSION,
+        "build": crate::buildinfo::get().build,
         "startedAtMs": state.started_unix_ms,
         "uptimeMs": state.started.elapsed().as_millis() as u64,
         "simThreadCount": state.sim.size(),

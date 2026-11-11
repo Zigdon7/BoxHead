@@ -46,6 +46,10 @@ VOLUME ["/data", "/backups"]
 EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" || exit 1
+# A label for this build (usually the git commit), shown next to the version on
+# the home screen. Last, so changing it rebuilds nothing else.
+ARG BOXHEAD_BUILD=""
+ENV BOXHEAD_BUILD=${BOXHEAD_BUILD}
 # tini forwards stop signals, so `docker stop` ends the server at once.
 ENTRYPOINT ["tini", "--"]
 CMD ["boxhead-server"]

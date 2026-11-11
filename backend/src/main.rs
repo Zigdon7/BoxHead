@@ -13,6 +13,7 @@ mod progression;
 mod ratelimit;
 mod mail;
 mod auth;
+mod buildinfo;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,6 +60,8 @@ fn pvp_enabled() -> bool {
 
 #[tokio::main]
 async fn main() {
+    let build = buildinfo::get();
+    println!("BoxHead server {}", build.label());
     let db_path = std::env::var("BOXHEAD_DB").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "boxhead.db".to_string());
     let db = Arc::new(Database::open(&db_path)
         .unwrap_or_else(|e| panic!("Failed to open database {db_path}: {e}")));
@@ -99,6 +102,8 @@ async fn main() {
         Err(_) => println!("WARNING: BASE_URL is not set, so email and Steam links follow each request's Host header. Set it before letting the public in."),
     }
     if !pvp_enabled() { println!("PvP is off: new operators are Safe (set BOXHEAD_PVP=1 to allow Raidable)"); }
+    if !build.notice.is_empty() { println!("Home screen notice: {}", build.notice); }
+    if !build.feedback_url.is_empty() { println!("Feedback link: {}", build.feedback_url); }
 
     // Periodic cleanup: expired sessions, refilled rate-limit buckets.
     let cleanup_state = state.clone();
@@ -692,10 +697,15 @@ async fn maps_list() -> Json<serde_json::Value> {
 // --- Config API ---
 
 async fn api_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let build = buildinfo::get();
     Json(serde_json::json!({
         "google_client_id": state.google_client_id,
         "pvp": pvp_enabled(),
         "minPassword": auth::MIN_PASSWORD,
+        "version": buildinfo::VERSION,
+        "build": build.build,
+        "feedbackUrl": build.feedback_url,
+        "notice": build.notice,
     }))
 }
 

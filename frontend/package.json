@@ -1,11 +1,12 @@
 {
   "name": "boxhead-frontend",
-  "version": "1.0.0",
-  "description": "BoxHead frontend client",
+  "version": "3.0.0-playtest.1",
+  "description": "BoxHead web client",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit -p .",
     "generate:types": "json2ts ../schema/types.json -o src/generated/types.ts --unreachableDefinitions"
   },
   "devDependencies": {

@@ -18,6 +18,8 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 const ROOT = resolve(import.meta.dirname, '..', '..');
+/** The server version, from backend/Cargo.toml. */
+const VERSION = readFileSync(joinPath(ROOT, 'backend', 'Cargo.toml'), 'utf8').match(/^version = "([^"]+)"/m)[1];
 const EMPTY_TTL_SECS = 2;
 const EXE = process.platform === 'win32' ? '.exe' : '';
 const BIN = process.env.BOXHEAD_SERVER_BIN ?? joinPath(ROOT, 'backend', 'target', 'debug', `boxhead-server${EXE}`);
@@ -26,6 +28,10 @@ const OPS_TOKEN = `ops-${randomUUID()}`;
 const SIM_THREADS = 4;
 const PUBLISH_THREADS = 2;
 const MAX_ROOMS = 64;
+// What the main test server is told about its build (shown on the home screen).
+const BUILD = 'e2e1234';
+const FEEDBACK_URL = 'https://example.com/boxhead/feedback';
+const NOTICE = 'Playtest build. Progress may be wiped.';
 
 let server;
 let dashboard;
@@ -186,6 +192,7 @@ async function joinOk(opts) {
   const first = await c.waitFor(m => m.type === 'init' || m.type === 'joinError', 4000, 'init');
   assert.equal(first.type, 'init', `expected init, got ${JSON.stringify(first)}`);
   c.id = first.id;
+  c.init = first;
   c.snapshot = await c.waitFor(m => m.type === 'snapshot', 4000, 'snapshot');
   return c;
 }
@@ -245,6 +252,9 @@ before(async () => {
       // The suite signs up hundreds of accounts from one address; limits get their own server below.
       BOXHEAD_RATE_LIMIT: 'off',
       BOXHEAD_PVP: '1',
+      BOXHEAD_BUILD: BUILD,
+      BOXHEAD_FEEDBACK_URL: FEEDBACK_URL,
+      BOXHEAD_NOTICE: `  ${NOTICE}  `,
     },
     ready: () => listRooms('').then(r => r.ok).catch(() => false),
   });
@@ -901,9 +911,13 @@ describe('server-hosted simulation', () => {
     const { room } = await mustCreate('Movement');
     const c = await joinOk({ roomId: room.id });
     const start = c.snapshot.players[c.id].pos;
-    const timer = setInterval(() => c.send({ type: 'input', input: { ...idle, right: true } }), 33);
+    // Walk toward the middle of the map. Insertion points sit on the map's edges,
+    // and one on the east edge can have the boundary wall 15 units to its right.
+    const right = start.x < c.init.mapWidth / 2;
+    const moved = x => (right ? x - start.x : start.x - x) > 20;
+    const timer = setInterval(() => c.send({ type: 'input', input: { ...idle, right, left: !right } }), 33);
     try {
-      await c.waitFor(m => m.type === 'delta' && m.players?.[c.id]?.pos?.x > start.x + 20, 4000, 'player to move right');
+      await c.waitFor(m => m.type === 'delta' && moved(m.players?.[c.id]?.pos?.x), 4000, `player to move ${right ? 'right' : 'left'}`);
     } finally { clearInterval(timer); }
     await c.close();
   });
@@ -1007,6 +1021,23 @@ async function ops(path, { method = 'GET', token = OPS_TOKEN, body } = {}) {
 
 const opsRoom = async id => (await ops('/ops/v1/status')).json.rooms.find(r => r.id === id);
 describe('public endpoints', () => {
+  test('/api/config names the build, the operator notice and where to send feedback', async () => {
+    const config = await api('/api/config');
+    assert.equal(config.version, VERSION, 'the version in backend/Cargo.toml');
+    assert.equal(config.build, BUILD);
+    assert.equal(config.feedbackUrl, FEEDBACK_URL);
+    assert.equal(config.notice, NOTICE, 'trimmed to one line');
+    assert.equal(config.pvp, true);
+    assert.equal(config.minPassword, 8);
+    assert.ok(server.log.includes(`BoxHead server ${VERSION} (${BUILD})`), 'the startup log names the build');
+  });
+
+  test('/healthz answers ok while the database is up', async () => {
+    const res = await fetch(`${base}/healthz`);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), 'ok');
+  });
+
   test('the old public admin endpoints are gone', async () => {
     for (const [method, path] of [['GET', '/admin'], ['GET', '/admin/status'], ['POST', '/admin/restart'], ['GET', '/ops/v1/status'], ['POST', '/api/rooms/outskirts/replay'], ['GET', '/api/progress']]) {
       const res = await fetch(base + path, { method });
@@ -1033,6 +1064,7 @@ describe('ops API (internal, for the dashboard)', () => {
     const { status, json } = await ops('/ops/v1/status');
     assert.equal(status, 200);
     assert.equal(json.serverId, 'e2e-game');
+    assert.deepEqual([json.version, json.build], [VERSION, BUILD]);
     assert.equal(json.simThreadCount, SIM_THREADS);
     assert.ok(json.simThreads.length >= 1 && json.simThreads.length <= SIM_THREADS);
     assert.ok(json.simThreads.every(t => t.name.startsWith('room-sim-')));
@@ -1112,7 +1144,8 @@ describe('production defaults (rate limits on, PvP off)', () => {
     prod = await launch(BIN, {
       cwd: dir,
       env: { PORT: String(port), STATIC_DIR: joinPath(ROOT, 'frontend', 'dist'), BOXHEAD_MAIL_OUTBOX: prodOutbox,
-        BOXHEAD_RATE_LIMIT: '', BOXHEAD_PVP: '', BOXHEAD_OPS_TOKEN: '' },
+        BOXHEAD_RATE_LIMIT: '', BOXHEAD_PVP: '', BOXHEAD_OPS_TOKEN: '',
+        BOXHEAD_BUILD: '', BOXHEAD_NOTICE: '', BOXHEAD_FEEDBACK_URL: 'javascript:alert(1)' },
       ready: () => fetch(`${prodBase}/api/config`).then(r => r.ok).catch(() => false),
     });
     extraProcesses.push(prod);
@@ -1129,6 +1162,13 @@ describe('production defaults (rate limits on, PvP off)', () => {
     assert.equal(raid.pvpEnabled, false);
     const safe = await (await post('/api/hideout/createOperator', { token: reg.token, name: 'Lamb', raidable: false })).json();
     assert.equal(safe.ok, true, JSON.stringify(safe));
+  });
+
+  test('an unlabelled build shows only its version, and a feedback link must be http(s)', async () => {
+    const config = await (await fetch(`${prodBase}/api/config`)).json();
+    assert.equal(config.version, VERSION);
+    assert.deepEqual([config.build, config.notice, config.feedbackUrl], ['', '', '']);
+    assert.match(prod.log, /BOXHEAD_FEEDBACK_URL is not an http\(s\) link/);
   });
 
   test('sign-ups from one address are rate limited', async () => {
@@ -1315,6 +1355,20 @@ describe('static client', () => {
     }
     // One lobby list for your matchmaking pool, with the cross-platform switch above it.
     assert.ok(html.includes('id="crossplayToggle"') && html.includes('role="switch"'), 'missing the cross-platform switch');
+    // Filled in from /api/config: the build label, the operator's notice and the feedback links.
+    for (const id of ['buildLabel', 'serverNotice']) assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
+    assert.equal(html.split('data-feedback-link').length - 1, 3, 'a feedback link on the home screen, the sign-in screen and the pause menu');
+    // Google sign-in stays hidden until /api/config reports a client id (this server has none).
+    assert.match(html, /id="googleLoginBtn"[^>]*\shidden[\s>]/, 'the Google button is hidden by default');
+    assert.equal((await api('/api/config')).google_client_id, '');
+  });
+
+  test('serves the guides', async () => {
+    for (const [path, marker] of [['/learn.html', 'id="progression"'], ['/about.html', 'aboutEnemies']]) {
+      const res = await fetch(base + path);
+      assert.equal(res.status, 200, path);
+      assert.ok((await res.text()).includes(marker), `${path} is missing ${marker}`);
+    }
   });
 });
 

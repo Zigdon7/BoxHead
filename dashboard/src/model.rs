@@ -109,6 +109,7 @@ impl ServerView {
             "lastOkAgoMs": self.last_ok_ms.map(|t| now_ms.saturating_sub(t)),
             "serverId": status["serverId"],
             "version": status["version"],
+            "build": status["build"],
             "uptimeMs": status["uptimeMs"],
             "simThreadCount": status["simThreadCount"],
             "publishThreadCount": status["publishThreadCount"],

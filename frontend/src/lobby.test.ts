@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   RoomInfo, Friend, Matchmaking, OPEN_ROOM_ID, resolveSelectedRoom, roomStatusText, roomsForMap,
-  matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel,
+  matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel, buildLabel, safeLink, signInIntro,
 } from './lobby';
 
 function room(overrides: Partial<RoomInfo> = {}): RoomInfo {
@@ -132,5 +132,34 @@ describe('callsigns', () => {
   it('labels the account chip without a double @', () => {
     expect(accountLabel('me@example.com')).toBe('me@example.com');
     expect(accountLabel('me.bsky.social')).toBe('@me.bsky.social');
+  });
+});
+
+describe('sign-in options', () => {
+  it('only offers Google when the server has it set up', () => {
+    expect(signInIntro(true)).toContain('Steam, Bluesky, Google and email');
+    expect(signInIntro(false)).toContain('Steam, Bluesky and email');
+    expect(signInIntro(false)).not.toContain('Google');
+  });
+});
+
+describe('server build info', () => {
+  it('names the version and, when the server has one, the build', () => {
+    expect(buildLabel({ version: '3.0.0-playtest.1', build: 'abc1234' })).toBe('Build 3.0.0-playtest.1 · abc1234');
+    expect(buildLabel({ version: '3.0.0-playtest.1', build: '' })).toBe('Build 3.0.0-playtest.1');
+    expect(buildLabel({ version: ' 3.0.0 ' })).toBe('Build 3.0.0');
+  });
+
+  it('shows nothing for a server that does not report a version', () => {
+    expect(buildLabel({})).toBe('');
+    expect(buildLabel({ build: 'abc1234' })).toBe('');
+  });
+
+  it('only turns http(s) addresses into links', () => {
+    expect(safeLink('https://example.com/feedback')).toBe('https://example.com/feedback');
+    expect(safeLink(' http://10.0.0.5:8080/bugs ')).toBe('http://10.0.0.5:8080/bugs');
+    for (const bad of ['', '   ', 'javascript:alert(1)', 'data:text/html,x', '/relative', 'example.com', 'mailto:a@b.c', undefined, null, 42]) {
+      expect(safeLink(bad)).toBe('');
+    }
   });
 });
