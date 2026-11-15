@@ -6,6 +6,10 @@ use crate::gear::{self, Item, ItemKind, Loadout, MapDef, Rarity, Slot};
 use crate::progression::{self as prog, Facility, Perk, Perks, RelocationReward, FACILITIES};
 use crate::types::RaidOutcome;
 
+#[cfg(test)]
+#[path = "economy_tests.rs"]
+mod economy_tests;
+
 /// An item in someone's stash, and the loadout slot it's equipped in (if any).
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +19,7 @@ pub struct StashItem {
     pub slot: Option<Slot>,
     /// A sealed item marked to come along on the next raid, to decrypt it there.
     pub carry: bool,
+    pub overflow: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -55,8 +60,10 @@ pub struct RaidSettlement {
     /// The loadout was insured, so a lost raid returned it.
     pub insured: bool,
     pub items_kept: u32,
-    /// Loot that didn't fit in a full stash was sold on the spot.
+    /// Compatibility field for older clients; new settlements never auto-sell.
     pub items_auto_sold: u32,
+    /// Overflow awaiting the player's explicit keep/sell selection.
+    pub items_pending: u32,
     pub cash: u32,
     /// Extra cash from Operations rank, perks and the season boost (already in `cash_earned`).
     #[serde(default)]
@@ -248,6 +255,9 @@ impl Database {
         let _ = conn.execute("ALTER TABLE operators ADD COLUMN insured INTEGER NOT NULL DEFAULT 0", []);
         // carry: 0 = stays home, 1 = bring on the next raid, 2 = in the raid right now.
         let _ = conn.execute("ALTER TABLE items ADD COLUMN carry INTEGER NOT NULL DEFAULT 0", []);
+        for column in ["protected INTEGER NOT NULL DEFAULT 0", "origin_tier INTEGER NOT NULL DEFAULT 0", "overflow INTEGER NOT NULL DEFAULT 0"] {
+            let _ = conn.execute(&format!("ALTER TABLE items ADD COLUMN {column}"), []);
+        }
         // Operators belong to accounts; several per account, each with a Homefront.
         for column in [
             "account TEXT", "name TEXT NOT NULL DEFAULT 'Operator 1'", "raidable INTEGER NOT NULL DEFAULT 0",
@@ -255,7 +265,7 @@ impl Database {
             "produced_at INTEGER NOT NULL DEFAULT 0", "raid_map TEXT",
             // What the current raid cost, so a voided raid can pay it back.
             "raid_fee INTEGER NOT NULL DEFAULT 0", "raid_premium INTEGER NOT NULL DEFAULT 0",
-            "friend_id TEXT",
+            "friend_id TEXT", "material_investment INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE operators ADD COLUMN {column}"), []);
         }
@@ -314,6 +324,7 @@ impl Database {
             -- Operators from before accounts could hold several were keyed by the account.
             UPDATE operators SET account = substr(profile, 6) WHERE account IS NULL AND profile LIKE 'user:%';
         ").map_err(|e| format!("Failed to create progression schema: {}", e))?;
+        let _ = conn.execute("ALTER TABLE operations ADD COLUMN requisition INTEGER NOT NULL DEFAULT 0", []);
         // Matchmaking: the platform a session signed in with, and the account's cross-platform opt-in.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN platform TEXT NOT NULL DEFAULT 'direct'", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN crossplay INTEGER NOT NULL DEFAULT 0", []);
@@ -337,8 +348,8 @@ impl Database {
 
     fn insert_item(conn: &Connection, profile: &str, item: &Item, slot: Option<Slot>) -> rusqlite::Result<usize> {
         conn.execute(
-            "INSERT INTO items (id, profile, kind, rarity, power, name, slot) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![item.id, profile, item.kind.as_str(), item.rarity.as_str(), item.power, item.name, slot.map(|s| s.as_str())],
+            "INSERT INTO items (id, profile, kind, rarity, power, name, slot, protected, origin_tier) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![item.id, profile, item.kind.as_str(), item.rarity.as_str(), item.power, item.name, slot.map(|s| s.as_str()), item.protected, item.origin_tier],
         )
     }
 
@@ -364,14 +375,14 @@ impl Database {
             "SELECT cash, raids, extracts, deaths, in_raid, name, raidable, tier, friend_id FROM operators WHERE profile = ?1", params![profile],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, String>(5)?, r.get::<_, i32>(6)? != 0, r.get::<_, u32>(7)?, r.get(8)?)),
         ).optional().ok()??;
-        let mut stmt = conn.prepare("SELECT id, kind, rarity, power, name, slot, carry FROM items WHERE profile = ?1 ORDER BY slot IS NULL, power DESC, name").ok()?;
+        let mut stmt = conn.prepare("SELECT id, kind, rarity, power, name, slot, carry, protected, origin_tier, overflow FROM items WHERE profile = ?1 ORDER BY slot IS NULL, power DESC, name").ok()?;
         let rows = stmt.query_map(params![profile], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, i32>(6)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, i32>(6)?, r.get::<_, bool>(7)?, r.get::<_, u32>(8)?, r.get::<_, bool>(9)?))
         }).ok()?;
-        let items = rows.filter_map(|r| r.ok()).filter_map(|(id, kind, rarity, power, name, slot, carry)| {
+        let items = rows.filter_map(|r| r.ok()).filter_map(|(id, kind, rarity, power, name, slot, carry, protected, origin_tier, overflow)| {
             let (kind, rarity) = (ItemKind::parse(&kind)?, Rarity::parse(&rarity)?);
             let value = gear::sell_value(kind, rarity, power);
-            Some(StashItem { item: Item { id, kind, rarity, power, name, value }, slot: slot.as_deref().and_then(Slot::parse), carry: carry != 0 })
+            Some(StashItem { item: Item { id, kind, rarity, power, name, value, protected, origin_tier }, slot: slot.as_deref().and_then(Slot::parse), carry: carry != 0, overflow })
         }).collect();
         Some(Operator { id: profile.to_string(), friend_id, name, raidable, tier, cash, raids, extracts, deaths, in_raid, items })
     }
@@ -383,7 +394,7 @@ impl Database {
     }
 
     fn stash_size(conn: &Connection, profile: &str) -> Result<usize, String> {
-        conn.query_row("SELECT COUNT(*) FROM items WHERE profile = ?1 AND slot IS NULL", params![profile], |r| r.get(0)).map_err(|e| e.to_string())
+        conn.query_row("SELECT COUNT(*) FROM items WHERE profile = ?1 AND slot IS NULL AND overflow = 0", params![profile], |r| r.get(0)).map_err(|e| e.to_string())
     }
 
     fn cash_of(conn: &Connection, profile: &str) -> Result<u32, String> {
@@ -395,7 +406,7 @@ impl Database {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         Self::not_in_raid(&tx, profile)?;
-        let (kind, current): (String, Option<String>) = tx.query_row("SELECT kind, slot FROM items WHERE id = ?1 AND profile = ?2", params![item_id, profile], |r| Ok((r.get(0)?, r.get(1)?)))
+        let (kind, current): (String, Option<String>) = tx.query_row("SELECT kind, slot FROM items WHERE id = ?1 AND profile = ?2 AND overflow = 0", params![item_id, profile], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|_| "Item not found".to_string())?;
         let kind = ItemKind::parse(&kind).ok_or("Unknown item")?;
         if !kind.fits(slot) { return Err(format!("A {} can't go in the {} slot", kind.label(), slot.as_str())); }
@@ -428,6 +439,7 @@ impl Database {
             "SELECT kind, rarity, power FROM items WHERE id = ?1 AND profile = ?2", params![item_id, profile],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).map_err(|_| "Item not found".to_string())?;
+        Self::unprotected(&tx, profile, item_id)?;
         let value = gear::sell_value(ItemKind::parse(&kind).ok_or("Unknown item")?, Rarity::parse(&rarity).ok_or("Unknown item")?, power);
         tx.execute("DELETE FROM items WHERE id = ?1", params![item_id]).map_err(|e| e.to_string())?;
         tx.execute("UPDATE operators SET cash = cash + ?1 WHERE profile = ?2", params![value, profile]).map_err(|e| e.to_string())?;
@@ -444,6 +456,7 @@ impl Database {
         Self::not_in_raid(&tx, profile)?;
         let mut total = 0u32;
         for id in item_ids {
+            Self::unprotected(&tx, profile, id)?;
             let (kind, rarity, power, slot): (String, String, u32, Option<String>) = tx.query_row(
                 "SELECT kind, rarity, power, slot FROM items WHERE id = ?1 AND profile = ?2", params![id, profile],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -464,7 +477,7 @@ impl Database {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         Self::not_in_raid(&tx, profile)?;
-        let (kind, slot): (String, Option<String>) = tx.query_row("SELECT kind, slot FROM items WHERE id = ?1 AND profile = ?2", params![item_id, profile], |r| Ok((r.get(0)?, r.get(1)?)))
+        let (kind, slot): (String, Option<String>) = tx.query_row("SELECT kind, slot FROM items WHERE id = ?1 AND profile = ?2 AND overflow = 0", params![item_id, profile], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|_| "Item not found".to_string())?;
         if ItemKind::parse(&kind) != Some(ItemKind::Encrypted) || slot.is_some() {
             return Err("Only encrypted items can be brought along to decrypt".into());
@@ -488,6 +501,72 @@ impl Database {
             }).unwrap_or_default();
             op.items.into_iter().filter(|s| in_raid.contains(&s.item.id)).map(|s| s.item).collect()
         })
+    }
+
+    fn unprotected(conn: &Connection, profile: &str, id: &str) -> Result<(), String> {
+        let protected: bool = conn.query_row("SELECT protected FROM items WHERE profile = ?1 AND id = ?2", params![profile,id], |r| r.get(0))
+            .map_err(|_| "Item not found".to_string())?;
+        if protected { Err("Unprotect this item before selling or consuming it.".into()) } else { Ok(()) }
+    }
+
+    pub fn protect_item(&self, profile: &str, id: &str, protected: bool) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        Self::not_in_raid(&conn, profile)?;
+        let changed = conn.execute("UPDATE items SET protected = ?1 WHERE profile = ?2 AND id = ?3", params![protected,profile,id]).map_err(|e| e.to_string())?;
+        if changed == 0 { Err("Item not found".into()) } else { Ok(()) }
+    }
+
+    /// Select overflow to retain; the previewed remainder is sold atomically.
+    pub fn resolve_overflow(&self, profile: &str, expected: &[String], keep: &[String]) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        Self::not_in_raid(&tx, profile)?;
+        let op = Self::load_operator(&tx, profile).ok_or("No operator")?;
+        let overflow: Vec<_> = op.items.iter().filter(|s| s.overflow).collect();
+        let preview: std::collections::HashSet<_> = expected.iter().collect();
+        if preview.len() != expected.len() || preview.len() != overflow.len()
+            || overflow.iter().any(|s| !preview.contains(&s.item.id)) {
+            return Err("Your overflow changed. Review the current items before confirming.".into());
+        }
+        let ids: std::collections::HashSet<_> = keep.iter().collect();
+        if ids.len() != keep.len() || ids.iter().any(|id| !overflow.iter().any(|s| s.item.id == **id)) { return Err("Invalid overflow selection".into()); }
+        let capacity = Self::context_in(&tx, profile, 0).stash_capacity();
+        if Self::stash_size(&tx, profile)? + keep.len() > capacity { return Err("Make room in your stash for the selected items first.".into()); }
+        let mut sold = 0;
+        for item in overflow {
+            if keep.contains(&item.item.id) {
+                tx.execute("UPDATE items SET overflow = 0 WHERE id = ?1", params![item.item.id]).map_err(|e| e.to_string())?;
+            } else {
+                Self::unprotected(&tx, profile, &item.item.id)?;
+                sold += item.item.value;
+                tx.execute("DELETE FROM items WHERE id = ?1", params![item.item.id]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute("UPDATE operators SET cash = cash + ?1 WHERE profile = ?2", params![sold,profile]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn requisition_balance(&self, profile: &str, map: &str) -> u32 {
+        self.conn.lock().unwrap().query_row("SELECT requisition FROM operations WHERE profile = ?1 AND map = ?2", params![profile,map], |r| r.get(0)).unwrap_or(0)
+    }
+
+    pub fn requisition(&self, profile: &str, map: &'static MapDef, kind: ItemKind) -> Result<Item, String> {
+        if !kind.is_gear() { return Err("Choose a weapon, armor or pack.".into()); }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        Self::not_in_raid(&tx, profile)?;
+        let ctx = Self::context_in(&tx, profile, 0);
+        if ctx.facility(Facility::Armory) == 0 { return Err("Build Armory level 1 to request targeted gear.".into()); }
+        let op = Self::load_operator(&tx, profile).ok_or("No operator")?;
+        if op.items.iter().any(|s| s.overflow) || Self::stash_size(&tx, profile)? >= ctx.stash_capacity() { return Err("Resolve overflow and make a stash slot first.".into()); }
+        let changed = tx.execute("UPDATE operations SET requisition = requisition - ?1 WHERE profile = ?2 AND map = ?3 AND requisition >= ?1", params![prog::REQUISITION_COST, profile, map.id]).map_err(|e| e.to_string())?;
+        if changed == 0 { return Err(format!("Earn {} requisition credits by extracting with activity on {}.", prog::REQUISITION_COST, map.name)); }
+        let mut item = Item::new(kind, Rarity::Rare, map.loot_power.1 + 6, None);
+        item.origin_tier = map.tier;
+        item.protected = true;
+        Self::insert_item(&tx, profile, &item, None).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(item)
     }
 
     /// Buy a trader offer into the stash. Returns the new item.
@@ -539,6 +618,7 @@ impl Database {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let op = Self::load_operator(&tx, profile).ok_or("No operator for this profile")?;
+        if op.items.iter().any(|s| s.overflow) { return Err("Review your extraction overflow in the stash before deploying.".into()); }
         if op.in_raid.is_some() { return Err("You're already deployed in another raid.".into()); }
         let ctx = Self::context_in(&tx, profile, now);
         if let Some(account) = &ctx.account {
@@ -605,15 +685,15 @@ impl Database {
             settlement.cash_earned = outcome.bounty + settlement.bonus_cash;
             let capacity = ctx.stash_capacity();
             for item in &outcome.loot {
+                let mut fresh = item.clone();
+                fresh.id = uuid::Uuid::new_v4().to_string();
+                Self::insert_item(&tx, profile, &fresh, None).map_err(|e| e.to_string())?;
                 if stash < capacity {
-                    let mut fresh = item.clone();
-                    fresh.id = uuid::Uuid::new_v4().to_string();
-                    Self::insert_item(&tx, profile, &fresh, None).map_err(|e| e.to_string())?;
                     stash += 1;
                     settlement.items_kept += 1;
                 } else {
-                    settlement.cash_earned += item.value;
-                    settlement.items_auto_sold += 1;
+                    tx.execute("UPDATE items SET overflow = 1 WHERE id = ?1", params![fresh.id]).map_err(|e| e.to_string())?;
+                    settlement.items_pending += 1;
                 }
             }
             tx.execute("UPDATE operators SET cash = cash + ?1, extracts = extracts + 1 WHERE profile = ?2", params![settlement.cash_earned, profile]).map_err(|e| e.to_string())?;
@@ -626,10 +706,15 @@ impl Database {
             tx.execute("UPDATE operators SET deaths = deaths + 1 WHERE profile = ?1", params![profile]).map_err(|e| e.to_string())?;
         }
         if let Some(m) = map {
-            let gained = prog::ops_xp(outcome.result.kept_gear(), outcome.kills, ctx.boost_level);
+            let gained = prog::ops_xp_for(outcome.result.kept_gear(), outcome.kills, &outcome.activity, ctx.boost_level);
             let xp = old_xp + gained;
             tx.execute("INSERT INTO operations (profile, map, xp) VALUES (?1, ?2, ?3) ON CONFLICT(profile, map) DO UPDATE SET xp = ?3",
                 params![profile, m.id, xp]).map_err(|e| e.to_string())?;
+            if outcome.result.kept_gear() {
+                let credits = prog::activity_points(outcome.kills, &outcome.activity);
+                tx.execute("UPDATE operations SET requisition = requisition + ?1 WHERE profile = ?2 AND map = ?3",
+                    params![credits, profile, m.id]).map_err(|e| e.to_string())?;
+            }
             settlement.ops = Some(OpsProgress {
                 map: m.id.to_string(), xp_gained: gained, xp, rank: prog::ops_rank(xp),
                 ranked_up: prog::ops_rank(xp) > prog::ops_rank(old_xp), next: prog::ops_next(xp),
@@ -833,6 +918,9 @@ impl Database {
         if picked.len() < cost.valuables as usize {
             return Err(format!("Tier {next} needs {} {}-or-better valuables in your stash.", cost.valuables, cost.min_rarity.label()));
         }
+        let op = Self::load_operator(&tx, profile).ok_or("No operator")?;
+        let materials: u32 = op.items.iter().filter(|s| picked.contains(&s.item.id)).map(|s| s.item.value).sum();
+        tx.execute("UPDATE operators SET material_investment = material_investment + ?1 WHERE profile = ?2", params![materials, profile]).map_err(|e| e.to_string())?;
         for id in &picked { tx.execute("DELETE FROM items WHERE id = ?1", params![id]).map_err(|e| e.to_string())?; }
         tx.execute("UPDATE operators SET cash = cash - ?1, tier = ?2 WHERE profile = ?3", params![cost.cash, next, profile]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -843,7 +931,7 @@ impl Database {
     fn pick_valuables(conn: &Connection, profile: &str, count: u32, min_rarity: Rarity) -> Vec<String> {
         let Some(op) = Self::load_operator(conn, profile) else { return Vec::new() };
         let mut ok: Vec<&StashItem> = op.items.iter()
-            .filter(|s| s.slot.is_none() && !s.carry && s.item.kind == ItemKind::Valuable && s.item.rarity >= min_rarity).collect();
+            .filter(|s| s.slot.is_none() && !s.carry && !s.overflow && !s.item.protected && s.item.kind == ItemKind::Valuable && s.item.rarity >= min_rarity).collect();
         ok.sort_by_key(|s| s.item.value);
         ok.into_iter().take(count as usize).map(|s| s.item.id.clone()).collect()
     }
@@ -882,15 +970,22 @@ impl Database {
     pub fn collect_workshop(&self, profile: &str, now: i64) -> Result<u32, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        Self::not_in_raid(&tx, profile)?;
         let ctx = Self::context_in(&tx, profile, now);
-        if ctx.facility(Facility::Workshop) == 0 { return Err("Build a Workshop first.".into()); }
+        let rate = prog::workshop_rate(ctx.facility(Facility::Workshop));
+        if rate == 0 { return Ok(0); }
         let made = ctx.workshop_stored(now);
-        tx.execute("UPDATE operators SET cash = cash + ?1, produced_at = ?2 WHERE profile = ?3", params![made, now, profile]).map_err(|e| e.to_string())?;
+        if made > 0 {
+            let seconds_per_dollar = 3600 / rate as i64;
+            let elapsed = (now - ctx.produced_at).max(0);
+            let collected_at = if elapsed >= prog::WORKSHOP_HOURS as i64 * 3600 {
+                now - elapsed % seconds_per_dollar
+            } else { ctx.produced_at + made as i64 * seconds_per_dollar };
+            tx.execute("UPDATE operators SET cash = cash + ?1, produced_at = ?2 WHERE profile = ?3", params![made, collected_at, profile]).map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(made)
     }
-
-    // ---------- Seasons, relocation and Legacy ----------
 
     pub fn account_state(&self, user: &str) -> AccountState {
         let conn = self.conn.lock().unwrap();
@@ -909,10 +1004,26 @@ impl Database {
         st
     }
 
+    fn investment_in(conn: &Connection, profile: &str) -> u32 {
+        let ctx = Self::context_in(conn, profile, 0);
+        let materials: u32 = conn.query_row("SELECT material_investment FROM operators WHERE profile = ?1", params![profile], |r| r.get(0)).unwrap_or(0);
+        materials + (2..=ctx.tier).filter_map(prog::tier_cost).map(|c| c.cash).sum::<u32>()
+            + FACILITIES.iter().map(|&f| (1..=ctx.facility(f)).map(|l| f.cost(l)).sum::<u32>()).sum::<u32>()
+    }
+
+    fn value_in(conn: &Connection, profile: &str) -> u32 {
+        Self::load_operator(conn, profile).map_or(0, |op| op.cash + op.items.iter().map(|s| s.item.value).sum::<u32>() + Self::investment_in(conn, profile))
+    }
+
+    pub fn investment_value(&self, profile: &str) -> u32 {
+        Self::investment_in(&self.conn.lock().unwrap(), profile)
+    }
+
     /// What an operator is worth if it relocated now: cash plus the sale value
     /// of everything it owns.
     pub fn operator_value(&self, profile: &str) -> u32 {
-        self.operator(profile).map_or(0, |op| op.cash + op.items.iter().map(|s| s.item.value).sum::<u32>())
+        let conn = self.conn.lock().unwrap();
+        Self::value_in(&conn, profile)
     }
 
     /// Why the account's active operator can't relocate right now, if it can't.
@@ -941,7 +1052,6 @@ impl Database {
     /// account keeps the Legacy points, stash space, badge and next-season boost.
     pub fn relocate(&self, user: &str, now: i64) -> Result<RelocationReward, String> {
         if let Some(why) = self.relocation_blocker(user, now) { return Err(why); }
-        let reward = self.relocation_preview(user, now).ok_or("Create an operator first.")?;
         let profile = self.active_operator(user).ok_or("Create an operator first.")?;
         let name = self.operator(&profile).map(|o| o.name).unwrap_or_default();
         let season = prog::season_at(now);
@@ -955,6 +1065,9 @@ impl Database {
         tx.execute("INSERT OR IGNORE INTO accounts (user_id) VALUES (?1)", params![user]).map_err(|e| e.to_string())?;
         let last: Option<String> = tx.query_row("SELECT last_relocation FROM accounts WHERE user_id = ?1", params![user], |r| r.get(0)).map_err(|e| e.to_string())?;
         if last.as_deref() == Some(season.id.as_str()) { return Err("Your account already retired an operator this season.".into()); }
+        let (earned, stash, boost): (u32,u32,u32) = tx.query_row("SELECT legacy_earned, stash_bonus, boost_level FROM accounts WHERE user_id = ?1", params![user], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
+        let previous = prog::season_at(season.starts_at - 1).id;
+        let reward = prog::relocation_reward(Self::value_in(&tx, &profile), earned, stash, boost, last.as_deref() == Some(previous.as_str()));
         tx.execute(
             "UPDATE accounts SET legacy_earned = legacy_earned + ?2, stash_bonus = stash_bonus + ?3, relocations = relocations + 1,
                 last_relocation = ?4, boost_level = ?5, boost_season = ?6, active_operator = NULL WHERE user_id = ?1",
@@ -982,6 +1095,25 @@ impl Database {
         conn.execute("INSERT INTO account_perks (user_id, perk, rank) VALUES (?1, ?2, ?3) ON CONFLICT(user_id, perk) DO UPDATE SET rank = ?3",
             params![user, perk.as_str(), rank]).map_err(|e| e.to_string())?;
         Ok(rank)
+    }
+
+    /// Refund all spent points, charging the active operator once. No active raid may change bonuses.
+    pub fn respec(&self, user: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let active: String = tx.query_row("SELECT active_operator FROM accounts WHERE user_id = ?1", params![user], |r| r.get(0)).map_err(|_| "Create an operator first.".to_string())?;
+        let perks = Self::perks_in(&tx, user);
+        if perks.spent() == 0 { return Err("No allocated Legacy points to reset.".into()); }
+        for id in Self::account_operator_ids(&tx, user) {
+            Self::not_in_raid(&tx, &id)?;
+            let mut ctx = Self::context_in(&tx, &id, 0);
+            ctx.perks = Perks::default();
+            if Self::stash_size(&tx, &id)? > ctx.stash_capacity() { return Err("Make room in every operator's stash before removing Packrat.".into()); }
+        }
+        let changed = tx.execute("UPDATE operators SET cash = cash - ?1 WHERE profile = ?2 AND account = ?3 AND cash >= ?1", params![prog::RESPEC_COST,active,user]).map_err(|e| e.to_string())?;
+        if changed == 0 { return Err(format!("The active operator needs ${} to reset Legacy perks.", prog::RESPEC_COST)); }
+        tx.execute("DELETE FROM account_perks WHERE user_id = ?1", params![user]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Attach a provider identity (Steam, Bluesky, ...) to an existing account.
@@ -1467,7 +1599,7 @@ mod stash_tests {
     }
 
     fn outcome(result: RaidResult, loot: Vec<Item>, bounty: u32) -> RaidOutcome {
-        RaidOutcome { player_id: "p".into(), name: "P".into(), result, extract_name: None, killed_by: None, loot, lost: Vec::new(), bounty, kills: 3, max_combo: 2, survived_secs: 60.0 }
+        RaidOutcome { player_id: "p".into(), name: "P".into(), result, extract_name: None, killed_by: None, loot, lost: Vec::new(), bounty, kills: 3, activity: crate::types::RaidActivity::default(), max_combo: 2, survived_secs: 60.0 }
     }
 
     #[test]
@@ -1581,15 +1713,22 @@ mod stash_tests {
     }
 
     #[test]
-    fn a_full_stash_sells_overflow_loot_on_extraction() {
+    fn a_full_stash_requires_a_review_before_overflow_sales() {
         let db = Database::open(":memory:").unwrap();
         db.begin_raid("p", "outskirts", 0).unwrap();
         let loot: Vec<Item> = (0..gear::STASH_CAPACITY + 2).map(|_| Item::new(ItemKind::Valuable, Rarity::Common, 5, Some("Junk".into()))).collect();
         let worth = loot[0].value;
         let s = db.finish_raid("p", &outcome(RaidResult::Extracted, loot, 0)).unwrap();
         assert_eq!(s.items_kept as usize, gear::STASH_CAPACITY);
-        assert_eq!(s.items_auto_sold, 2);
-        assert_eq!(s.cash_earned, worth * 2);
+        assert_eq!(s.items_auto_sold, 0);
+        assert_eq!(s.items_pending, 2);
+        assert_eq!(s.cash_earned, 0);
+        let pending: Vec<String> = db.operator("p").unwrap().items.iter().filter(|s| s.overflow).map(|s| s.item.id.clone()).collect();
+        assert!(db.begin_raid("p", "r", 0).is_err());
+        assert!(db.resolve_overflow("p", &[], &[]).is_err(), "stale preview cannot sell new loot");
+        db.resolve_overflow("p", &pending, &[]).unwrap();
+        assert_eq!(db.operator("p").unwrap().cash, s.cash + worth * 2);
+        assert!(db.resolve_overflow("p", &pending, &[]).is_err(), "no repeated payout");
     }
 
     #[test]
@@ -1746,7 +1885,7 @@ mod stash_tests {
         assert_eq!(db.operator(&op).unwrap().cash, cash - Facility::Workshop.cost(1));
         assert_eq!(db.collect_workshop(&op, 1_000 + 2 * 3600).unwrap(), 2 * prog::workshop_rate(1));
         assert_eq!(db.collect_workshop(&op, 1_000 + 2 * 3600).unwrap(), 0, "collected already");
-        assert!(db.collect_workshop(&db.create_operator(&user, "Idle", false, 0).unwrap(), 99_999).is_err());
+        assert_eq!(db.collect_workshop(&db.create_operator(&user, "Idle", false, 0).unwrap(), 99_999).unwrap(), 0);
     }
 
     #[test]
@@ -1758,7 +1897,7 @@ mod stash_tests {
         {
             let conn = db.conn.lock().unwrap();
             conn.execute("UPDATE items SET power = 40 WHERE profile = ?1", params![op]).unwrap();
-            conn.execute("INSERT INTO operations (profile, map, xp) VALUES (?1, 'rustyard', 140)", params![op]).unwrap();
+            conn.execute("INSERT INTO operations (profile, map, xp) VALUES (?1, 'rustyard', 144)", params![op]).unwrap();
         }
         give(&db, &op, 10_000, &[]);
         db.deploy(&op, "r", rusty, false).unwrap();

@@ -22,6 +22,10 @@ use crate::navigation::{self, Navigation};
 use crate::spatial_grid::SpatialGrid;
 use crate::types::*;
 
+#[cfg(test)]
+#[path = "mechanics_tests.rs"]
+mod mechanics_tests;
+
 // ---------- Spatial-grid helper structs ----------
 
 #[derive(Clone, Debug)]
@@ -82,7 +86,7 @@ struct CrateInternal {
     id: String,
     x: f64,
     y: f64,
-    respawn_at: Option<f64>,
+    claimed: HashSet<String>,
 }
 
 struct DropInternal {
@@ -94,6 +98,7 @@ struct DropInternal {
     item: Option<Item>,
     /// A player who just swapped this out of their pack can't pick it straight back up.
     blocked: Option<(String, f64)>,
+    claimant: Option<String>,
 }
 
 // ---------- Explosion event ----------
@@ -232,7 +237,7 @@ fn zombie_base_stats(zombie_type: &ZombieType) -> (f64, f64) {
 /// Bounty for a kill. Hunters sent after campers pay only their base bounty,
 /// so camping on purpose to farm them doesn't pay.
 fn kill_bounty(z: &Zombie, was_hunter: bool) -> f64 {
-    let elite = z.elite && z.target.is_none() && !was_hunter;
+    let elite = z.elite && !z.hunter && z.target.is_none() && !was_hunter;
     zombie_bounty(&z.zombie_type) * if elite { ELITE_BOUNTY } else { 1.0 }
 }
 
@@ -273,6 +278,7 @@ fn make_zombie(map: &MapDef, kind: ZombieType, elite: bool, x: f64, y: f64) -> Z
         speed: (speed * map.enemy_speed * if elite { 1.1 } else { 1.0 }).min(ABOMINATION_MAX_SPEED),
         elite,
         target: None,
+        hunter: false,
     }
 }
 
@@ -310,15 +316,22 @@ fn roll_supply_drop(zombie_type: &ZombieType, x: f64, y: f64, game_time: f64) ->
     };
     Some(DropInternal {
         id: short_id(), drop_type, x, y,
-        despawn_at: game_time + DROP_DESPAWN_TIME, item: None, blocked: None,
+        despawn_at: game_time + DROP_DESPAWN_TIME, item: None, blocked: None, claimant: None,
     })
 }
 
 fn loot_drop(item: Item, x: f64, y: f64, game_time: f64) -> DropInternal {
     DropInternal {
         id: short_id(), drop_type: DropType::Loot, x, y,
-        despawn_at: game_time + LOOT_DESPAWN_TIME, item: Some(item), blocked: None,
+        despawn_at: game_time + LOOT_DESPAWN_TIME, item: Some(item), blocked: None, claimant: None,
     }
+}
+
+fn record_hit(contributions: &mut HashMap<String, HashMap<String, (f64, f64)>>, z: &Zombie, player: &str, damage: f64, now: f64) {
+    let hit = contributions.entry(z.id.clone()).or_default().entry(player.to_string()).or_insert((0.0, now));
+    if now - hit.1 > 12.0 { hit.0 = 0.0; }
+    hit.0 += damage.max(0.0).min(z.health.max(0.0));
+    hit.1 = now;
 }
 
 fn award_kill_to_player(p: &mut Player, base_bounty: f64, map_mult: f64) {
@@ -435,6 +448,8 @@ pub struct Game {
     boss_quarry: HashMap<String, String>,
     /// Players decrypting at an uplink last tick (id, x, y): the noise draws monsters.
     decrypt_noise: Vec<(String, f64, f64)>,
+    contributions: HashMap<String, HashMap<String, (f64, f64)>>,
+    credited_revives: HashSet<String>,
 }
 
 impl Game {
@@ -446,7 +461,7 @@ impl Game {
             id: format!("ammo_{}", i), x: p.x, y: p.y, amount: AMMO_PICKUP_AMOUNT, respawn_at: None,
         }).collect();
         let crates = layout.crates.iter().enumerate().map(|(i, p)| CrateInternal {
-            id: format!("crate_{}", i), x: p.x, y: p.y, respawn_at: None,
+            id: format!("crate_{}", i), x: p.x, y: p.y, claimed: HashSet::new(),
         }).collect();
         let (w, h) = (layout.width, layout.height);
 
@@ -491,6 +506,8 @@ impl Game {
             acted: HashSet::new(),
             boss_quarry: HashMap::new(),
             decrypt_noise: Vec::new(),
+            contributions: HashMap::new(),
+            credited_revives: HashSet::new(),
             layout,
         }
     }
@@ -510,6 +527,7 @@ impl Game {
         self.zombie_wall_stuck.clear();
         self.zombie_home.clear();
         self.zombie_brains.clear();
+        self.contributions.clear();
         self.boss_quarry.clear();
         self.decrypt_noise.clear();
         for p in self.players.values_mut() { p.camp = 0.0; p.hunted = false; p.decrypt = 0.0; }
@@ -518,7 +536,7 @@ impl Game {
         self.paused = false;
         self.inputs.clear();
         for pickup in &mut self.ammo_pickups { pickup.respawn_at = None; }
-        for c in &mut self.crates { c.respawn_at = None; }
+        // Crate claims belong to deployments and survive world resets.
     }
 
     /// Deploy a player into the raid with their loadout. Squadmates who deploy
@@ -574,6 +592,7 @@ impl Game {
             combo_timer: 0.0,
             max_combo: 0,
             kills: 0,
+            activity: RaidActivity::default(),
             tactical_items: pack.map_or(gear::NO_PACK_TACTICAL, gear::pack_tactical),
             bounty: 0.0,
             backpack,
@@ -597,6 +616,10 @@ impl Game {
         }
         self.join_order.retain(|player| player != id);
         self.players.remove(id);
+        for c in &mut self.crates { c.claimed.remove(id); }
+        self.drops.retain(|d| d.claimant.as_deref() != Some(id));
+        for hits in self.contributions.values_mut() { hits.remove(id); }
+        self.credited_revives.remove(id);
         self.player_names.remove(id);
         self.deployed_at.remove(id);
         self.inputs.remove(id);
@@ -642,6 +665,7 @@ impl Game {
             },
             bounty: p.bounty.max(0.0) as u32,
             kills: p.kills,
+            activity: p.activity.clone(),
             max_combo: p.max_combo,
             survived_secs: (self.map.raid_secs - p.raid_time).max(0.0),
         }
@@ -672,6 +696,33 @@ impl Game {
             self.inputs.clear();
         }
         true
+    }
+
+    fn award_coop_kill(&mut self, killer: &str, zombie: &str, bounty: f64) {
+        let hits = self.contributions.remove(zombie).unwrap_or_default();
+        let max_health = self.zombies.iter().find(|z| z.id == zombie).map_or(1.0, |z| z.max_health);
+        let mut eligible: Vec<(String, f64)> = hits.into_iter()
+            .filter(|(id, (damage, at))| self.players.contains_key(id) && self.game_time - at <= 12.0
+                && (id == killer || *damage >= max_health * 0.1))
+            .map(|(id, (damage, _))| (id, damage)).collect();
+        if self.players.contains_key(killer) && !eligible.iter().any(|(id,_)| id == killer) {
+            eligible.push((killer.to_string(), 1.0));
+        }
+        eligible.sort_by(|a,b| a.0.cmp(&b.0));
+        // Combo belongs to the final hit; a single bounded bounty pool is split by damage.
+        let mult = self.players.get(killer).map_or(1.0, |p| (1.0 + p.combo as f64 * 0.2).min(COMBO_MAX_MULT));
+        let pool = (bounty * self.map.bounty_mult * mult).round() as u32;
+        let total: f64 = eligible.iter().map(|(_,d)| *d).sum();
+        let mut remaining = pool;
+        let len = eligible.len();
+        for (i,(id,damage)) in eligible.into_iter().enumerate() {
+            let share = if i+1 == len { remaining } else { (pool as f64 * damage / total).floor() as u32 };
+            remaining -= share;
+            if let Some(p) = self.players.get_mut(&id) {
+                if id == killer { award_kill_to_player(p, 0.0, 1.0); } else { p.activity.assists += 1; }
+                p.bounty += share as f64;
+            }
+        }
     }
 
     pub fn handle_input(&mut self, id: &str, input: ClientInput) {
@@ -725,6 +776,7 @@ impl Game {
         };
         for mut z in pack {
             z.target = Some(quarry.to_string());
+            z.hunter = true;
             if let Some(home) = home { self.zombie_home.insert(z.id.clone(), home); }
             self.boss_quarry.insert(z.id.clone(), quarry.to_string());
             self.zombies.push(z);
@@ -759,13 +811,14 @@ impl Game {
         // Enemies killed this tick. They're removed (and drop loot) at the end of
         // the tick, so indices from the zombie grid stay valid for every player.
         let mut zombie_kill_indices: Vec<usize> = Vec::new();
+        let mut kill_awards: Vec<(String, String, f64)> = Vec::new();
 
         // ---------- Players ----------
         let player_ids: Vec<String> = self.players.keys().cloned().collect();
         // One-shot actions (dash, drop, place) apply once per input message: the
         // stored input is reused every tick until the next one arrives.
         for input in self.inputs.values_mut() {
-            if input.consumed { input.dash = false; input.drop_item = false; input.drop_id = None; input.place_item = 0; }
+            if input.consumed { input.dash = false; input.drop_item = false; input.drop_id = None; input.protect_id = None; input.place_item = 0; }
             input.consumed = true;
         }
         for pid in &player_ids {
@@ -784,6 +837,12 @@ impl Game {
                 Some(i) => i.clone(),
                 None => continue,
             };
+
+            if let Some(id) = &input.protect_id {
+                if let Some(item) = self.players.get_mut(pid).and_then(|p| p.backpack.iter_mut().find(|i| &i.id == id)) {
+                    item.protected = !item.protected;
+                }
+            }
 
             // Dash: up to 3 charges, i-frames and a shockwave.
             let mut just_dashed = false;
@@ -863,7 +922,7 @@ impl Game {
                     Some(id) => p.backpack.iter().position(|i| &i.id == id),
                     None => p.backpack.len().checked_sub(1),
                 };
-                if let Some(idx) = pick {
+                if let Some(idx) = pick.filter(|&i| !p.backpack[i].protected) {
                     // Dropping the item being decrypted restarts the timer.
                     if p.backpack.iter().position(|i| i.kind == ItemKind::Encrypted) == Some(idx) { p.decrypt = 0.0; }
                     let item = p.backpack.remove(idx);
@@ -917,7 +976,7 @@ impl Game {
                     if (bdx * bdx + bdy * bdy).sqrt() <= MELEE_RANGE + BARREL_RADIUS {
                         let mut angle_diff = (bdy.atan2(bdx) - p_angle).abs();
                         if angle_diff > PI { angle_diff = 2.0 * PI - angle_diff; }
-                        if angle_diff <= MELEE_ARC / 2.0 {
+                        if angle_diff <= MELEE_ARC / 2.0 && navigation::clear_path(&self.layout.walls, (px, py), (pl.pos.x, pl.pos.y), 0.0) {
                             pl.health = 0.0;
                             explosions.push(ExplosionEvent { x: pl.pos.x, y: pl.pos.y, radius: BARREL_EXPLOSION_RADIUS, damage: BARREL_DAMAGE * map.enemy_health, owner_id: pid.clone() });
                         }
@@ -937,10 +996,12 @@ impl Game {
                     if dist > MELEE_RANGE { continue; }
                     let mut angle_diff = (zdy.atan2(zdx) - p_angle).abs();
                     if angle_diff > PI { angle_diff = 2.0 * PI - angle_diff; }
-                    if angle_diff > MELEE_ARC / 2.0 { continue; }
+                    if angle_diff > MELEE_ARC / 2.0 || !navigation::clear_path(&self.layout.walls, (px, py), (z.pos.x, z.pos.y), 0.0) { continue; }
 
                     let is_crit = rng.random::<f64>() < crit_chance;
-                    self.zombies[zi].health -= crate::types::MELEE_DAMAGE * dmg_mult * if is_crit { CRIT_DAMAGE_MULT } else { 1.0 };
+                    let damage = crate::types::MELEE_DAMAGE * dmg_mult * if is_crit { CRIT_DAMAGE_MULT } else { 1.0 };
+                    record_hit(&mut self.contributions, z, pid, damage, self.game_time);
+                    self.zombies[zi].health -= damage;
                     if dist > 0.0 {
                         let z = &mut self.zombies[zi];
                         z.pos.x = clampz(z.pos.x + zdx / dist * 48.0, map_w);
@@ -951,7 +1012,7 @@ impl Game {
                         zombie_kill_indices.push(zi);
                         if let Some(p) = self.players.get_mut(pid) {
                             let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
-                            award_kill_to_player(p, kill_bounty(&z, was_hunter), map.bounty_mult);
+                            kill_awards.push((pid.clone(), z.id.clone(), kill_bounty(&z, was_hunter)));
                             p.health = (p.health + p.max_health * 0.04).min(p.max_health);
                         }
                     }
@@ -1019,20 +1080,23 @@ impl Game {
             }
             let mut rng = rand::rng();
             for c in &mut self.crates {
-                if c.respawn_at.is_some() { continue; }
+                if c.claimed.contains(pid) { continue; }
                 if f64::hypot(p.pos.x - c.x, p.pos.y - c.y) < PLAYER_RADIUS + CRATE_RADIUS + 6.0 {
-                    c.respawn_at = Some(self.game_time + CRATE_RESPAWN_TIME);
+                    c.claimed.insert(pid.clone());
+                    p.activity.crates += 1;
                     let contents = gear::roll_crate(&mut rng, map);
                     let n = contents.len();
                     for (i, item) in contents.into_iter().enumerate() {
                         // Spill the loot in a ring so each item can be picked up on its own.
                         let a = i as f64 / n as f64 * 2.0 * PI + rng.random_range(0.0..0.6);
-                        new_drops.push(loot_drop(item, c.x + a.cos() * 34.0, c.y + a.sin() * 34.0, self.game_time));
+                        let mut drop = loot_drop(item, c.x + a.cos() * 34.0, c.y + a.sin() * 34.0, self.game_time);
+                        drop.claimant = Some(pid.clone());
+                        new_drops.push(drop);
                     }
                     if rng.random::<f64>() < 0.45 {
                         new_drops.push(DropInternal {
                             id: short_id(), drop_type: DropType::Ammo, x: c.x, y: c.y + 2.0,
-                            despawn_at: self.game_time + DROP_DESPAWN_TIME, item: None, blocked: None,
+                            despawn_at: self.game_time + DROP_DESPAWN_TIME, item: None, blocked: None, claimant: Some(pid.clone()),
                         });
                     }
                 }
@@ -1040,7 +1104,7 @@ impl Game {
 
             let mut taken = Vec::new();
             for (di, drop) in self.drops.iter_mut().enumerate() {
-                if drop.despawn_at <= self.game_time { continue; }
+                if drop.despawn_at <= self.game_time || drop.claimant.as_ref().is_some_and(|id| id != pid) { continue; }
                 if f64::hypot(p.pos.x - drop.x, p.pos.y - drop.y) >= PLAYER_RADIUS + DROP_PICKUP_RADIUS { continue; }
                 if let Some((who, until)) = &drop.blocked {
                     if who == pid && *until > self.game_time { continue; }
@@ -1072,6 +1136,7 @@ impl Game {
                             drop.id = short_id();
                             drop.despawn_at = self.game_time + LOOT_DESPAWN_TIME;
                             drop.blocked = Some((pid.clone(), self.game_time + 4.0));
+                            drop.claimant = None;
                             continue;
                         }
                     }
@@ -1086,9 +1151,6 @@ impl Game {
         // Respawning caches and crates
         for pickup in &mut self.ammo_pickups {
             if pickup.respawn_at.is_some_and(|t| self.game_time >= t) { pickup.respawn_at = None; }
-        }
-        for c in &mut self.crates {
-            if c.respawn_at.is_some_and(|t| self.game_time >= t) { c.respawn_at = None; }
         }
 
         // ---------- Bullets ----------
@@ -1213,7 +1275,6 @@ impl Game {
         let player_positions: HashMap<String, (f64, f64)> = self.players.values()
             .filter(|p| p.health > 0.0).map(|p| (p.id.clone(), (p.pos.x, p.pos.y))).collect();
         let mut bullet_kill_indices: Vec<usize> = Vec::new();
-        let mut kill_awards: Vec<(String, f64)> = Vec::new();
         let mut damage_to_players: Vec<(String, DamageHit)> = Vec::new();
 
         for zi in (0..self.zombies.len()).rev() {
@@ -1303,6 +1364,15 @@ impl Game {
                 }
             }
 
+            // A disengaging enemy may defend locally, but never restart an endless chase.
+            if brain.returning {
+                target = self.contributions.get(&zid).and_then(|hits| hits.iter()
+                    .filter(|(_, (_, at))| self.game_time - at <= 2.0)
+                    .filter_map(|(id, _)| player_positions.get(id).map(|&(x,y)| (id.clone(),x,y)))
+                    .filter(|(_,x,y)| f64::hypot(x-zx,y-zy) <= 100.0
+                        && navigation::clear_path(&self.layout.walls,(zx,zy),(*x,*y),0.0))
+                    .min_by(|a,b| f64::hypot(a.1-zx,a.2-zy).total_cmp(&f64::hypot(b.1-zx,b.2-zy))));
+            }
             let z_type = self.zombies[zi].zombie_type.clone();
             let (mut move_dx, mut move_dy, speed_scale, tx, ty) = if let Some((_, tx, ty)) = &target {
                 let (tdx, tdy) = (tx - zx, ty - zy);
@@ -1391,10 +1461,11 @@ impl Game {
                             z.pos.y += (bdy / bdist) * overlap;
                         }
                         pl.health -= 22.0 * dt;
+                        record_hit(&mut self.contributions, z, &pl.owner_id, BARRICADE_CONTACT_DAMAGE * dt, self.game_time);
                         z.health -= BARRICADE_CONTACT_DAMAGE * dt;
                         if z.health <= 0.0 && !zombie_kill_indices.contains(&zi) {
                             let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
-                            kill_awards.push((pl.owner_id.clone(), kill_bounty(z, was_hunter)));
+                            kill_awards.push((pl.owner_id.clone(), z.id.clone(), kill_bounty(z, was_hunter)));
                             zombie_kill_indices.push(zi);
                         }
                     }
@@ -1479,6 +1550,7 @@ impl Game {
                     explosions.push(ExplosionEvent { x: ix, y: iy, radius: ROCKET_EXPLOSION_RADIUS, damage, owner_id });
                     break;
                 }
+                record_hit(&mut self.contributions, &self.zombies[zi], &owner_id, damage, self.game_time);
                 self.zombies[zi].health -= damage;
                 let b_speed = (vx * vx + vy * vy).sqrt();
                 if b_speed > 0.0 {
@@ -1495,7 +1567,7 @@ impl Game {
                 if self.zombies[zi].health <= 0.0 {
                     let z = &self.zombies[zi];
                     let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
-                    kill_awards.push((owner_id, kill_bounty(z, was_hunter)));
+                    kill_awards.push((owner_id, z.id.clone(), kill_bounty(z, was_hunter)));
                     zombie_kill_indices.push(zi);
                     break;
                 }
@@ -1511,7 +1583,9 @@ impl Game {
                 let dist = (dx * dx + dy * dy).sqrt();
                 if dist >= exp.radius { continue; }
                 // Full damage at the centre, 40% at the edge.
-                z.health -= exp.damage * (1.0 - 0.6 * dist / exp.radius);
+                let damage = exp.damage * (1.0 - 0.6 * dist / exp.radius);
+                record_hit(&mut self.contributions, z, &exp.owner_id, damage, self.game_time);
+                z.health -= damage;
                 if dist > 0.0 {
                     let kb = 60.0 * (1.0 - dist / exp.radius).max(0.35);
                     z.pos.x = clampz(z.pos.x + dx / dist * kb, map_w);
@@ -1519,7 +1593,7 @@ impl Game {
                 }
                 if z.health <= 0.0 && !zombie_kill_indices.contains(&zi) {
                     let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
-                    kill_awards.push((exp.owner_id.clone(), kill_bounty(z, was_hunter)));
+                    kill_awards.push((exp.owner_id.clone(), z.id.clone(), kill_bounty(z, was_hunter)));
                     zombie_kill_indices.push(zi);
                 }
             }
@@ -1562,10 +1636,8 @@ impl Game {
             }
         }
 
-        for (pid, bounty) in &kill_awards {
-            if let Some(p) = self.players.get_mut(pid) {
-                award_kill_to_player(p, *bounty, map.bounty_mult);
-            }
+        for (pid, zid, bounty) in &kill_awards {
+            self.award_coop_kill(pid, zid, *bounty);
         }
 
         // Remove dead enemies and roll their drops
@@ -1579,6 +1651,7 @@ impl Game {
                 self.zombie_wall_stuck.remove(&z.id);
                 self.zombie_home.remove(&z.id);
                 self.zombie_brains.remove(&z.id);
+                self.contributions.remove(&z.id);
                 self.boss_quarry.remove(&z.id);
                 self.zombies.swap_remove(zi);
             }
@@ -1602,6 +1675,7 @@ impl Game {
                 for id in &culled {
                     self.zombie_home.remove(id);
                     self.zombie_brains.remove(id);
+                    self.contributions.remove(id);
                     self.zombie_attack_cooldowns.remove(id);
                     self.zombie_wall_stuck.remove(id);
                 }
@@ -1626,6 +1700,7 @@ impl Game {
         let alive_positions: Vec<(String, f64, f64)> = self.players.values()
             .filter(|p| p.health > 0.0).map(|p| (p.id.clone(), p.pos.x, p.pos.y)).collect();
         let mut noise = Vec::new();
+        let mut revive_awards = Vec::new();
         let mut decrypt_rng = rand::rng();
         for p in self.players.values_mut() {
             p.raid_time = (p.raid_time - dt).max(0.0);
@@ -1641,7 +1716,7 @@ impl Game {
                         p.decrypt += dt;
                         noise.push((p.id.clone(), p.pos.x, p.pos.y));
                         if p.decrypt >= gear::decrypt_secs(p.backpack[idx].rarity) {
-                            p.backpack[idx] = gear::decrypt(&mut decrypt_rng, &p.backpack[idx]);
+                            p.backpack[idx] = gear::decrypt_at(&mut decrypt_rng, &p.backpack[idx], map.tier);
                             p.decrypt = 0.0;
                         }
                     }
@@ -1662,14 +1737,18 @@ impl Game {
 
             // Downed: a squadmate standing close revives you; otherwise you bleed out.
             let reviver = alive_positions.iter()
-                .find(|(aid, ax, ay)| *aid != p.id && f64::hypot(ax - p.pos.x, ay - p.pos.y) < REVIVE_RANGE)
+                .find(|(aid, ax, ay)| *aid != p.id && f64::hypot(ax - p.pos.x, ay - p.pos.y) < REVIVE_RANGE
+                    && navigation::clear_path(&self.layout.walls, (*ax,*ay), (p.pos.x,p.pos.y), 0.0))
                 .map(|(aid, _, _)| aid.clone());
             match reviver {
                 Some(reviver_id) => {
                     let entry = self.revive_progress.entry(p.id.clone()).or_insert((reviver_id.clone(), 0.0));
-                    if entry.0 != reviver_id { *entry = (reviver_id, 0.0); }
+                    if entry.0 != reviver_id { *entry = (reviver_id.clone(), 0.0); }
                     entry.1 += dt;
                     if entry.1 >= REVIVE_TIME {
+                        if !p.damage_log.is_empty() && self.credited_revives.insert(p.id.clone()) {
+                            revive_awards.push(reviver_id);
+                        }
                         p.health = (p.max_health * REVIVE_FRACTION).round();
                         p.bleedout = 0.0;
                         p.damage_log.clear();
@@ -1688,6 +1767,7 @@ impl Game {
                 }
             }
         }
+        for id in revive_awards { if let Some(p) = self.players.get_mut(&id) { p.activity.revives += 1; } }
         self.decrypt_noise = noise;
         for (id, result, extract) in finished {
             self.finish_raid(&id, result, extract);
@@ -1699,6 +1779,8 @@ impl Game {
             out.push(d);
         }
         let mut rng = rand::rng();
+        // Pressure enemies never become premium loot sources, even after expiry.
+        if z.hunter { return; }
         if z.zombie_type == ZombieType::Abomination {
             // The reward for surviving one: a lucky piece of gear, a valuable and a sealed prize.
             for i in 0..3 {
@@ -1712,7 +1794,7 @@ impl Game {
             }
             return;
         }
-        let elite = z.elite && z.target.is_none();
+        let elite = z.elite && !z.hunter && z.target.is_none();
         // Fights are worth more on harder maps: +35% loot chance per tier above 1.
         let tier_bonus = 1.0 + (map.tier as f64 - 1.0) * 0.35;
         if rng.random::<f64>() < (gear::enemy_loot_chance(&z.zombie_type, elite) * tier_bonus).min(0.95) {
@@ -1739,6 +1821,7 @@ impl Game {
             drop_type: d.drop_type.clone(),
             pos: Vector2 { x: d.x, y: d.y },
             item: d.item.clone(),
+            claimant: d.claimant.clone(),
         }).collect()
     }
 
@@ -1748,8 +1831,8 @@ impl Game {
         self.ammo_pickups.iter().map(|p| AmmoPickupState { id: p.id.clone(), available: p.respawn_at.is_none() }).collect()
     }
 
-    pub fn crate_availability(&self) -> Vec<AmmoPickupState> {
-        self.crates.iter().map(|c| AmmoPickupState { id: c.id.clone(), available: c.respawn_at.is_none() }).collect()
+    pub fn crate_availability(&self, player: &str) -> Vec<AmmoPickupState> {
+        self.crates.iter().map(|c| AmmoPickupState { id: c.id.clone(), available: !c.claimed.contains(player) }).collect()
     }
 
     pub fn ammo_spawn_points(&self) -> Vec<AmmoSpawnPoint> {
@@ -1793,7 +1876,7 @@ pub mod test_support {
     }
 
     pub fn enemy(id: &str, kind: ZombieType, x: f64, y: f64, health: f64, speed: f64) -> Zombie {
-        Zombie { id: id.into(), zombie_type: kind, pos: Vector2 { x, y }, health, max_health: health, speed, elite: false, target: None }
+        Zombie { id: id.into(), zombie_type: kind, pos: Vector2 { x, y }, health, max_health: health, speed, elite: false, target: None, hunter: false }
     }
 
     pub fn idle_input() -> ClientInput {
@@ -2021,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_crate_spills_loot_and_the_crate_restocks_later() {
+    fn crates_are_claimed_once_per_deployment_and_fresh_for_other_players() {
         let mut game = game();
         game.add_player("p", "P", &kit(5, 5, 5));
         game.clear_zombies();
@@ -2029,13 +2112,18 @@ mod tests {
         game.player_mut("p").pos = Vector2 { x: c.x, y: c.y };
         game.handle_input("p", idle_input());
         game.update(1.0 / 60.0);
-        assert!(!game.crate_availability()[0].available);
+        assert!(!game.crate_availability("p")[0].available);
         let loot = game.drops().iter().filter(|d| d.drop_type == DropType::Loot).count();
         let picked = game.players()["p"].backpack.len();
         assert!(loot + picked >= 1, "a crate holds at least one item");
-        game.crates[0].respawn_at = Some(game.time() + 0.01);
         game.update(1.0 / 60.0);
-        assert!(game.crate_availability()[0].available);
+        assert!(!game.crate_availability("p")[0].available);
+        assert_eq!(game.players()["p"].activity.crates, 1);
+        game.add_player("q", "Q", &kit(5,5,5));
+        assert!(game.crate_availability("q")[0].available);
+        game.remove_player("p");
+        game.add_player("p", "P", &kit(5,5,5));
+        assert!(game.crate_availability("p")[0].available);
     }
 
     #[test]
@@ -2104,7 +2192,7 @@ mod tests {
     }
 
     #[test]
-    fn the_abomination_hunts_from_anywhere_and_pays_out_on_death() {
+    fn the_abomination_hunts_from_anywhere_without_premium_loot() {
         let mut game = game();
         game.add_player("p", "P", &kit(5, 5, 5));
         let (x, y) = isolate(&mut game, "p");
@@ -2120,7 +2208,7 @@ mod tests {
         assert!(b.pos.x < far - 20.0, "the boss is coming");
         let mut out = Vec::new();
         Game::roll_kill_drops(game.map(), b, 0.0, &mut out);
-        assert_eq!(out.iter().filter(|d| d.drop_type == DropType::Loot).count(), 3, "guaranteed loot");
+        assert_eq!(out.iter().filter(|d| d.drop_type == DropType::Loot).count(), 0, "hunters never grant premium loot");
         assert!(make_zombie(game.map(), ZombieType::Abomination, false, 0.0, 0.0).speed >= 140.0, "too fast to simply walk away from");
         assert_eq!(make_zombie(game.map(), ZombieType::Abomination, false, 0.0, 0.0).max_health, 1400.0);
     }
@@ -2333,15 +2421,15 @@ mod tests {
     }
 
     #[test]
-    fn reset_world_restocks_but_keeps_players_raiding() {
+    fn reset_world_preserves_deployment_loot_claims() {
         let mut game = game();
         game.add_player("p", "P", &kit(5, 5, 5));
-        game.crates[0].respawn_at = Some(1e9);
+        game.crates[0].claimed.insert("p".into());
         game.push_zombie(enemy("z", ZombieType::Zombie, 500.0, 500.0, 10.0, 0.0));
         game.player_mut("p").raid_time = 100.0;
         game.reset_world();
         assert!(game.zombies().is_empty());
-        assert!(game.crate_availability()[0].available);
+        assert!(!game.crate_availability("p")[0].available);
         assert_eq!(game.players()["p"].raid_time, 100.0);
     }
 

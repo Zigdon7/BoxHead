@@ -594,6 +594,13 @@
     .rp-row .row-meta { display: block; }
     .value-open { color: #4fe3f7; font-weight: 700; }
     .stash-list.with-bar { padding-bottom: 90px; }
+    .reward-review { grid-column: 1 / -1; margin: 12px 0; padding: 16px; border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--surface-raised); }
+    .reward-review[hidden] { display: none; }
+    .reward-review h3 { margin: 0 0 8px; }
+    .reward-review .cmp-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 10px 0; }
+    .reward-review label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 200px; }
+    .reward-review input[type="checkbox"] { flex: none; }
+    .reward-review select { max-width: 100%; }
     .trader-caption { font-size: 12px; color: var(--text-muted); margin-top: -4px; }
 
     .mobile-only { display: none; }

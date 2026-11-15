@@ -156,6 +156,12 @@ pub struct Item {
     pub name: String,
     /// What the trader pays for it.
     pub value: u32,
+    /// Protected items cannot be automatically replaced, sold or consumed.
+    #[serde(default)]
+    pub protected: bool,
+    /// Zero denotes an older item with no recorded origin.
+    #[serde(default)]
+    pub origin_tier: u32,
 }
 
 pub const MAX_POWER: u32 = 100;
@@ -164,7 +170,7 @@ impl Item {
     pub fn new(kind: ItemKind, rarity: Rarity, power: u32, name: Option<String>) -> Self {
         let power = power.clamp(1, MAX_POWER);
         let name = name.unwrap_or_else(|| default_name(kind, power));
-        Self { id: uuid::Uuid::new_v4().to_string(), kind, rarity, power, value: sell_value(kind, rarity, power), name }
+        Self { id: uuid::Uuid::new_v4().to_string(), kind, rarity, power, value: sell_value(kind, rarity, power), name, protected: false, origin_tier: 0 }
     }
 
     #[cfg(test)]
@@ -231,7 +237,7 @@ pub fn swap_target(pack: &[Item], incoming: &Item) -> Option<usize> {
     let gear = incoming.kind.is_gear();
     let score = |i: &Item| if gear { i.power } else { pack_worth(i) };
     let (idx, low) = pack.iter().enumerate()
-        .filter(|(_, i)| i.kind.is_gear() == gear)
+        .filter(|(_, i)| !i.protected && i.kind.is_gear() == gear)
         .min_by_key(|(_, i)| score(i))?;
     (score(incoming) > score(low)).then_some(idx)
 }
@@ -265,7 +271,10 @@ pub fn estimated_value(item: &Item) -> u32 {
 /// Seal an item: its rarity (signal strength) and power stay visible, its kind doesn't.
 pub fn seal(rng: &mut impl Rng, item: &Item) -> Item {
     let name = ENCRYPTED_NAMES[rng.random_range(0..ENCRYPTED_NAMES.len())];
-    Item::new(ItemKind::Encrypted, item.rarity, item.power, Some(name.to_string()))
+    let mut sealed = Item::new(ItemKind::Encrypted, item.rarity, item.power, Some(name.to_string()));
+    sealed.origin_tier = item.origin_tier;
+    sealed.protected = item.protected;
+    sealed
 }
 
 /// Seal raid loot with the map's odds.
@@ -279,16 +288,25 @@ fn next_rarity(r: Rarity) -> Rarity {
 
 /// Open an encrypted item: gear (60%) or a valuable, same signal and power,
 /// with a one-in-five chance the contents are a grade better.
+#[cfg(test)]
 pub fn decrypt(rng: &mut impl Rng, item: &Item) -> Item {
-    let rarity = if rng.random::<f64>() < 0.2 { next_rarity(item.rarity) } else { item.rarity };
+    decrypt_at(rng, item, item.origin_tier)
+}
+
+/// Lower-tier uplinks preserve the item but forgo the 20% rarity upgrade.
+pub fn decrypt_at(rng: &mut impl Rng, item: &Item, tier: u32) -> Item {
+    let rarity = if tier >= item.origin_tier && rng.random::<f64>() < 0.2 { next_rarity(item.rarity) } else { item.rarity };
     let power = item.power + rarity.power_bonus() - item.rarity.power_bonus();
-    if rng.random::<f64>() < 0.6 {
+    let mut opened = if rng.random::<f64>() < 0.6 {
         let kind = GEAR_KINDS[rng.random_range(0..GEAR_KINDS.len())];
         Item::new(kind, rarity, power, None)
     } else {
         let name = VALUABLE_NAMES[rng.random_range(0..VALUABLE_NAMES.len())];
         Item::new(ItemKind::Valuable, rarity, power, Some(name.to_string()))
-    }
+    };
+    opened.origin_tier = item.origin_tier;
+    opened.protected = item.protected;
+    opened
 }
 
 // ---------- Loadout ----------
@@ -343,7 +361,7 @@ pub fn gear_score(powers: &[Option<u32>; 4]) -> u32 {
 
 /// The free sidearm you deploy with when no weapon is equipped. It is never lost.
 pub fn loaner_pistol() -> Item {
-    Item { id: "loaner".into(), kind: ItemKind::Pistol, rarity: Rarity::Common, power: 0, name: "Loaner Pistol".into(), value: 0 }
+    Item { id: "loaner".into(), kind: ItemKind::Pistol, rarity: Rarity::Common, power: 0, name: "Loaner Pistol".into(), value: 0, protected: false, origin_tier: 0 }
 }
 
 /// What a brand new operator owns: enough to raid the first map.
@@ -493,14 +511,18 @@ const VALUABLE_NAMES: [&str; 12] = [
 pub fn roll_gear(rng: &mut impl Rng, map: &MapDef, luck: f64) -> Item {
     let kind = GEAR_KINDS[rng.random_range(0..GEAR_KINDS.len())];
     let rarity = roll_rarity(rng, map.tier, luck);
-    Item::new(kind, rarity, roll_power(rng, map, rarity), None)
+    let mut item = Item::new(kind, rarity, roll_power(rng, map, rarity), None);
+    item.origin_tier = map.tier;
+    item
 }
 
 /// A random valuable: no use in a raid, worth cash at the trader.
 pub fn roll_valuable(rng: &mut impl Rng, map: &MapDef, luck: f64) -> Item {
     let rarity = roll_rarity(rng, map.tier, luck);
     let name = VALUABLE_NAMES[rng.random_range(0..VALUABLE_NAMES.len())];
-    Item::new(ItemKind::Valuable, rarity, roll_power(rng, map, rarity), Some(name.to_string()))
+    let mut item = Item::new(ItemKind::Valuable, rarity, roll_power(rng, map, rarity), Some(name.to_string()));
+    item.origin_tier = map.tier;
+    item
 }
 
 /// Contents of a supply crate: one to three items, many of them sealed.

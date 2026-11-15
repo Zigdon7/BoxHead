@@ -6,7 +6,7 @@ BoxHead `3.0.0-playtest.1` is a real-time, top-down PvE extraction shooter. Succ
 
 Each raid asks the player to balance five things: loadout value, route safety, combat resources, pack contents and remaining time. A good route can avoid combat; a profitable fight can still be a bad choice when extraction is far away. Sealed loot creates a reason to stay longer, while loss risk creates a reason to leave early.
 
-The server simulates the world at 60 Hz and sends each client nearby state at 30 Hz. Movement prediction smooths local controls, but the server decides damage, pickups, extraction and settlement. Raids persist independently of any single player's timer. Late arrivals can encounter a world where other players have already opened crates or drawn enemies.
+The server simulates the world at 60 Hz and sends each client nearby state at 30 Hz. Movement prediction smooths local controls, but the server decides damage, pickups, extraction and settlement. Raids persist independently of any single player's timer. Late arrivals encounter existing enemies and shared ammo caches, while each crate is fresh once per deployment, equally in official and hosted rooms.
 
 ## Controls and combat
 
@@ -52,9 +52,9 @@ Walkers apply basic contact pressure; crawlers close distance quickly; devils ap
 
 ### Detection, pursuit and navigation
 
-Nests are indestructible. They activate within 1,500 units of a living player and maintain a local cap of `5 + 2 × map tier` monsters, subject to raid-wide population limits. Ordinary monsters patrol locally and acquire visible players within 480 units. Walls block initial detection and melee attacks.
+Nests are indestructible. They activate within 1,500 units of a living player and maintain a local cap of `5 + 2 × map tier` monsters, subject to raid-wide population limits. Ordinary monsters patrol locally and acquire visible players within 480 units. Walls block initial detection and both player and enemy melee attacks.
 
-A monster commits to one target, remembers the last visible position for 2.5 seconds, and pursues for at most 12 seconds. A target outside its 800-unit home territory ends ordinary pursuit. Returning monsters ignore new targets until they are back in the patrol area and the four-second recovery period has elapsed. Crawlers and brutes navigate doorways rather than walking through walls. Distant monsters are culled without loot or credit.
+A monster commits to one target, remembers the last visible position for 2.5 seconds, and pursues for at most 12 seconds. A target outside its 800-unit home territory ends ordinary pursuit. Returning monsters do not resume ordinary pursuit until they are home and the four-second recovery period has elapsed. They can defend against attackers who hit them within the last two seconds and remain within 100 units with clear sight; this does not restart a long chase. Crawlers and brutes navigate doorways rather than walking through walls. Distant monsters are culled without loot or credit.
 
 The full map's nest circles describe the 800-unit territory, not the wider activation radius. Entering a circle does not itself guarantee immediate detection, and leaving one nest's territory can still bring the player near another.
 
@@ -62,13 +62,13 @@ The full map's nest circles describe the 800-unit territory, not the wider activ
 
 Camping considers movement over a rolling 30-second window within a 450-unit radius; small movements on the spot do not clear it. The warning starts at 45 seconds of accumulated camping and hunters arrive at 75. Meaningful travel drains the meter.
 
-The first hunt sends an Abomination; later camping sends packs of three elites. A hunt lasts at most 30 seconds, after which hunters return home. Killing hunters or extracting also resolves the threat. A downed target does not erase the remaining hunt. The camp meter stays empty during an active hunt, and hunter elites pay only base bounty even after returning, limiting bounty farming.
+The first hunt sends an Abomination; later camping sends packs of three elites. A hunt lasts at most 30 seconds, after which hunters return home. Killing hunters or extracting also resolves the threat. A downed target does not erase the remaining hunt. The camp meter stays empty during an active hunt. Hunter origin is permanent: hunters pay base bounty and may drop consumable supplies, but never equipment, valuables or sealed prizes, including after expiry. Rewarding optional boss encounters remain future work.
 
 ## Loot and decryption
 
-Walking into supply crates opens them for one to three items, sometimes with ammo. Crates restock after four minutes. Ammo caches grant 20 ammo and refill after 45 seconds. Ordinary supply drops last 20 seconds; gear drops last two minutes. Loot becomes persistent only after extraction.
+Walking into supply crates opens them for one to three items, sometimes with ammo. Each crate opens once for each deployment, with its drops reserved for that player. Picked-up items can be shared by dropping them. Creating a room, joining an older room, or resetting its world gives no extra entitlement during that deployment. Ammo caches grant 20 ammo and refill after 45 seconds. Ordinary supply drops last 20 seconds; gear drops last two minutes. Loot becomes persistent only after extraction.
 
-A full pack automatically compares like categories: new gear replaces the lowest-power carried gear only if stronger; valuables and sealed items compete by sale value or estimated opened value. This comparison does not inspect which loadout slot the player needs next. Use the pack's Drop buttons to make deliberate space. Looted equipment cannot be equipped during a raid.
+A full pack automatically compares like categories: new gear replaces the lowest-power carried gear only if stronger; valuables and sealed items compete by sale value or estimated opened value. Protected items are excluded from replacement. The comparison does not otherwise infer which loadout slot the player needs next. Use the pack's Drop buttons to make deliberate space. Looted equipment cannot be equipped during a raid.
 
 Sealing probability starts at 25% on Outskirts and rises eight percentage points per map tier, with extra probability for rarity and a 90% cap. The visible signal reveals rarity and power, not the final item kind. Each map has `tier + 1` uplinks. Standing inside one decrypts the first sealed item in the pack:
 
@@ -80,18 +80,20 @@ Sealing probability starts at 25% on Outskirts and rises eight percentage points
 | Epic | 11 s |
 | Legendary | 15 s |
 
-Leaving the ring or going down resets progress. The outcome is gear 60% of the time and a valuable otherwise, with a 20% chance to improve one rarity grade, capped at legendary. Decryption alerts monsters within 1,300 units subject to their territory rules, and makes nests within 1,500 units spawn 1.8× faster. A squad can cover the operator decrypting; a solo player must decide whether the expected reward warrants the exposure.
+Leaving the ring or going down resets progress. The outcome is gear 60% of the time and a valuable otherwise, with a 20% chance to improve one rarity grade only when the uplink map matches or exceeds the sealed item’s origin tier, capped at legendary. Lower-tier processing preserves base rarity and power; existing originless items retain the previous bonus eligibility. Decryption alerts monsters within 1,300 units subject to their territory rules, and makes nests within 1,500 units spawn 1.8× faster. A squad can cover the operator decrypting; a solo player must decide whether the expected reward warrants the exposure.
 
 ## Co-op, extraction and loss
 
-Players who deploy into the same raid within 30 seconds share an insertion point. This supports meeting up, but is not a persistent party system. Downed players have 25 seconds before bleeding out, shortened to three seconds when nobody else in the raid remains alive. Standing within revive range for three seconds restores a teammate to half maximum health.
+Damage contributors who dealt at least 10% of maximum enemy health within the previous 12 seconds earn assist activity. Bounty is one pool, using the final hitter’s combo multiplier, split by eligible damage with deterministic rounding. Overkill is capped to remaining health; stale and trivial tags do not qualify. Only the final hitter receives kill/combo credit. Total cash is not multiplied by group size.
+
+Players who deploy into the same raid within 30 seconds share an insertion point. This supports meeting up, but is not a persistent party system. Downed players have 25 seconds before bleeding out, shortened to three seconds when nobody else in the raid remains alive. Standing within revive range with an unobstructed path for three seconds restores a teammate to half maximum health. A wall cannot advance the revive or freeze bleedout.
 
 Extraction takes six seconds inside a green ring. Leaving the ring resets progress; being downed prevents completion. Enemies do not pause for extraction. Every operator has a separate timer, so one player's extraction does not end the raid for everyone else.
 
 | Outcome | Equipment | Pack contents and bounty | Progression |
 | --- | --- | --- | --- |
-| Extracted | Kept | Banked; excess stash loot is sold | Extraction Operations XP |
-| Death, timeout or abandonment | Lost unless insured | Lost | Loss Operations XP |
+| Extracted | Kept | Banked; excess loot awaits selection | Earned activity + bounded extraction XP bonus |
+| Death, timeout or abandonment | Lost unless insured | Lost | Earned activity XP only |
 | Disconnect before any input | Kept; premium refunded | Staged items restored, no raid earnings | No raid XP; entry fee remains spent |
 | Server restart during raid | Kept; fee and premium refunded | Staged items restored, no unbanked earnings | Raid voided without XP |
 

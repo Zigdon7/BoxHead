@@ -125,7 +125,10 @@ pub fn insurance_rate(office: u32, broker: u32) -> f64 {
     (BASE_INSURANCE_RATE - 0.04 * office as f64 - 0.03 * broker as f64).max(MIN_INSURANCE_RATE)
 }
 
-pub const WORKSHOP_HOURS: u32 = 12;
+pub const WORKSHOP_HOURS: u32 = 48;
+pub const RESPEC_COST: u32 = 1_000;
+/// Earn one selected piece of gear after this much extracted activity on a map.
+pub const REQUISITION_COST: u32 = 120;
 
 /// Cash per hour the Workshop makes at `level`.
 pub fn workshop_rate(level: u32) -> u32 { 60 * level }
@@ -148,9 +151,20 @@ pub fn ops_rank(xp: u32) -> u32 { OPS_THRESHOLDS.iter().filter(|&&t| xp >= t).co
 pub fn ops_next(xp: u32) -> Option<u32> { OPS_THRESHOLDS.iter().copied().find(|&t| xp < t) }
 
 /// Operations XP for one raid: extracting is worth far more than dying.
-pub fn ops_xp(extracted: bool, kills: u32, boost_level: u32) -> u32 {
-    let base = if extracted { 100 } else { 25 } + kills.min(100);
+pub fn activity_points(kills: u32, activity: &crate::types::RaidActivity) -> u32 {
+    kills.saturating_add(activity.assists).min(100)
+        + activity.crates.min(10) * 8 + activity.revives.min(3) * 5
+}
+
+pub fn ops_xp_for(extracted: bool, kills: u32, activity: &crate::types::RaidActivity, boost_level: u32) -> u32 {
+    let earned = activity_points(kills, activity);
+    let base = earned + if extracted { earned.min(100) } else { 0 };
     (base as f64 * (1.0 + 0.10 * boost_level as f64)).round() as u32
+}
+
+#[cfg(test)]
+pub fn ops_xp(extracted: bool, kills: u32, boost_level: u32) -> u32 {
+    ops_xp_for(extracted, kills, &crate::types::RaidActivity::default(), boost_level)
 }
 
 /// Entry fee after an Operations rank discount (10% per rank).
@@ -396,9 +410,10 @@ mod tests {
         let bs = &gear::MAPS[3];
         assert_eq!(ops_fee(bs, 0), bs.entry_fee);
         assert_eq!(ops_fee(bs, MAX_OPS_RANK), bs.entry_fee / 2);
-        assert!(ops_xp(true, 0, 0) > ops_xp(false, 0, 0));
-        assert!(ops_xp(true, 0, 2) > ops_xp(true, 0, 0));
-        assert_eq!(ops_xp(false, 10_000, 0), 125, "kills are capped");
+        assert_eq!(ops_xp(true, 0, 0), 0);
+        assert_eq!(ops_xp(false, 0, 0), 0);
+        assert!(ops_xp(true, 10, 2) > ops_xp(true, 10, 0));
+        assert_eq!(ops_xp(false, 10_000, 0), 100, "kills are capped");
     }
 
     #[test]

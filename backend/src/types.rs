@@ -130,6 +130,8 @@ pub struct Player {
     pub combo_timer: f64,
     pub max_combo: u32,
     pub kills: u32,
+    #[serde(default)]
+    pub activity: RaidActivity,
     pub tactical_items: [u32; 3],
     /// Cash earned from kills this raid; banked only on extraction.
     pub bounty: f64,
@@ -170,6 +172,9 @@ pub struct Zombie {
     /// Set on hunters sent after a camper: the player they're hunting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Spawn origin survives hunt expiry and target changes.
+    #[serde(default)]
+    pub hunter: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -224,6 +229,9 @@ pub struct ClientInput {
     /// Drop this backpack item (from the inventory screen).
     #[serde(default, rename = "dropId", skip_serializing_if = "Option::is_none")]
     pub drop_id: Option<String>,
+    /// Toggle protection on an item currently in this player's pack.
+    #[serde(default, rename = "protectId", skip_serializing_if = "Option::is_none")]
+    pub protect_id: Option<String>,
     /// Server-side: this input has already been applied once (one-shot actions are spent).
     #[serde(skip)]
     pub consumed: bool,
@@ -236,6 +244,8 @@ pub struct DropPickup {
     #[serde(rename = "type")]
     pub drop_type: DropType,
     pub pos: Vector2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item: Option<crate::gear::Item>,
 }
@@ -317,6 +327,8 @@ pub struct PlayerDelta {
     pub max_combo: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kills: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<RaidActivity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tactical_items: Option<[u32; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,6 +427,14 @@ pub struct ClientMessage {
 
 // --- Raid results ---
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RaidActivity {
+    pub assists: u32,
+    pub crates: u32,
+    pub revives: u32,
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RaidResult {
@@ -448,6 +468,7 @@ pub struct RaidOutcome {
     pub lost: Vec<crate::gear::Item>,
     pub bounty: u32,
     pub kills: u32,
+    pub activity: RaidActivity,
     pub max_combo: u32,
     pub survived_secs: f64,
 }

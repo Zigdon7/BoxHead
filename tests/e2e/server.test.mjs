@@ -802,6 +802,44 @@ describe('hideout: operators, Homefront and Legacy', () => {
 });
 
 describe('hideout: stash, trader and loadout', () => {
+  test('protected overflow, requisitions, automatic income and respec work through the API', async () => {
+    const { token } = await signUp();
+    const stranger = await signUp();
+    let h = await hideout(token);
+    const db = new DatabaseSync(joinPath(workDir, 'boxhead.db'));
+    const pending = randomUUID();
+    try {
+      db.prepare('UPDATE operators SET cash=2000, produced_at=? WHERE profile=?').run(Math.floor(Date.now()/1000)-7200,h.id);
+      db.prepare("INSERT INTO facilities VALUES (?,'armory',1), (?,'workshop',1)").run(h.id,h.id);
+      db.prepare("INSERT INTO operations (profile,map,xp,requisition) VALUES (?,'outskirts',500,120)").run(h.id);
+      db.prepare('UPDATE accounts SET legacy_earned=3 WHERE user_id=?').run(h.accountId);
+      db.prepare("INSERT INTO account_perks VALUES (?,'vitality',1)").run(h.accountId);
+      db.prepare("INSERT INTO items (id,profile,kind,rarity,power,name,protected,origin_tier,overflow) VALUES (?,?,'encrypted','rare',65,'Reserved cache',1,4,1)").run(pending,h.id);
+    } finally { db.close(); }
+    h = await hideout(token);
+    assert.equal(h.homefront.workshop.collected,120);
+    assert.equal(h.cash,2120);
+    assert.equal(h.investmentValue,1400);
+    assert.deepEqual(h.overflow.map(i => [i.id,i.protected,i.originTier]),[[pending,true,4]]);
+    assert.equal((await hideoutAct('protect',{token:stranger.token,itemId:pending,protected:false})).ok,false);
+    assert.equal((await hideoutAct('resolveOverflow',{token,keepIds:[]})).ok,false,'missing preview cannot sell');
+    assert.equal((await hideoutAct('resolveOverflow',{token,expectedIds:[pending],keepIds:[]})).ok,false,'protected loot cannot be sold');
+    assert.equal((await hideoutAct('requisition',{token,map:'outskirts',kind:'armor'})).ok,false,'resolve overflow first');
+    h = await hideoutAct('resolveOverflow',{token,expectedIds:[pending],keepIds:[pending]});
+    assert.equal(h.ok,true,JSON.stringify(h));
+    assert.equal(h.overflow.length,0);
+    assert.equal((await hideoutAct('resolveOverflow',{token,expectedIds:[pending],keepIds:[]})).ok,false,'stale confirmation rejected');
+    h = await hideoutAct('requisition',{token,map:'outskirts',kind:'armor'});
+    assert.equal(h.ok,true,JSON.stringify(h));
+    assert.ok(h.stash.some(i => i.kind==='armor' && i.power===22 && i.protected));
+    assert.equal(h.operations.find(o => o.map==='outskirts').requisition,0);
+    assert.equal((await hideoutAct('respec',{token})).ok,false);
+    h = await hideoutAct('respec',{token,confirm:true});
+    assert.equal(h.ok,true,JSON.stringify(h));
+    assert.equal(h.legacy.available,3);
+    assert.equal(h.cash,1120);
+  });
+
   test('a new operator gets the starter kit, cash and the map ladder', async () => {
     const { token } = await signUp();
     const h = await hideout(token);

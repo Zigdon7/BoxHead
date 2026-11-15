@@ -110,6 +110,14 @@ describe('raid HUD', () => {
     expect(backpackValue(pack)).toBe(800);
   });
 
+  test('pickup previews never offer protected items for replacement', () => {
+    const reserved = { ...item('armor', 5, 80), protected: true };
+    const spare = item('pistol', 10, 100);
+    const incoming = item('shotgun', 40, 300);
+    expect(swapCandidate([reserved], 1, incoming)).toBeNull();
+    expect(swapCandidate([reserved, spare], 2, incoming)).toBe(spare);
+  });
+
   test('sealed loot is valued by what it should open into and competes with valuables', () => {
     const sealed = { ...item('encrypted', 60, 120), rarity: 'legendary' as const };
     expect(estimatedValue(sealed)).toBeGreaterThan(sealed.value);
