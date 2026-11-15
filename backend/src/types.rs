@@ -405,7 +405,6 @@ pub struct ClientMessage {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub input: Option<ClientInput>,
-    pub name: Option<String>,
     pub token: Option<String>,
     pub paused: Option<bool>,
     #[serde(rename = "roomId")]

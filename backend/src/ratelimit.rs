@@ -52,7 +52,7 @@ pub fn rule_for(method: &Method, path: &str) -> Option<Rule> {
         "/api/auth/password/reset" if post => RESET,
         "/api/rooms" if post => HOST,
         "/api/friends/add" => FRIENDS,
-        "/ws" => JOIN,
+        "/ws" | "/ws/presence" => JOIN,
         p if p.starts_with("/api/hideout") => HIDEOUT,
         p if p.starts_with("/api/") => API,
         _ => return None,

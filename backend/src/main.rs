@@ -2,6 +2,7 @@ mod types;
 mod gear;
 mod map;
 mod spatial_grid;
+mod navigation;
 mod game;
 mod delta;
 mod social;
@@ -123,6 +124,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/ws/presence", get(presence_handler))
         .route("/api/rooms", get(rooms_list).post(rooms_create))
         .route("/api/matchmaking/crossplay", post(crossplay_set))
         .route("/api/hideout", get(hideout))
@@ -192,15 +194,59 @@ async fn send_join_error(ws_sender: &mut futures::stream::SplitSink<WebSocket, M
     let _ = ws_sender.send(Message::Close(None)).await;
 }
 
+/// Signed-in browser presence remains connected in the menus and hideout.
+async fn presence_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.max_message_size(4096).on_upgrade(move |mut socket| async move {
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await;
+        let Ok(Some(Ok(Message::Text(text)))) = first else { return };
+        let Ok(message) = serde_json::from_str::<ClientMessage>(&text) else { return };
+        if message.msg_type != "presence" { return; }
+        let token = message.token.unwrap_or_default();
+        let (db, t) = (state.db.clone(), token.clone());
+        let user = tokio::task::spawn_blocking(move || db.validate_session(&t)).await.ok().flatten();
+        let Some(user) = user else {
+            let _ = socket.send(Message::Text(serde_json::json!({"type": "presence", "ok": false}).to_string().into())).await;
+            return;
+        };
+        let connection = format!("presence:{}", uuid::Uuid::new_v4());
+        state.social.lock().await.link_account(&connection, &user);
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+        let mut last_pong = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                next = socket.next() => {
+                    match next {
+                        Some(Ok(Message::Pong(_))) => last_pong = tokio::time::Instant::now(),
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        _ => {}
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if last_pong.elapsed() > std::time::Duration::from_secs(45) { break; }
+                    let (db, t) = (state.db.clone(), token.clone());
+                    let valid = tokio::task::spawn_blocking(move || db.validate_session(&t)).await.ok().flatten().as_deref() == Some(user.as_str());
+                    let reply = Message::Text(serde_json::json!({"type": "presence", "ok": valid}).to_string().into());
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), socket.send(reply)).await, Ok(Ok(()))) || !valid { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), socket.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) { break; }
+                }
+            }
+        }
+        state.social.lock().await.unlink_player(&connection);
+    })
+}
+
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let player_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Wait for the join message: callsign, target raid and identity.
+    // Wait for the join message: target raid and account identity.
     // A socket that never says which raid it wants is dropped after 10 seconds.
     let join_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let (player_name, auth_token, room_id, insure) = loop {
+    let (auth_token, room_id, insure) = loop {
         let next = match tokio::time::timeout_at(join_deadline, ws_receiver.next()).await {
             Ok(next) => next,
             Err(_) => return,
@@ -210,11 +256,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 let text_str: &str = &text;
                 if let Ok(msg) = serde_json::from_str::<ClientMessage>(text_str) {
                     if msg.msg_type == "join" {
-                        let name = msg.name.unwrap_or_default();
-                        let name = name.trim().chars().take(16).collect::<String>();
-                        let name = if name.is_empty() { format!("Player_{}", &player_id[..4]) } else { name };
                         let room_id = msg.room_id.unwrap_or_else(|| OPEN_ROOM_ID.to_string());
-                        break (name, msg.token, room_id, msg.insure.unwrap_or(false));
+                        break (msg.token, room_id, msg.insure.unwrap_or(false));
                     }
                 }
             }
@@ -262,10 +305,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Gear score gate + lock the loadout into this raid (blocking DB work off the async thread).
     let begin = {
         let (db, profile, room_id, map) = (state.db.clone(), profile.clone(), room.id.clone(), room.map);
-        tokio::task::spawn_blocking(move || db.deploy(&profile, &room_id, map, insure)).await
+        tokio::task::spawn_blocking(move || db.deploy_named(&profile, &room_id, map, insure)).await
             .unwrap_or_else(|_| Err("Server error".into()))
     };
-    let loadout = match begin {
+    let (loadout, player_name) = match begin {
         Ok(loadout) => loadout,
         Err(e) => { send_join_error(&mut ws_sender, &e).await; return; }
     };
@@ -307,7 +350,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     room.clients.lock().await.insert(player_id.clone(), tx);
 
     if let Some(ref user_id) = user_id {
-        state.social.lock().await.link_player(&player_id, user_id);
+        state.social.lock().await.link_player(&player_id, user_id, &profile);
     }
 
     let pid_send = player_id.clone();
@@ -506,7 +549,7 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
         })
     }).collect();
     serde_json::json!({
-        "id": op.id, "name": op.name, "raidable": op.raidable,
+        "id": op.id, "friendId": op.friend_id, "name": op.name, "raidable": op.raidable,
         "carryCapacity": loadout.pack.as_ref().map_or(gear::NO_PACK_CAPACITY, |p| gear::pack_capacity(p.power)),
         "cash": op.cash, "raids": op.raids, "extracts": op.extracts, "deaths": op.deaths,
         "inRaid": op.in_raid.is_some(),
@@ -550,6 +593,7 @@ fn hideout_json(db: &Database, user: &str) -> serde_json::Value {
     let mut out = serde_json::json!({
         "ok": true,
         "account": true,
+        "accountId": user,
         "operators": db.operator_summaries(user),
         "maxOperators": progression::MAX_OPERATORS,
         "needsOperator": active.is_none(),
@@ -956,93 +1000,72 @@ if (window.opener) {{
 
 async fn friends_list(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let token = params.get("token").map(|s| s.as_str()).unwrap_or("");
-
-    let user_id = match state.db.validate_session(token) {
-        Some(id) => id,
-        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
-    };
-
-    let friend_rows = state.db.get_friends(&user_id);
-    let social = state.social.lock().await;
-
-    let friends: Vec<social::FriendStatus> = friend_rows.into_iter().map(|f| {
-        social::FriendStatus {
-            user_id: f.user_id.clone(),
-            display_name: f.display_name.clone(),
-            handle: f.provider_handle.unwrap_or_else(|| f.display_name.clone()),
-            online: social.is_online(&f.user_id),
+    let token = params.get("token").cloned().unwrap_or_default();
+    let presence = state.social.lock().await.clone();
+    let db = state.db.clone();
+    Json(tokio::task::spawn_blocking(move || {
+        let Some(user) = db.validate_session(&token) else {
+            return serde_json::json!({"ok": false, "error": "Not authenticated"});
+        };
+        let identity = |owner: &str| {
+            let id = presence.raid_operator(owner).map(String::from).or_else(|| db.active_operator(owner))?;
+            let op = db.operator(&id)?;
+            Some(social::OperatorIdentity { id: op.friend_id, name: op.name })
+        };
+        let activity = |owner: &str, online: bool| {
+            if !online { "offline" } else if presence.raid_operator(owner).is_some() { "raid" } else { "hideout" }
+        };
+        let mut friends: Vec<social::FriendStatus> = db.get_friends(&user).into_iter().map(|f| {
+            let online = presence.is_online(&f.user_id);
+            social::FriendStatus::Account {
+                operator: if online { identity(&f.user_id) } else { None },
+                activity: activity(&f.user_id, online), online, id: f.user_id,
+            }
+        }).collect();
+        for f in db.get_operator_friends(&user) {
+            let online = presence.is_online(&f.account) && identity(&f.account).is_some_and(|op| op.id == f.id);
+            friends.push(social::FriendStatus::Operator {
+                activity: activity(&f.account, online), online, id: f.id, name: f.name,
+            });
         }
-    }).collect();
-
-    Json(serde_json::json!({ "ok": true, "friends": friends }))
+        serde_json::json!({"ok": true, "friends": friends, "identity": {"accountId": user, "operator": identity(&user)}})
+    }).await.unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "Could not load friends"})))
 }
 
 async fn friends_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let token = body["token"].as_str().unwrap_or("");
-    let friend_handle = body["handle"].as_str().unwrap_or("");
-
-    if friend_handle.is_empty() {
-        return Json(serde_json::json!({ "ok": false, "error": "Friend handle required" }));
-    }
-
-    let user_id = match state.db.validate_session(token) {
-        Some(id) => id,
-        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
-    };
-
-    // Try to resolve as a Bluesky handle first
-    match social::resolve_handle(friend_handle).await {
-        Ok(friend_did) => {
-            // Find or create a user for this Bluesky account
-            let friend_user_id = match state.db.find_or_create_user(
-                "bluesky",
-                &friend_did,
-                friend_handle,
-                friend_handle,
-            ) {
-                Ok(id) => id,
-                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
-            };
-
-            if friend_user_id == user_id {
-                return Json(serde_json::json!({ "ok": false, "error": "Cannot add yourself" }));
-            }
-
-            match state.db.add_friend(&user_id, &friend_user_id) {
-                Ok(_) => Json(serde_json::json!({
-                    "ok": true,
-                    "user_id": friend_user_id,
-                    "handle": friend_handle,
-                })),
-                Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
-            }
-        }
-        Err(e) => {
-            Json(serde_json::json!({ "ok": false, "error": e }))
-        }
-    }
+    change_friend(state, body, true).await
 }
 
 async fn friends_remove(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let token = body["token"].as_str().unwrap_or("");
-    let friend_user_id = body["user_id"].as_str().unwrap_or("");
+    change_friend(state, body, false).await
+}
 
-    let user_id = match state.db.validate_session(token) {
-        Some(id) => id,
-        None => return Json(serde_json::json!({ "ok": false, "error": "Not authenticated" })),
-    };
-
-    match state.db.remove_friend(&user_id, friend_user_id) {
-        Ok(_) => Json(serde_json::json!({ "ok": true })),
-        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
-    }
+async fn change_friend(state: Arc<AppState>, body: serde_json::Value, add: bool) -> Json<serde_json::Value> {
+    let db = state.db.clone();
+    Json(tokio::task::spawn_blocking(move || {
+        let Some(user) = db.validate_session(body["token"].as_str().unwrap_or("")) else {
+            return serde_json::json!({"ok": false, "error": "Not authenticated"});
+        };
+        let id = body["id"].as_str().or_else(|| body["user_id"].as_str()).or_else(|| body["handle"].as_str()).unwrap_or("").trim();
+        if id.is_empty() { return serde_json::json!({"ok": false, "error": "Enter an account ID or operator ID"}); }
+        let kind = body["kind"].as_str().unwrap_or("account");
+        let result = match kind {
+            "account" if add => db.add_friend(&user, id),
+            "account" => db.remove_friend(&user, id),
+            "operator" => db.change_operator_friend(&user, id, add),
+            _ => Err("Choose account or operator friendship".into()),
+        };
+        match result {
+            Ok(()) => serde_json::json!({"ok": true}),
+            Err(e) => serde_json::json!({"ok": false, "error": e}),
+        }
+    }).await.unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "Could not update friends"})))
 }

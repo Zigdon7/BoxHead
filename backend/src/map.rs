@@ -16,8 +16,15 @@ pub const BULLET_RADIUS: f64 = 3.0;
 pub const ZOMBIE_ATTACK_COOLDOWN: f64 = 1.0;
 pub const ZOMBIE_ATTACK_RANGE: f64 = ZOMBIE_RADIUS + PLAYER_RADIUS + 5.0;
 pub const ZOMBIE_DAMAGE: f64 = 20.0;
-/// Enemies notice players this close; further away they wander.
-pub const ZOMBIE_AGGRO_RANGE: f64 = 950.0;
+/// Ordinary enemies notice visible players this close.
+pub const ZOMBIE_AGGRO_RANGE: f64 = 480.0;
+/// A pursuit cannot pull ordinary monsters beyond their home territory.
+pub const ZOMBIE_CHASE_LEASH: f64 = 800.0;
+pub const ZOMBIE_CHASE_SECS: f64 = 12.0;
+pub const ZOMBIE_MEMORY_SECS: f64 = 2.5;
+pub const ZOMBIE_RETURN_COOLDOWN: f64 = 4.0;
+/// Even anti-camping hunters eventually give up and return home.
+pub const HUNTER_CHASE_SECS: f64 = 30.0;
 /// Enemies this far from every player are culled (no loot, no kill credit).
 pub const ZOMBIE_DESPAWN_RANGE: f64 = 1900.0;
 // Nests: unbreakable spawners. Monsters pour out of a nest while a player is near it.
@@ -306,7 +313,8 @@ pub fn generate_layout(map: &MapDef) -> MapLayout {
     // Nests sit on inner street crossings, never on the edge where players
     // insert and extract. Roughly one per four blocks, spread out.
     let mut inner: Vec<(u32, u32)> = (1..cols).flat_map(|i| (1..rows).map(move |j| (i, j))).collect();
-    let want = ((cols * rows) as usize / 4).max(4).min(inner.len());
+    // Outskirts gains room to route around encounters without gaining nests.
+    let want = if map.tier == 1 { 8 } else { ((cols * rows) as usize / 4).max(4) }.min(inner.len());
     let mut nests: Vec<Point> = Vec::new();
     while nests.len() < want && !inner.is_empty() {
         let (i, j) = inner.swap_remove(rng.random_range(0..inner.len()));
@@ -387,6 +395,13 @@ mod tests {
             assert_eq!(a.walls, b.walls);
             assert_eq!(a.crates, b.crates);
         }
+    }
+
+    #[test]
+    fn outskirts_has_more_routing_room_without_more_nests() {
+        let layout = generate_layout(&MAPS[0]);
+        assert_eq!((layout.width, layout.height), (4640.0, 4000.0));
+        assert_eq!(layout.nests.len(), 8);
     }
 
     #[test]

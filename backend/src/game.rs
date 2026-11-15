@@ -18,6 +18,7 @@ fn short_id() -> String {
 
 use crate::gear::{self, Item, ItemKind, Loadout, MapDef};
 use crate::map::*;
+use crate::navigation::{self, Navigation};
 use crate::spatial_grid::SpatialGrid;
 use crate::types::*;
 
@@ -230,8 +231,8 @@ fn zombie_base_stats(zombie_type: &ZombieType) -> (f64, f64) {
 
 /// Bounty for a kill. Hunters sent after campers pay only their base bounty,
 /// so camping on purpose to farm them doesn't pay.
-fn kill_bounty(z: &Zombie) -> f64 {
-    let elite = z.elite && z.target.is_none();
+fn kill_bounty(z: &Zombie, was_hunter: bool) -> f64 {
+    let elite = z.elite && z.target.is_none() && !was_hunter;
     zombie_bounty(&z.zombie_type) * if elite { ELITE_BOUNTY } else { 1.0 }
 }
 
@@ -353,6 +354,33 @@ fn active_weapon(p: &Player) -> Option<&RaidWeapon> { p.weapons.get(p.active_slo
 
 // ---------- Game ----------
 
+#[derive(Default)]
+struct ZombieBrain {
+    /// Spawn position is also the fallback home for monsters without a nest.
+    home: (f64, f64),
+    quarry: Option<String>,
+    last_seen: (f64, f64),
+    chasing: f64,
+    unseen: f64,
+    returning: bool,
+    rest: f64,
+    hunt_elapsed: f64,
+    route: Vec<(f64, f64)>,
+    repath: f64,
+}
+
+impl ZombieBrain {
+    fn return_home(&mut self) {
+        self.quarry = None;
+        self.chasing = 0.0;
+        self.unseen = 0.0;
+        self.returning = true;
+        self.rest = ZOMBIE_RETURN_COOLDOWN;
+        self.route.clear();
+        self.repath = 0.0;
+    }
+}
+
 pub struct Game {
     map: &'static MapDef,
     layout: MapLayout,
@@ -393,6 +421,8 @@ pub struct Game {
     nest_timers: Vec<f64>,
     /// The nest each monster came from (it wanders back there when idle).
     zombie_home: HashMap<String, usize>,
+    zombie_brains: HashMap<String, ZombieBrain>,
+    navigation: Navigation,
     /// Each player's position, sampled once a second over the camping window.
     camp_track: HashMap<String, std::collections::VecDeque<(f64, f64, f64)>>,
     /// Players who have sent at least one input (so they actually saw the raid).
@@ -411,6 +441,7 @@ impl Game {
     pub fn new(map: &'static MapDef) -> Self {
         let layout = generate_layout(map);
         let wall_grid = build_wall_grid(&layout.walls, layout.width, layout.height);
+        let navigation = Navigation::new(layout.width, layout.height, &layout.walls);
         let ammo_pickups = layout.ammo.iter().enumerate().map(|(i, p)| AmmoPickupInternal {
             id: format!("ammo_{}", i), x: p.x, y: p.y, amount: AMMO_PICKUP_AMOUNT, respawn_at: None,
         }).collect();
@@ -452,6 +483,8 @@ impl Game {
             outcomes: Vec::new(),
             nest_timers: vec![0.0; layout.nests.len()],
             zombie_home: HashMap::new(),
+            zombie_brains: HashMap::new(),
+            navigation,
             camp_track: HashMap::new(),
             hunts_sent: HashMap::new(),
             loadouts: HashMap::new(),
@@ -476,6 +509,7 @@ impl Game {
         self.bullet_lifetimes.clear();
         self.zombie_wall_stuck.clear();
         self.zombie_home.clear();
+        self.zombie_brains.clear();
         self.boss_quarry.clear();
         self.decrypt_noise.clear();
         for p in self.players.values_mut() { p.camp = 0.0; p.hunted = false; p.decrypt = 0.0; }
@@ -916,7 +950,8 @@ impl Game {
                         let z = self.zombies[zi].clone();
                         zombie_kill_indices.push(zi);
                         if let Some(p) = self.players.get_mut(pid) {
-                            award_kill_to_player(p, kill_bounty(&z), map.bounty_mult);
+                            let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
+                            award_kill_to_player(p, kill_bounty(&z, was_hunter), map.bounty_mult);
                             p.health = (p.health + p.max_health * 0.04).min(p.max_health);
                         }
                     }
@@ -1185,30 +1220,91 @@ impl Game {
             let (zx, zy, z_speed) = (self.zombies[zi].pos.x, self.zombies[zi].pos.y, self.zombies[zi].speed);
             let zid_hash = self.zombies[zi].id.as_bytes().iter().fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
 
-            // Nearest player within aggro range; otherwise wander.
-            let mut target: Option<(String, f64, f64)> = None;
-            let mut nearest = ZOMBIE_AGGRO_RANGE;
-            for pr in self.player_grid.query(zx, zy, ZOMBIE_AGGRO_RANGE) {
-                let d = f64::hypot(pr.x - zx, pr.y - zy);
-                if d < nearest { nearest = d; target = Some((pr.id.clone(), pr.x, pr.y)); }
-            }
-            // An uplink at work is heard from much further away.
-            if target.is_none() {
-                let mut nearest = UPLINK_ALERT_RANGE;
-                for (id, x, y) in &self.decrypt_noise {
-                    let d = f64::hypot(x - zx, y - zy);
-                    if d < nearest { nearest = d; target = player_positions.get(id).map(|(px, py)| (id.clone(), *px, *py)); }
+            let zid = self.zombies[zi].id.clone();
+            let home = self.zombie_home.get(&zid).and_then(|&i| self.layout.nests.get(i))
+                .map(|n| (n.x, n.y));
+            let brain = self.zombie_brains.entry(zid.clone()).or_insert_with(|| ZombieBrain {
+                home: (zx, zy), ..ZombieBrain::default()
+            });
+            let home = home.unwrap_or(brain.home);
+            let home_distance = f64::hypot(zx - home.0, zy - home.1);
+            brain.rest = (brain.rest - dt).max(0.0);
+
+            // Dedicated anti-camping hunts are threatening, but no longer endless.
+            let mut hunter = self.boss_quarry.get(&zid).cloned();
+            if hunter.is_some() {
+                brain.hunt_elapsed += dt;
+                if brain.hunt_elapsed >= HUNTER_CHASE_SECS {
+                    self.boss_quarry.remove(&zid);
+                    self.zombies[zi].target = None;
+                    hunter = None;
+                    brain.return_home();
                 }
             }
-            // An Abomination hunts its camper from anywhere on the map.
-            if let Some(quarry) = self.boss_quarry.get(&self.zombies[zi].id) {
-                if let Some((qx, qy)) = player_positions.get(quarry) {
-                    target = Some((quarry.clone(), *qx, *qy));
+            if hunter.is_none() && !brain.returning && home_distance > ZOMBIE_CHASE_LEASH {
+                brain.return_home();
+            }
+            if brain.returning && home_distance <= NEST_LEASH && brain.rest <= 0.0 {
+                brain.returning = false;
+            }
+
+            // Keep one target; remember its last visible position briefly instead
+            // of tracking it through buildings or switching players every frame.
+            let mut target: Option<(String, f64, f64)> = None;
+            if let Some(quarry) = &hunter {
+                if let Some(&(qx, qy)) = player_positions.get(quarry) {
+                    target = Some((quarry.clone(), qx, qy));
+                }
+            } else if !brain.returning {
+                if let Some(quarry) = &brain.quarry {
+                    brain.chasing += dt;
+                    let position = player_positions.get(quarry).copied();
+                    let audible = self.decrypt_noise.iter().any(|(id, x, y)| id == quarry
+                        && f64::hypot(x - zx, y - zy) < UPLINK_ALERT_RANGE);
+                    if let Some((px, py)) = position {
+                        if f64::hypot(px - home.0, py - home.1) <= ZOMBIE_CHASE_LEASH
+                            && (audible || (f64::hypot(px - zx, py - zy) < ZOMBIE_AGGRO_RANGE * 1.3
+                                && navigation::clear_path(&self.layout.walls, (zx, zy), (px, py), 0.0))) {
+                            brain.last_seen = (px, py);
+                            brain.unseen = 0.0;
+                        } else {
+                            brain.unseen += dt;
+                        }
+                    }
+                    if position.is_none() || brain.chasing >= ZOMBIE_CHASE_SECS
+                        || brain.unseen >= ZOMBIE_MEMORY_SECS
+                        || position.is_some_and(|(x, y)| f64::hypot(x - home.0, y - home.1) > ZOMBIE_CHASE_LEASH) {
+                        brain.return_home();
+                    } else {
+                        target = Some((quarry.clone(), brain.last_seen.0, brain.last_seen.1));
+                    }
+                } else {
+                    let mut nearest = UPLINK_ALERT_RANGE;
+                    for pr in self.player_grid.query(zx, zy, UPLINK_ALERT_RANGE) {
+                        let (id, px, py) = (&pr.id, pr.x, pr.y);
+                        if f64::hypot(px - home.0, py - home.1) > ZOMBIE_CHASE_LEASH { continue; }
+                        let d = f64::hypot(px - zx, py - zy);
+                        let audible = self.decrypt_noise.iter().any(|(pid, x, y)| pid == id
+                            && f64::hypot(x - zx, y - zy) < UPLINK_ALERT_RANGE);
+                        if d < nearest && (audible || (d < ZOMBIE_AGGRO_RANGE
+                            && navigation::clear_path(&self.layout.walls, (zx, zy), (px, py), 0.0))) {
+                            nearest = d;
+                            target = Some((id.clone(), px, py));
+                        }
+                    }
+                    if let Some((id, x, y)) = &target {
+                        brain.quarry = Some(id.clone());
+                        brain.last_seen = (*x, *y);
+                        brain.chasing = 0.0;
+                        brain.unseen = 0.0;
+                        brain.route.clear();
+                        brain.repath = 0.0;
+                    }
                 }
             }
 
             let z_type = self.zombies[zi].zombie_type.clone();
-            let (move_dx, move_dy, speed_scale, tx, ty) = if let Some((_, tx, ty)) = &target {
+            let (mut move_dx, mut move_dy, speed_scale, tx, ty) = if let Some((_, tx, ty)) = &target {
                 let (tdx, tdy) = (tx - zx, ty - zy);
                 let tdist = (tdx * tdx + tdy * tdy).sqrt().max(1e-6);
                 let (mut mdx, mut mdy) = (tdx / tdist, tdy / tdist);
@@ -1243,19 +1339,39 @@ impl Game {
                 }
                 (mdx, mdy, scale, *tx, *ty)
             } else {
-                // Idle: shamble around the home nest, drifting back if strayed too far.
-                let home = self.zombie_home.get(&self.zombies[zi].id).and_then(|&i| self.layout.nests.get(i));
-                match home {
-                    Some(n) if f64::hypot(n.x - zx, n.y - zy) > NEST_LEASH => {
-                        let d = f64::hypot(n.x - zx, n.y - zy);
-                        ((n.x - zx) / d, (n.y - zy) / d, 0.45, n.x, n.y)
+                // Patrol a small ring around the nest, or return to the original
+                // spawn after disengaging. Returning monsters cannot reacquire.
+                let heading = (zid_hash % 628) as f64 / 100.0 + (self.game_time / 8.0).floor() * 1.7;
+                let (gx, gy) = if brain.returning || home_distance > NEST_LEASH {
+                    brain.home
+                } else {
+                    (home.0 + heading.cos() * 190.0, home.1 + heading.sin() * 190.0)
+                };
+                let d = f64::hypot(gx - zx, gy - zy).max(1.0);
+                ((gx - zx) / d, (gy - zy) / d, if brain.returning { 0.8 } else { 0.35 }, gx, gy)
+            };
+
+            // Navigate to remembered positions and back home through doorways.
+            // The Abomination keeps its established ability to break through walls.
+            if z_type != ZombieType::Abomination {
+                brain.repath -= dt;
+                if navigation::clear_path(&self.layout.walls, (zx, zy), (tx, ty), navigation::CLEARANCE) {
+                    brain.route.clear();
+                } else {
+                    if brain.repath <= 0.0 {
+                        brain.route = self.navigation.route((zx, zy), (tx, ty), &self.layout.walls);
+                        brain.repath = 0.8 + (zid_hash % 5) as f64 * 0.1;
                     }
-                    _ => {
-                        let heading = (zid_hash % 628) as f64 / 100.0 + (self.game_time * 0.15 + zid_hash as f64 * 0.01).sin() * 1.2;
-                        (heading.cos(), heading.sin(), 0.3, zx, zy)
+                    while brain.route.last().is_some_and(|(x, y)| f64::hypot(x - zx, y - zy) < 10.0) {
+                        brain.route.pop();
+                    }
+                    if let Some(&(wx, wy)) = brain.route.last() {
+                        let d = f64::hypot(wx - zx, wy - zy).max(1.0);
+                        move_dx = (wx - zx) / d;
+                        move_dy = (wy - zy) / d;
                     }
                 }
-            };
+            }
 
             {
                 let z = &mut self.zombies[zi];
@@ -1277,15 +1393,16 @@ impl Game {
                         pl.health -= 22.0 * dt;
                         z.health -= BARRICADE_CONTACT_DAMAGE * dt;
                         if z.health <= 0.0 && !zombie_kill_indices.contains(&zi) {
-                            kill_awards.push((pl.owner_id.clone(), kill_bounty(z)));
+                            let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
+                            kill_awards.push((pl.owner_id.clone(), kill_bounty(z, was_hunter)));
                             zombie_kill_indices.push(zi);
                         }
                     }
                 }
             }
 
-            // Walls: brutes and crawlers push through; the rest steer around.
-            if !matches!(z_type, ZombieType::Brute | ZombieType::Crawler | ZombieType::Abomination) {
+            // All ordinary monsters respect walls, including brutes and crawlers.
+            if z_type != ZombieType::Abomination {
                 let (cur_x, cur_y) = (self.zombies[zi].pos.x, self.zombies[zi].pos.y);
                 let (nx, ny) = resolve_wall_collisions(cur_x, cur_y, ZOMBIE_RADIUS, &self.wall_grid);
                 let blocked = (nx - cur_x).abs() > 0.1 || (ny - cur_y).abs() > 0.1;
@@ -1323,6 +1440,9 @@ impl Game {
                 let z = &self.zombies[zi];
                 let dist_to_target = f64::hypot(tx - z.pos.x, ty - z.pos.y);
                 if z.health > 0.0 && dist_to_target < ZOMBIE_ATTACK_RANGE + zombie_radius(z) - ZOMBIE_RADIUS
+                    && player_positions.get(target_id).is_some_and(|&(px, py)|
+                        f64::hypot(px - z.pos.x, py - z.pos.y) < ZOMBIE_ATTACK_RANGE + zombie_radius(z) - ZOMBIE_RADIUS
+                        && (z_type == ZombieType::Abomination || navigation::clear_path(&self.layout.walls, (z.pos.x, z.pos.y), (px, py), 0.0)))
                     && self.dash_iframes.get(target_id).copied().unwrap_or(0.0) <= 0.0 {
                     let cd = self.zombie_attack_cooldowns.entry(z.id.clone()).or_insert(0.0);
                     if *cd <= 0.0 {
@@ -1366,7 +1486,7 @@ impl Game {
                     let z = &mut self.zombies[zi];
                     z.pos.x = clampz(z.pos.x + vx / b_speed * kb, map_w);
                     z.pos.y = clampz(z.pos.y + vy / b_speed * kb, map_h);
-                    if !matches!(z.zombie_type, ZombieType::Brute | ZombieType::Crawler | ZombieType::Abomination) {
+                    if z.zombie_type != ZombieType::Abomination {
                         let (nx, ny) = resolve_wall_collisions(z.pos.x, z.pos.y, ZOMBIE_RADIUS, &self.wall_grid);
                         z.pos.x = nx;
                         z.pos.y = ny;
@@ -1374,7 +1494,8 @@ impl Game {
                 }
                 if self.zombies[zi].health <= 0.0 {
                     let z = &self.zombies[zi];
-                    kill_awards.push((owner_id, kill_bounty(z)));
+                    let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
+                    kill_awards.push((owner_id, kill_bounty(z, was_hunter)));
                     zombie_kill_indices.push(zi);
                     break;
                 }
@@ -1397,7 +1518,8 @@ impl Game {
                     z.pos.y = clampz(z.pos.y + dy / dist * kb, map_h);
                 }
                 if z.health <= 0.0 && !zombie_kill_indices.contains(&zi) {
-                    kill_awards.push((exp.owner_id.clone(), kill_bounty(z)));
+                    let was_hunter = self.zombie_brains.get(&z.id).is_some_and(|b| b.hunt_elapsed > 0.0);
+                    kill_awards.push((exp.owner_id.clone(), kill_bounty(z, was_hunter)));
                     zombie_kill_indices.push(zi);
                 }
             }
@@ -1456,6 +1578,7 @@ impl Game {
                 self.zombie_attack_cooldowns.remove(&z.id);
                 self.zombie_wall_stuck.remove(&z.id);
                 self.zombie_home.remove(&z.id);
+                self.zombie_brains.remove(&z.id);
                 self.boss_quarry.remove(&z.id);
                 self.zombies.swap_remove(zi);
             }
@@ -1478,6 +1601,7 @@ impl Game {
             if !culled.is_empty() {
                 for id in &culled {
                     self.zombie_home.remove(id);
+                    self.zombie_brains.remove(id);
                     self.zombie_attack_cooldowns.remove(id);
                     self.zombie_wall_stuck.remove(id);
                 }
@@ -1973,8 +2097,8 @@ mod tests {
         assert_eq!(game.boss_quarry.get(&bosses[0].id).map(String::as_str), Some("camper"));
         assert!(game.players()["camper"].hunted && !game.players()["mover"].hunted);
         assert!(game.players()["camper"].camp < 1.0, "the meter resets once the boss is sent");
-        // Camping on while hunted never stacks a second boss.
-        for _ in 0..frames { game.player_mut("camper").health = 1e6; game.player_mut("mover").health = 1e6; game.update(1.0 / 60.0); }
+        // Camping on during a hunt never stacks a second boss.
+        for _ in 0..20 * 60 { game.player_mut("camper").health = 1e6; game.player_mut("mover").health = 1e6; game.update(1.0 / 60.0); }
         let for_camper = game.boss_quarry.values().filter(|q| *q == "camper").count();
         assert_eq!(for_camper, 1, "a hunted camper never gets a second boss");
     }
@@ -2016,6 +2140,148 @@ mod tests {
         if let Some(z) = game.zombies().iter().find(|z| z.id == "stray") {
             assert!(f64::hypot(z.pos.x - n.x, z.pos.y - n.y) < d0 + 100.0 - 20.0, "it walked home");
         }
+    }
+
+    fn ai_arena(walls: Vec<Wall>) -> Game {
+        let mut game = game();
+        game.add_player("p", "P", &kit(5, 5, 5));
+        isolate(&mut game, "p");
+        game.layout.walls = walls;
+        game.layout.nests = vec![Point { x: 200.0, y: 200.0 }];
+        game.layout.extracts.clear();
+        game.wall_grid = build_wall_grid(&game.layout.walls, game.layout.width, game.layout.height);
+        game.navigation = Navigation::new(game.layout.width, game.layout.height, &game.layout.walls);
+        game.player_mut("p").pos = Vector2 { x: 400.0, y: 200.0 };
+        game.player_mut("p").health = 1e6;
+        game.push_zombie(enemy("guard", ZombieType::Zombie, 200.0, 200.0, 1000.0, 0.0));
+        game.zombie_home.insert("guard".into(), 0);
+        game
+    }
+
+    #[test]
+    fn monsters_need_sight_and_do_not_detect_players_across_the_map() {
+        let mut game = ai_arena(vec![Wall::new(300.0, 100.0, 20.0, 200.0)]);
+        game.update(1.0 / 60.0);
+        assert!(game.zombie_brains["guard"].quarry.is_none(), "a wall conceals the player");
+        game.player_mut("p").pos = Vector2 { x: 200.0, y: 200.0 + ZOMBIE_AGGRO_RANGE + 50.0 };
+        game.update(1.0 / 60.0);
+        assert!(game.zombie_brains["guard"].quarry.is_none(), "distant players do not draw idle monsters");
+        game.player_mut("p").pos = Vector2 { x: 250.0, y: 200.0 };
+        game.update(1.0 / 60.0);
+        assert_eq!(game.zombie_brains["guard"].quarry.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn pursuit_expires_even_with_continuous_sight_and_cannot_restart_immediately() {
+        let mut game = ai_arena(Vec::new());
+        for _ in 0..122 { game.update(0.1); }
+        let brain = &game.zombie_brains["guard"];
+        assert!(brain.returning && brain.quarry.is_none());
+        assert!(brain.rest > 3.0, "visible players cannot reset the chase timer");
+        game.update(0.1);
+        assert!(game.zombie_brains["guard"].quarry.is_none(), "no instant reacquisition");
+    }
+
+    #[test]
+    fn monsters_search_last_seen_position_then_give_up() {
+        let mut game = ai_arena(vec![Wall::new(300.0, 300.0, 20.0, 300.0)]);
+        game.update(0.1);
+        game.player_mut("p").pos = Vector2 { x: 400.0, y: 500.0 };
+        game.update(0.1);
+        assert_eq!(game.zombie_brains["guard"].last_seen, (400.0, 200.0));
+        for _ in 0..26 { game.update(0.1); }
+        assert!(game.zombie_brains["guard"].returning);
+        assert!(game.zombie_brains["guard"].quarry.is_none());
+    }
+
+    #[test]
+    fn pursuit_keeps_its_target_and_stops_at_the_home_boundary() {
+        let mut game = ai_arena(Vec::new());
+        game.update(0.1);
+        game.add_player("q", "Q", &kit(5, 5, 5));
+        game.player_mut("q").pos = Vector2 { x: 300.0, y: 200.0 };
+        game.update(0.1);
+        assert_eq!(game.zombie_brains["guard"].quarry.as_deref(), Some("p"), "nearby squadmates do not steal the target every frame");
+        game.player_mut("p").pos.x = 200.0 + ZOMBIE_CHASE_LEASH + 20.0;
+        game.update(0.1);
+        assert!(game.zombie_brains["guard"].returning);
+        game.update(0.1);
+        assert!(game.zombie_brains["guard"].quarry.is_none(), "returning ignores even a closer player");
+    }
+
+    #[test]
+    fn returning_monsters_walk_home_and_resume_patrolling() {
+        let mut game = ai_arena(Vec::new());
+        game.player_mut("p").pos = Vector2 { x: 1000.0, y: 200.0 };
+        game.zombies[0].speed = 100.0;
+        game.zombie_brains.insert("guard".into(), ZombieBrain { home: (200.0, 200.0), ..ZombieBrain::default() });
+        game.zombies[0].pos.x = 1100.0;
+        for _ in 0..90 { game.update(0.1); }
+        assert!(game.zombies[0].pos.x < 600.0, "it returns despite a player standing beside it");
+        assert!(game.zombie_brains["guard"].quarry.is_none());
+        assert!(!game.zombie_brains["guard"].returning, "back home, patrol can resume");
+    }
+
+    #[test]
+    fn anti_camping_hunters_also_have_a_finite_pursuit() {
+        let mut game = ai_arena(Vec::new());
+        game.boss_quarry.insert("guard".into(), "p".into());
+        game.zombies[0].target = Some("p".into());
+        game.update(0.1);
+        assert!(game.players["p"].hunted);
+        game.zombie_brains.get_mut("guard").unwrap().hunt_elapsed = HUNTER_CHASE_SECS - 0.05;
+        game.update(0.1);
+        assert!(game.boss_quarry.is_empty());
+        assert!(!game.players["p"].hunted);
+        assert!(game.zombies[0].target.is_none());
+        assert!(game.zombie_brains["guard"].returning);
+    }
+
+    #[test]
+    fn crawlers_and_brutes_cannot_walk_or_attack_through_walls() {
+        for kind in [ZombieType::Crawler, ZombieType::Brute] {
+            let mut game = ai_arena(vec![Wall::new(220.0, 0.0, 20.0, 600.0)]);
+            game.zombies[0].zombie_type = kind;
+            game.zombies[0].speed = 90.0;
+            game.player_mut("p").pos.x = 255.0;
+            game.boss_quarry.insert("guard".into(), "p".into());
+            for _ in 0..60 { game.update(1.0 / 60.0); }
+            assert!(game.zombies[0].pos.x <= 220.0 - ZOMBIE_RADIUS);
+            assert!(game.players["p"].damage_log.is_empty(), "no hits through a wall");
+        }
+    }
+
+    #[test]
+    fn monsters_navigate_around_a_building_wall_through_its_doorway() {
+        let mut game = ai_arena(vec![
+            Wall::new(300.0, 0.0, 20.0, 350.0),
+            Wall::new(300.0, 450.0, 20.0, 4000.0),
+        ]);
+        game.zombies[0].zombie_type = ZombieType::Crawler;
+        game.zombies[0].speed = 100.0;
+        game.boss_quarry.insert("guard".into(), "p".into());
+        for _ in 0..600 {
+            game.update(1.0 / 60.0);
+            let z = &game.zombies[0];
+            assert!(!circle_hits_wall(z.pos.x, z.pos.y, ZOMBIE_RADIUS - 0.1, &game.wall_grid));
+        }
+        assert!(game.zombies[0].pos.x > 330.0, "it found the doorway instead of pushing against the wall");
+        assert!(!game.players["p"].damage_log.is_empty(), "it reached the player by the walkable route");
+    }
+
+    #[test]
+    fn uplink_noise_alerts_local_monsters_without_overriding_their_territory() {
+        let mut game = ai_arena(Vec::new());
+        game.player_mut("p").pos.x = 900.0;
+        game.update(0.1);
+        assert!(game.zombie_brains["guard"].quarry.is_none());
+        game.decrypt_noise = vec![("p".into(), 900.0, 200.0)];
+        game.update(0.1);
+        assert_eq!(game.zombie_brains["guard"].quarry.as_deref(), Some("p"));
+        game.player_mut("p").pos.x = 1100.0;
+        game.decrypt_noise = vec![("p".into(), 1100.0, 200.0)];
+        game.update(0.1);
+        assert!(game.zombie_brains["guard"].returning, "noise does not drag monsters beyond home territory");
     }
 
     #[test]
@@ -2183,7 +2449,7 @@ mod tests {
         assert_eq!(game.zombies().iter().filter(|z| z.elite).count(), ELITE_PACK * 3, "camping never becomes free");
         let hunter = game.zombies().iter().find(|z| z.elite).unwrap().clone();
         assert_eq!(hunter.target.as_deref(), Some("p"));
-        assert_eq!(kill_bounty(&hunter), zombie_bounty(&hunter.zombie_type), "no elite bonus for farmed hunters");
+        assert_eq!(kill_bounty(&hunter, true), zombie_bounty(&hunter.zombie_type), "no elite bonus for farmed hunters");
     }
 
     #[test]

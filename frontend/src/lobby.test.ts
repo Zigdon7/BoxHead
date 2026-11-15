@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   RoomInfo, Friend, Matchmaking, OPEN_ROOM_ID, resolveSelectedRoom, roomStatusText, roomsForMap,
-  matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel, buildLabel, safeLink, signInIntro,
+  matchmakingText, sortFriends, friendsSummary, friendLabel, friendDetail, buildLabel, safeLink, signInIntro,
 } from './lobby';
 
 function room(overrides: Partial<RoomInfo> = {}): RoomInfo {
@@ -14,7 +14,7 @@ function room(overrides: Partial<RoomInfo> = {}): RoomInfo {
 }
 
 function friend(handle: string, online: boolean): Friend {
-  return { handle, display_name: handle, user_id: `id-${handle}`, online };
+  return { kind: 'operator', name: handle, id: `id-${handle}`, online, activity: online ? 'hideout' : 'offline' };
 }
 
 describe('resolveSelectedRoom', () => {
@@ -98,40 +98,27 @@ describe('friends', () => {
     const sorted = sortFriends([
       friend('zed', false), friend('Bob', true), friend('amy', false), friend('carl', true),
     ]);
-    expect(sorted.map(f => f.handle)).toEqual(['Bob', 'carl', 'amy', 'zed']);
+    expect(sorted.map(friendLabel)).toEqual(['Bob', 'carl', 'amy', 'zed']);
   });
 
   it('does not mutate the input list', () => {
     const list = [friend('b', false), friend('a', true)];
     sortFriends(list);
-    expect(list.map(f => f.handle)).toEqual(['b', 'a']);
+    expect(list.map(friendLabel)).toEqual(['b', 'a']);
   });
 
   it('summarises online counts', () => {
     expect(friendsSummary([])).toBe('0/0 online');
     expect(friendsSummary([friend('a', true), friend('b', false)])).toBe('1/2 online');
   });
-});
 
-describe('callsigns', () => {
-  it('never exposes an email address to other players', () => {
-    expect(defaultCallsign('jane.doe@example.com')).toBe('jane.doe');
-    expect(defaultCallsign('someone-with-a-long-name@example.com')).toBe('someone-with-a-l');
-  });
-
-  it('keeps social handles, bounded to the server limit', () => {
-    expect(defaultCallsign('pilot.bsky.social')).toBe('pilot.bsky.socia');
-    expect(defaultCallsign('ace')).toBe('ace');
-  });
-
-  it('falls back when nothing usable remains', () => {
-    expect(defaultCallsign('@example.com')).toBe('Operative');
-    expect(defaultCallsign('   ')).toBe('Operative');
-  });
-
-  it('labels the account chip without a double @', () => {
-    expect(accountLabel('me@example.com')).toBe('me@example.com');
-    expect(accountLabel('me.bsky.social')).toBe('@me.bsky.social');
+  it('shows the current operator only for account friends', () => {
+    const account: Friend = { kind: 'account', id: 'account-id', online: true, activity: 'raid', operator: { id: 'op:ghost', name: 'Ghost' } };
+    expect(friendLabel(account)).toBe('account-id');
+    expect(friendDetail(account)).toBe('In raid · Ghost');
+    expect(friendDetail({ ...account, online: false, operator: null })).toBe('Offline');
+    expect(friendLabel(friend('Ghost', true))).toBe('Ghost');
+    expect(friendDetail(friend('Ghost', true))).toBe('Online');
   });
 });
 

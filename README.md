@@ -11,6 +11,10 @@ A co-op zombie **extraction shooter** built from the classic BoxHead, with a 60 
 | Run a playtest: checks before, what to tell testers, what to collect after | [docs/PLAYTEST.md](docs/PLAYTEST.md) |
 | Check a build before it ships | [Release check](#release-check) |
 | Learn the game as a player | `/learn.html` on a running server |
+| Understand the complete player journey and usability gaps | [docs/USER_EXPERIENCE.md](docs/USER_EXPERIENCE.md) |
+| Understand gear, economy, Homefront, Operations and Legacy | [docs/PROGRESSION.md](docs/PROGRESSION.md) |
+| Review combat, encounters, loot and co-op rules | [docs/GAMEPLAY.md](docs/GAMEPLAY.md) |
+| See the sequenced UX, progression and gameplay roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) |
 
 ## The loop
 
@@ -24,13 +28,13 @@ A co-op zombie **extraction shooter** built from the classic BoxHead, with a 60 
 - **Gear score** is the average power of the four loadout slots (an empty slot counts as 0).
 - Gun power multiplies damage (×1 + power/50). Armor sets max health (100 + 2 × power). The pack sets loot slots (4 + power/12), ammo reserve (60 + 2 × power) and starting deployables. Katana damage scales with gear score (×1 + score/90).
 - Harder maps charge an **entry fee** (Outskirts free, Rust Yard $150, Quarantine $600, Black Site $2,000), paid even if you die, so bounty and loot sales always matter. Combos multiply kill bounty up to 3×.
-- **Insurance:** before deploying you can insure your loadout for 35% of its sale value. If the raid is lost, the equipped gear comes back (the pack, bounty, fee and premium don't).
+- **Insurance:** before deploying you can insure your loadout for 35% of its sale value before discounts. If the raid is lost, the equipped gear, including the pack item, comes back (pack contents, bounty, fee and premium don't).
 - With nothing equipped you deploy with a **loaner pistol** (20% weaker than any real gun, never lost) and a 2-slot pouch, so nobody can get stuck, but going in naked is never better than the starter kit.
 - A new operator starts with a Service Pistol, a Padded Vest, a Canvas Satchel and $400. The stash holds 40 items besides the equipped gear; loot that doesn't fit when you extract is sold for you.
 
 | Map | Gear score | Size | Enemies | Loot power |
 | --- | --- | --- | --- | --- |
-| Outskirts (10 min) | 0+ | 4640 × 3360 | ×1 health and damage. Walkers, crawlers, a few devils | 2–16 |
+| Outskirts (10 min) | 0+ | 4640 × 4000 | ×1 health and damage. Walkers, crawlers, a few devils | 2–16 |
 | Rust Yard (11 min) | 20+ | 5280 × 4000 | ×1.5 health, ×1.35 damage, ×1.12 speed, brutes, 3% elites | 14–34 |
 | Quarantine Zone (12 min) | 40+ | 5920 × 4000 | ×2.1 health, ×1.8 damage, ×1.3 speed, vampires, 6% elites | 32–59 |
 | Black Site (13 min) | 65+ | 6560 × 4640 | ×2.8 health, ×2.3 damage, ×1.42 speed, 11% elites | 55–88 |
@@ -41,7 +45,7 @@ Rarity adds 0–15 power. Each map's common loot tops out just below the next ga
 
 - **A lot of loot comes sealed.** Crate and enemy drops are sealed 25% of the time on Outskirts, rising by 8% per tier, and more often for rarer items (up to 90%). The Abomination always drops one sealed prize. You can see a sealed item's rarity (its signal) and power, but not what it is. Sealed, it's worth only scrap.
 - **Uplinks decrypt it.** Every map has tier + 1 uplinks on inner street crossings (cyan diamonds on the radar and the full map). Stand in an uplink's ring and the first sealed item in your pack decrypts: 4, 6, 8, 11 or 15 seconds by rarity. It becomes gear (60%) or a valuable, of the same rarity and power, with a one-in-five chance of one grade better. Leaving the ring, or going down, restarts the timer.
-- **Decrypting is loud.** While you decrypt, monsters within 1,300 units come for you and nests within 1,500 units spawn 1.8× faster.
+- **Decrypting is loud.** While you decrypt, monsters within 1,300 units that can reach you within their home territory come for you and nests within 1,500 units spawn 1.8× faster.
 - **Bring it back later.** Sealed items you extract with go to your stash. Select one in the hideout's Stash tab and choose **Pack for next raid**, and it starts your next raid in your pack (as many as the pack fits), ready to decrypt. Like anything in your pack, they're lost if you die. If you drop out before playing, they go back to the stash.
 - Full-pack swaps: gear only replaces weaker gear. Valuables and sealed items replace each other, ranked by sale value (a sealed item by what it should open into).
 
@@ -83,15 +87,15 @@ The rules live in `backend/src/progression.rs`. Every number below is a first gu
 
 ## Nests and the Abomination
 
-- Monsters come from **nests**: unbreakable mounds on inner street crossings, never next to an insertion or extraction point. A nest only spawns while a living player is within 1,500 units, keeps a capped number of monsters out (5 + 2 × tier) and its monsters roam near it until they spot someone. Monsters far from everyone are culled.
-- **Camping is punished.** If you haven't strayed more than 450 units (14 m) from where you are at any point in the last 30 seconds, a camp meter fills; travelling drains it, and shuffling on the spot doesn't count. After 75 seconds of camping the nest nearest you sends hunters that track you anywhere on the map: first an **Abomination** (1,400 HP × the map's health multiplier, nearly as fast as you, smashes through walls, drops a lucky gear roll and a valuable), and for any later camping in the same raid, packs of three elites (hunters pay only base bounty, so farming them doesn't pay). Hunters stay on a downed target until they leave the raid. The HUD warns from 45 seconds with a countdown, and the meter stays empty while you're being hunted.
+- Monsters come from **nests**: unbreakable mounds on inner street crossings, never next to an insertion or extraction point. A nest only spawns while a living player is within 1,500 units, keeps a capped number of monsters out (5 + 2 × tier) and its monsters patrol near it. Ordinary monsters spot visible players within 480 units, remember their last seen position for 2.5 seconds and pursue for at most 12 seconds within 800 units of their nest. They then return home, ignoring players until they are within the patrol area and at least 4 seconds have passed. Monsters route through doorways and cannot see or attack through walls. Monsters far from everyone are culled. Outskirts is seven by six blocks with eight nests, leaving more room to route around encounters.
+- **Camping is punished.** If you haven't strayed more than 450 units (14 m) from where you are at any point in the last 30 seconds, a camp meter fills; travelling drains it, and shuffling on the spot doesn't count. After 75 seconds of camping the nest nearest you sends hunters that track you for up to 30 seconds before returning home: first an **Abomination** (1,400 HP × the map's health multiplier, nearly as fast as you, smashes through walls, drops a lucky gear roll and a valuable), and for any later camping in the same raid, packs of three elites (hunters pay only base bounty, so farming them doesn't pay). Hunters keep a downed target for the remaining hunt duration, or until that player leaves the raid. The HUD warns from 45 seconds with a countdown, and the meter stays empty while you're being hunted.
 
 ## Raids
 
 - Every raid is hosted and simulated by the server. Raids are persistent: you can drop into one already running, and each operator has their own raid clock. Squadmates who deploy within 30 seconds share an insertion point.
 - A downed operator bleeds out after 25 seconds (3 seconds if nobody else in the raid is alive). Stand next to them for 3 seconds to revive them at half health.
 - Health drops heal 25% of max health and katana kills 4%. Barrel and claymore damage scales with the map's enemy health. Explosions deal full damage at the centre and 40% at the edge; rockets cost 2 rounds.
-- With a full pack, gear you walk over replaces your weakest gear (by power) and valuables your cheapest valuable. **G** drops the last item you picked up.
+- With a full pack, new gear replaces weaker carried gear (by power). Valuables and sealed items compete by sale value or estimated opened value. **I** lets you inspect and drop a chosen item; **G** drops the pack's last item.
 - Leaving or disconnecting mid-raid counts as abandoning it (gear lost). Dropping before you've sent any input voids the raid (gear kept, insurance premium refunded, entry fee not refunded); a server restart voids raids and returns the gear, the entry fee and the premium.
 - You can pause (`P`) only while you are alone in a raid. It freezes everything, raid clock included, and anyone joining resumes it.
 - **Networking:** each client gets its own 30 Hz delta stream with only the enemies, bullets, drops and deployables within 1,500 units of its player. Worst case on Black Site (220 enemies on screen, 6 players firing) measures about 300 KB/s per player: `cargo test --release bandwidth -- --ignored --nocapture`.
@@ -149,7 +153,7 @@ To serve the built site from the backend instead of the dev server, run `npm run
 | `tests/e2e/` | End-to-end tests that drive the real binaries |
 | `scripts/release-check.mjs` | The release check |
 | `Dockerfile`, `compose.yaml`, `deploy/`, `.env.example` | Hosting (see [docs/HOSTING.md](docs/HOSTING.md)) |
-| `docs/` | Hosting and playtest guides |
+| `docs/` | Hosting, playtesting, user experience, progression, gameplay and development roadmap |
 
 ## Accounts and sign-in
 
@@ -163,7 +167,7 @@ To serve the built site from the backend instead of the dev server, run `npm run
 - **Password reset.** `POST /api/auth/password/forgot {email}` emails a one-hour link to `/?reset=<token>` and answers the same way whether or not the account exists. `POST /api/auth/password/reset {token, password}` sets the password, signs out every session and signs this one in. Link tokens are stored only as SHA-256 hashes.
 - **Account deletion.** `POST /api/account/delete {token, confirm: "DELETE"}` removes the account and everything it owns (operators, stash, Homefront, Legacy, friends, linked sign-ins). It is refused while an operator is in a raid.
 - **Matchmaking pools.** Players are matched by the platform they signed in with this session (Steam, Bluesky, or email/Google). Turning on cross-platform play (`POST /api/matchmaking/crossplay {token, enabled}`) moves the account into one shared pool.
-- **Friends.** `GET /api/friends?token=` lists friends and whether each is in a raid; `POST /api/friends/add {token, handle}` and `/api/friends/remove` change the list.
+- **Friends have two tiers.** Share your permanent account ID or the selected operator's independent operator ID from **Friends**. Account friends persist across operators and see your account ID plus the operator you are currently playing. Operator friends belong only to the two linked operators: they see that operator's name and status, never the account ID or another character. Switching to another operator makes the original one appear offline. Existing friendships become account friendships. Presence works in menus, the hideout and raids; signing out or closing the last tab makes you offline. `GET /api/friends?token=` returns the list and your shareable IDs. `POST /api/friends/{add|remove} {token, kind: "account"|"operator", id}` changes the selected tier in both directions.
 
 ## Hosting
 
@@ -210,7 +214,7 @@ The database runs in WAL mode (`synchronous=NORMAL`): commits don't wait on a di
   - `GET /api/rooms?token=` lists raids with their map and `canJoin`. `POST /api/rooms {token, name, map}` creates one in the host's pool.
   - `GET /api/hideout?token=` returns the account (operators, season, Legacy) and the active operator: stash, loadout, cash, gear score, trader offers, maps, Homefront, Operations and which sealed items are packed for the next raid. `POST /api/hideout/{equip|unequip|sell|sellMany|buy|carry} {token, itemId?, itemIds?, slot?, offerId?, carry?}` changes them and returns the new state. Account actions use the same route: `createOperator {name, raidable}`, `switchOperator {operatorId}`, `deleteOperator {operatorId, confirm: true}` (frees the slot, earns nothing, refused mid-raid), `upgradeTier`, `upgradeFacility {facility}`, `collectWorkshop`, `relocate {confirm: true}` and `buyPerk {perk}`. Gear is locked while you're in a raid.
   - `GET /api/maps` lists the maps.
-- The WebSocket `join` message takes `roomId`, `token`, `name` (the callsign) and `insure`. The server checks verification and gear score, charges the entry fee, then locks the loadout into the raid. When a raid ends the server sends `raidEnd` (outcome + stash settlement) and closes the socket.
+- Your raid callsign is fixed to the selected operator's stored name. The WebSocket `join` message takes `roomId`, `token` and `insure`; client-supplied names are ignored. The server checks verification and gear score, charges the entry fee, then locks the loadout into the raid. When a raid ends the server sends `raidEnd` (outcome + stash settlement) and closes the socket.
 
 ## Ops dashboard
 

@@ -10,13 +10,28 @@ pub struct BskySession {
     pub access_jwt: String,
 }
 
-/// Friend with online status (returned to frontend)
+#[derive(Serialize, Clone)]
+pub struct OperatorIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+/// Operator friendships deliberately have no account identity in their payload.
 #[derive(Serialize)]
-pub struct FriendStatus {
-    pub user_id: String,
-    pub display_name: String,
-    pub handle: String,
-    pub online: bool,
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FriendStatus {
+    Account {
+        id: String,
+        online: bool,
+        activity: &'static str,
+        operator: Option<OperatorIdentity>,
+    },
+    Operator {
+        id: String,
+        name: String,
+        online: bool,
+        activity: &'static str,
+    },
 }
 
 /// Google user info from token exchange
@@ -30,34 +45,63 @@ pub struct GoogleUserInfo {
 
 /// Runtime online-presence tracking only.
 /// All persistence (sessions, friends, accounts) is in db.rs.
+#[derive(Clone)]
 pub struct SocialState {
-    /// player_id (game websocket) -> internal user_id
-    pub player_to_user: HashMap<String, String>,
-    /// user_id -> player_id (reverse, for online status)
-    pub user_to_player: HashMap<String, String>,
+    /// Each browser or raid connection is tracked separately: one disconnect
+    /// must not hide another open tab or a still-connected raid.
+    connections: HashMap<String, String>,
+    raids: HashMap<String, (String, String)>,
 }
 
 impl SocialState {
     pub fn new() -> Self {
         Self {
-            player_to_user: HashMap::new(),
-            user_to_player: HashMap::new(),
+            connections: HashMap::new(),
+            raids: HashMap::new(),
         }
     }
 
-    pub fn link_player(&mut self, player_id: &str, user_id: &str) {
-        self.player_to_user.insert(player_id.to_string(), user_id.to_string());
-        self.user_to_player.insert(user_id.to_string(), player_id.to_string());
+    pub fn link_account(&mut self, connection: &str, user_id: &str) {
+        self.connections.insert(connection.into(), user_id.into());
+    }
+
+    pub fn link_player(&mut self, player_id: &str, user_id: &str, operator_id: &str) {
+        self.link_account(player_id, user_id);
+        self.raids.insert(player_id.into(), (user_id.into(), operator_id.into()));
     }
 
     pub fn unlink_player(&mut self, player_id: &str) {
-        if let Some(user_id) = self.player_to_user.remove(player_id) {
-            self.user_to_player.remove(&user_id);
-        }
+        self.connections.remove(player_id);
+        self.raids.remove(player_id);
     }
 
     pub fn is_online(&self, user_id: &str) -> bool {
-        self.user_to_player.contains_key(user_id)
+        self.connections.values().any(|u| u == user_id)
+    }
+
+    pub fn raid_operator(&self, user_id: &str) -> Option<&str> {
+        self.raids.values().find(|(u, _)| u == user_id).map(|(_, p)| p.as_str())
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn closing_one_tab_does_not_hide_other_tabs_or_raids() {
+        let mut presence = SocialState::new();
+        presence.link_account("tab-a", "user");
+        presence.link_account("tab-b", "user");
+        presence.link_player("raid", "user", "op:ghost");
+        presence.unlink_player("tab-a");
+        assert!(presence.is_online("user"));
+        assert_eq!(presence.raid_operator("user"), Some("op:ghost"));
+        presence.unlink_player("raid");
+        assert!(presence.is_online("user"));
+        assert_eq!(presence.raid_operator("user"), None);
+        presence.unlink_player("tab-b");
+        assert!(!presence.is_online("user"));
     }
 }
 
@@ -94,31 +138,6 @@ pub async fn bsky_login(handle: &str, password: &str) -> Result<BskySession, Str
     res.json::<BskySession>()
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))
-}
-
-/// Resolve a handle to a DID via the appropriate PDS
-pub async fn resolve_handle(handle: &str) -> Result<String, String> {
-    let pds = pds_url_for_handle(handle);
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/xrpc/com.atproto.identity.resolveHandle?handle={}",
-        pds, handle
-    );
-    let res = client.get(&url).send().await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !res.status().is_success() {
-        return Err(format!("Handle '{}' not found", handle));
-    }
-
-    #[derive(Deserialize)]
-    struct ResolveResponse {
-        did: String,
-    }
-
-    let data: ResolveResponse = res.json().await
-        .map_err(|e| format!("Failed to parse: {}", e))?;
-    Ok(data.did)
 }
 
 /// Exchange Google OAuth authorization code for user info.

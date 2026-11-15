@@ -418,7 +418,7 @@ pub static MAPS: [MapDef; 4] = [
     MapDef {
         id: "outskirts", name: "Outskirts", tier: 1, min_gear_score: 0,
         blurb: "Abandoned suburbs on the edge of the quarantine. Walkers, crawlers and the odd devil; light loot.",
-        blocks: (7, 5), seed: 0x0B0C_5EED_0001, loot_power: (2, 16),
+        blocks: (7, 6), seed: 0x0B0C_5EED_0001, loot_power: (2, 16),
         enemy_health: 1.0, enemy_damage: 1.0, enemy_speed: 1.0, elite_chance: 0.0,
         max_enemies_base: 26, max_enemies_per_player: 8, spawn_interval: 0.9, raid_secs: 10.0 * 60.0,
         spawn_weights: [70.0, 22.0, 8.0, 0.0, 0.0], bounty_mult: 1.0, entry_fee: 0,

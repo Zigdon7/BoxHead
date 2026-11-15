@@ -2,6 +2,8 @@
 
 This is the runbook for putting BoxHead in front of invited testers: what to check before, what to tell them, what to watch while they play and what to collect afterwards. Getting the server online is covered in [HOSTING.md](HOSTING.md).
 
+The complete experience and current rules are covered in [USER_EXPERIENCE.md](USER_EXPERIENCE.md), [PROGRESSION.md](PROGRESSION.md) and [GAMEPLAY.md](GAMEPLAY.md). Use [ROADMAP.md](ROADMAP.md) to turn observations into sequenced work; planned features there are not part of the current playtest.
+
 ## What is in this build
 
 Version `3.0.0-playtest.1`: the first build of BoxHead as an extraction shooter.
@@ -59,9 +61,12 @@ Ten minutes, on the public address, with two browsers (or one normal and one pri
 - [ ] **Play** opens the hideout and asks you to create an operator. It starts with a pistol, a vest, a satchel and $400.
 - [ ] **Trader**: buy something, then sell it back in **Stash**.
 - [ ] **Deploy** to Outskirts. You spawn at the map edge, enemies appear near nests, and the raid clock counts down.
+- [ ] **Monster AI:** on Outskirts, use **M** to see the eight nest territories on the larger 4640 × 4000 map. Approach a nest: monsters patrol locally, then pursue when they see you. Break sight around a building for 2.5 seconds, leave the territory, or kite for 12 seconds: they return home without immediately chasing again. Crawlers and brutes must use doorways.
+- [ ] **Hunter limit:** camp until warned and hunted. Survive for 30 seconds: the hunter returns home and the hunted indicator clears.
 - [ ] Open a crate, pick up loot, press **I** to see your pack.
 - [ ] Stand in a green extraction ring for 6 seconds. The results screen lists what you kept and the cash you banked, and the loot is in your stash.
 - [ ] In the second browser, sign up again and join the same raid. You see each other. Let one go down and revive them.
+- [ ] **Identity and friends:** the deploy screen shows the selected operator name without an editable callsign. In **Friends**, share IDs and add the second browser as both an account friend and an operator friend. Both appear online in the hideout. Switch the second account to another operator: the account friend shows the new operator, while the original operator friend goes offline without revealing the new character. Close one of two signed-in tabs: the other keeps the account online. Sign out of the last tab: both entries go offline.
 - [ ] Die on purpose without insurance: the loadout is gone and the stash is not. Deploy again with nothing equipped: you get the loaner pistol.
 - [ ] Rust Yard shows as locked with the gear score it needs.
 - [ ] The ops dashboard (on the host, port 3900) shows the server, its version and build, and the raid you are in.

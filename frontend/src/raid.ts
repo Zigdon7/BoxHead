@@ -86,6 +86,7 @@ export interface Hideout {
   maxOperators?: number;
   /** The active operator. */
   id?: string; name?: string; raidable?: boolean;
+  accountId?: string; friendId?: string;
   insuranceRate?: number;
   boost?: { maxHealth: number; damage: number };
   homefront?: Homefront;

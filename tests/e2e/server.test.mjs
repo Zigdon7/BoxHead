@@ -134,10 +134,10 @@ async function signUp({ operator = true, raidable = false, confirm = true } = {}
 }
 
 class Client {
-  constructor() {
+  constructor(path = '') {
     this.messages = [];
     this.waiters = [];
-    this.ws = new WebSocket(wsUrl);
+    this.ws = new WebSocket(wsUrl + path);
     this.opened = new Promise((res, rej) => {
       this.ws.addEventListener('open', res, { once: true });
       this.ws.addEventListener('error', rej, { once: true });
@@ -217,10 +217,21 @@ async function launch(bin, { env, cwd, ready }) {
   child.log = '';
   child.stdout.on('data', d => { child.log += d; });
   child.stderr.on('data', d => { child.log += d; });
-  child.exitCode$ = new Promise(res => child.once('exit', code => res(code)));
+  child.exitCode$ = new Promise((res, rej) => {
+    child.once('exit', code => res(code));
+    child.once('error', rej);
+  });
   if (ready) {
     const died = child.exitCode$.then(code => { throw new Error(`${bin} exited (${code}):\n${child.log}`); });
-    await Promise.race([died, waitUntil(ready, { message: `${bin} to start` })]);
+    try {
+      await Promise.race([died, waitUntil(ready, { message: `${bin} to start` })]);
+    } catch (error) {
+      // A failed launch never reaches the caller's cleanup list. Stop it here
+      // so startup failures report their logs and cannot hang the whole suite.
+      child.kill();
+      await child.exitCode$.catch(() => {});
+      throw new Error(`${error.message}\nStartup output:\n${child.log}`, { cause: error });
+    }
   }
   return child;
 }
@@ -537,13 +548,8 @@ describe('accounts', () => {
   test('friends show online while in any lobby and offline after leaving', async () => {
     const me = await signUp();
     const pal = await signUp();
-    // Adding friends normally resolves a Bluesky handle; link directly in the scratch DB instead.
-    const db = new DatabaseSync(joinPath(workDir, 'boxhead.db'));
-    for (const [a, b] of [[me.user_id, pal.user_id], [pal.user_id, me.user_id]]) {
-      db.prepare('INSERT INTO friends (user_id, friend_id) VALUES (?, ?)').run(a, b);
-    }
-    db.close();
-    const friendOnline = async () => (await api(`/api/friends?token=${me.token}`)).friends.find(f => f.user_id === pal.user_id)?.online;
+    assert.equal((await api('/api/friends/add', { method: 'POST', body: { token: me.token, kind: 'account', id: pal.user_id } })).ok, true);
+    const friendOnline = async () => (await api(`/api/friends?token=${me.token}`)).friends.find(f => f.kind === 'account' && f.id === pal.user_id)?.online;
     assert.equal(await friendOnline(), false);
     const { room } = await mustCreate('Hangout');
     const c = await joinOk({ roomId: room.id, token: pal.token });
@@ -561,6 +567,67 @@ describe('accounts', () => {
     assert.equal((await api('/api/friends/add', { method: 'POST', body: { token: 'bogus', handle: 'x.bsky.social' } })).ok, false);
     assert.equal((await api('/api/friends/add', { method: 'POST', body: { token, handle: '' } })).ok, false);
     assert.equal((await api('/api/friends/remove', { method: 'POST', body: { token: 'bogus', user_id: 'x' } })).ok, false);
+  });
+
+  test('account and operator friends keep separate identities across menus, raids and operator switches', async () => {
+    const me = await signUp();
+    const pal = await signUp();
+    const first = await api(`/api/hideout?token=${pal.token}`);
+    const second = await api('/api/hideout/createOperator', { method: 'POST', body: { token: pal.token, name: 'Sable' } });
+    const act = (action, extra) => api(`/api/hideout/${action}`, { method: 'POST', body: { token: pal.token, ...extra } });
+    await act('switchOperator', { operatorId: first.id });
+    const change = (route, kind, id) => api(`/api/friends/${route}`, { method: 'POST', body: { token: me.token, kind, id } });
+    assert.equal((await change('add', 'account', pal.user_id)).ok, true);
+    assert.equal((await change('add', 'operator', first.friendId)).ok, true);
+    assert.equal((await change('add', 'account', me.user_id)).ok, false);
+    assert.equal((await change('add', 'operator', 'op:missing')).ok, false);
+    const list = async () => (await api(`/api/friends?token=${me.token}`)).friends;
+    const presence = async () => {
+      const c = new Client('/presence');
+      await c.opened;
+      c.send({ type: 'presence', token: pal.token });
+      assert.equal((await c.waitFor(m => m.type === 'presence')).ok, true);
+      return c;
+    };
+    const tabA = await presence();
+    const tabB = await presence();
+    try {
+      let friends = await list();
+      assert.equal(friends.find(f => f.kind === 'account').operator.name, 'Tester');
+      assert.equal(friends.find(f => f.kind === 'operator').online, true);
+      assert.equal(friends.find(f => f.kind === 'account').activity, 'hideout');
+      await tabA.close();
+      assert.equal((await list()).find(f => f.kind === 'account').online, true, 'another tab keeps presence alive');
+      await act('switchOperator', { operatorId: second.id });
+      friends = await list();
+      assert.equal(friends.find(f => f.kind === 'account').operator.name, 'Sable');
+      const operatorFriend = friends.find(f => f.kind === 'operator');
+      assert.deepEqual(Object.keys(operatorFriend).sort(), ['activity', 'id', 'kind', 'name', 'online']);
+      assert.equal(operatorFriend.name, 'Tester');
+      assert.equal(operatorFriend.online, false);
+      assert.ok(!JSON.stringify(operatorFriend).includes(pal.user_id));
+      assert.ok(!JSON.stringify(operatorFriend).includes(pal.email));
+      const theirs = (await api(`/api/friends?token=${pal.token}`)).friends;
+      assert.equal(theirs.filter(f => f.kind === 'operator').length, 0, 'operator links do not follow you to another character');
+      assert.equal(theirs.filter(f => f.kind === 'account').length, 1);
+      const raid = await joinOk({ token: pal.token, name: 'Forged callsign' });
+      assert.equal(raid.snapshot.players[raid.id].name, 'Sable');
+      assert.equal((await list()).find(f => f.kind === 'account').activity, 'raid');
+      await raid.close();
+      assert.equal((await list()).find(f => f.kind === 'account').activity, 'hideout');
+      await act('switchOperator', { operatorId: first.id });
+      assert.equal((await list()).find(f => f.kind === 'operator').online, true);
+      await tabB.close();
+      assert.ok((await list()).every(f => !f.online));
+      assert.equal((await change('remove', 'account', pal.user_id)).ok, true);
+      assert.equal((await list()).length, 1, 'account removal leaves the operator friendship intact');
+      assert.equal((await change('remove', 'operator', first.friendId)).ok, true);
+      assert.deepEqual(await list(), []);
+      assert.deepEqual((await api(`/api/friends?token=${pal.token}`)).friends, []);
+    } finally {
+      if (tabA.ws.readyState < 2) await tabA.close();
+      if (tabB.ws.readyState < 2) await tabB.close();
+    }
   });
 });
 
@@ -628,15 +695,14 @@ describe('joining rooms over WebSocket', () => {
     await c.close();
   });
 
-  test('callsigns are trimmed to 16 chars and blank names get a default', async () => {
+  test('callsigns always use the operator name, including repeated raids and forged join names', async () => {
     const { room } = await mustCreate('Names');
-    const long = await joinOk({ roomId: room.id, name: '   ' + 'N'.repeat(30) });
-    assert.equal(long.snapshot.players[long.id].name, 'N'.repeat(16));
-    const blank = await joinOk({ roomId: room.id, name: '   ' });
-    const snap = await blank.waitFor(m => m.type === 'snapshot');
-    assert.match(snap.players[blank.id].name, /^Player_/);
-    await long.close();
-    await blank.close();
+    const user = await signUp();
+    for (const name of ['   ' + 'N'.repeat(30), '   ', 'Someone else']) {
+      const client = await joinOk({ roomId: room.id, token: user.token, name });
+      assert.equal(client.snapshot.players[client.id].name, 'Tester');
+      await client.close();
+    }
   });
 
   test('gear score gates the harder maps', async () => {

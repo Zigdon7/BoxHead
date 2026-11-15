@@ -6,6 +6,7 @@ import '@fontsource/barlow-condensed/800.css';
 import '@fontsource/share-tech-mono/400.css';
 import { drawEnemySprite, drawPlaceableSprite, drawDropSprite, drawGunSprite, drawNestSprite, drawCrateSprite, drawExtractZone } from './sprites';
 import { HideoutView, keyStat } from './hideout';
+import { Presence } from './presence';
 import {
   Hideout, MapSummary, RARITY_COLOR, RARITY_LABEL, KIND_LABEL, KIND_ICON, EXTRACT_TIME, CAMP_LIMIT, CAMP_WARNING,
   weaponDamageMult, formatClock, formatDistance, nearest, compass, threatLevel, raidTitle, swapCandidate, backpackValue, enemyName, itemEffect,
@@ -15,7 +16,7 @@ import { COMBO_MAX_MULT } from './constants';
 import { theme, withAlpha, font } from './theme';
 import {
   RoomInfo, Friend, Matchmaking, OPEN_ROOM_ID, resolveSelectedRoom, roomStatusText,
-  matchmakingText, sortFriends, friendsSummary, defaultCallsign, accountLabel, roomsForMap,
+  matchmakingText, sortFriends, friendsSummary, friendLabel, friendDetail, FriendIdentity, roomsForMap,
   ServerInfo, buildLabel, safeLink, signInIntro,
 } from './lobby';
 import {
@@ -249,7 +250,7 @@ function spawnExplosion(x: number, y: number, maxRadius: number, color = '#ff6d0
 
 const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
-const nameInputEl = document.getElementById('nameInput') as HTMLInputElement;
+const operatorCallsign = document.getElementById('operatorCallsign')!;
 const emailInputEl = document.getElementById('emailInput') as HTMLInputElement;
 const emailPassEl = document.getElementById('emailPassInput') as HTMLInputElement;
 const bskyHandleEl = document.getElementById('bskyHandleInput') as HTMLInputElement;
@@ -534,8 +535,6 @@ document.querySelectorAll<HTMLElement>('[data-menu-view]').forEach(el =>
 document.getElementById('signInBtn')!.addEventListener('click', () => showMenuView('signin'));
 
 function deploy() {
-  if (!playerName.trim()) playerName = 'Operative';
-  nameInputEl.value = playerName;
   connectToServer();
 }
 deployBtn.addEventListener('click', deploy);
@@ -551,10 +550,9 @@ function updateAuthDOM() {
   authSectionIn.classList.toggle('hidden', !isLoggedIn);
   updateAccountSummary();
   if (isLoggedIn) {
-    // Lead with the callsign other players see; the account handle is secondary.
-    const callsign = playerName.trim() || defaultCallsign(authHandle);
+    const callsign = hideoutView.state?.name || friendIdentity?.operator?.name || 'Choose an operator';
     loggedInStatus.textContent = callsign;
-    loggedInStatus.title = accountLabel(authHandle);
+    loggedInStatus.title = `Account ID: ${authUserId}`;
     document.getElementById('accountAvatar')!.textContent = callsign.charAt(0).toUpperCase() || '?';
   }
 }
@@ -564,7 +562,12 @@ const hideoutView = new HideoutView({
   auth: () => ({ token: authToken }),
   onSignedOut: () => { clearAuthState(); requireSignIn(); },
   icon: (id) => svgIcon(id),
-  onChange: (h: Hideout) => { updateAccountSummary(h); if (menuView === 'browser') renderRooms(); },
+  onChange: (h: Hideout) => {
+    operatorCallsign.textContent = h.name || 'Create an operator first';
+    friendIdentity = { accountId: h.accountId || authUserId, operator: h.friendId && h.name ? { id: h.friendId, name: h.name } : null };
+    updateAuthDOM(); updateFriendIdentity(); void refreshFriends();
+    if (menuView === 'browser') renderRooms();
+  },
 });
 document.getElementById('toDeployBtn')!.addEventListener('click', () => showMenuView('browser'));
 document.getElementById('insureToggle')!.addEventListener('change', () => renderRooms());
@@ -682,7 +685,7 @@ function renderRaidResults() {
     : shown.length ? `Lost · $${fmtInt(itemsValue(shown))}` : 'Lost';
   const settle = end.settlement;
   let line: string;
-  if (insured) line = 'Your loadout was insured and is back in the hideout. Your pack and bounty are gone.';
+  if (insured) line = 'Your equipped gear, including the pack itself, is back in the hideout. Pack contents and bounty are gone.';
   else if (!kept) line = shown.length
     ? 'Everything above is gone. Gear in your stash is safe: re-equip in the hideout, or buy from the trader.'
     : 'You went in with nothing equipped, so nothing was lost.';
@@ -701,9 +704,6 @@ function renderRaidResults() {
   document.getElementById('resultsLootCard')!.hidden = false;
 }
 
-// Older builds saved the full sign-in email as the callsign; never broadcast that.
-let playerName = (n => (n.includes('@') ? defaultCallsign(n) : n))(localStorage.getItem('boxhead_name') || 'Operative');
-
 // --- Auth ---
 let authToken = localStorage.getItem('boxhead_auth_token') || '';
 let authHandle = localStorage.getItem('boxhead_auth_handle') || '';
@@ -712,18 +712,19 @@ let isLoggedIn = !!authToken;
 
 // --- Friends ---
 let friendsList: Friend[] = [];
+let friendIdentity: FriendIdentity | null = null;
+const presence = new Presence();
 
 function setAuthState(token: string, handle: string, userId: string, displayName?: string) {
   authToken = token;
   authHandle = handle || displayName || '';
   authUserId = userId;
   isLoggedIn = true;
-  playerName = defaultCallsign(authHandle);
-  nameInputEl.value = playerName;
   localStorage.setItem('boxhead_auth_token', authToken);
   localStorage.setItem('boxhead_auth_handle', authHandle);
   localStorage.setItem('boxhead_auth_user_id', authUserId);
-  localStorage.setItem('boxhead_name', playerName);
+  presence.connect(token);
+  localStorage.removeItem('boxhead_name');
   updateAuthDOM();
   refreshFriends();
   refreshMe();
@@ -821,11 +822,14 @@ function handleAuthResult(d: { ok: boolean; error?: string; linked?: string; tok
 }
 
 function clearAuthState() {
+  presence.disconnect();
   authToken = '';
   authHandle = '';
   authUserId = '';
   isLoggedIn = false;
   friendsList = [];
+  friendIdentity = null;
+  hideoutView.state = null;
   updateAuthDOM();
   localStorage.removeItem('boxhead_auth_token');
   localStorage.removeItem('boxhead_auth_handle');
@@ -1061,11 +1065,15 @@ try {
 
 async function refreshFriends() {
   if (!authToken) return;
+  const requestedToken = authToken;
   try {
-    const res = await fetch(`/api/friends?token=${encodeURIComponent(authToken)}`);
+    const res = await fetch(`/api/friends?token=${encodeURIComponent(requestedToken)}`);
     const data = await res.json();
+    if (requestedToken !== authToken) return;
     if (data.ok) {
       friendsList = data.friends;
+      friendIdentity = data.identity;
+      updateFriendIdentity();
       updateFriendsDOM();
       updateAuthDOM();
     }
@@ -1088,19 +1096,23 @@ function renderFriendList(container: HTMLElement, removable: boolean) {
     const dot = document.createElement('div');
     dot.className = `status-dot${f.online ? ' online' : ''}`;
     const handle = document.createElement('span');
-    handle.textContent = f.handle;
+    handle.textContent = friendLabel(f);
+    handle.className = 'friend-name';
+    const tier = document.createElement('small');
+    tier.className = 'friend-tier';
+    tier.textContent = f.kind === 'account' ? 'Account' : 'Operator';
     const state = document.createElement('span');
     state.className = `friend-state${f.online ? ' online' : ''}`;
-    state.textContent = f.online ? 'Online' : 'Offline';
-    label.append(dot, handle);
+    state.textContent = friendDetail(f);
+    label.append(dot, tier, handle);
     row.append(label, state);
     if (removable) {
       const remove = document.createElement('button');
       remove.className = 'btn-icon-red';
-      remove.title = `Remove ${f.handle}`;
-      remove.setAttribute('aria-label', `Remove ${f.handle}`);
+      remove.title = `Remove ${friendLabel(f)}`;
+      remove.setAttribute('aria-label', `Remove ${friendLabel(f)}`);
       remove.append(svgIcon('i-close'));
-      remove.addEventListener('click', () => void removeFriend(f.user_id));
+      remove.addEventListener('click', () => void removeFriend(f));
       row.append(remove);
     }
     return row;
@@ -1143,7 +1155,7 @@ async function addFriend(handle: string) {
     const res = await fetch('/api/friends/add', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: authToken, handle }),
+      body: JSON.stringify({ token: authToken, id: handle, kind: (document.getElementById('friendKind') as HTMLSelectElement).value }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -1157,25 +1169,44 @@ async function addFriend(handle: string) {
   }
 }
 
-async function removeFriend(userId: string) {
+async function removeFriend(friend: Friend) {
   try {
     await fetch('/api/friends/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: authToken, user_id: userId }),
+      body: JSON.stringify({ token: authToken, id: friend.id, kind: friend.kind }),
     });
     refreshFriends();
   } catch { /* ignore */ }
 }
 
 setInterval(() => { if (isLoggedIn) refreshFriends(); }, 5000);
+if (isLoggedIn) presence.connect(authToken);
+
+function updateFriendIdentity() {
+  operatorCallsign.textContent = friendIdentity?.operator?.name || 'Create an operator first';
+  (document.getElementById('ownAccountId') as HTMLInputElement).value = friendIdentity?.accountId || authUserId;
+  (document.getElementById('ownOperatorId') as HTMLInputElement).value = friendIdentity?.operator?.id || '';
+  document.getElementById('ownOperatorName')!.textContent = friendIdentity?.operator?.name || 'No operator selected';
+}
+
+document.getElementById('friendKind')!.addEventListener('change', () => {
+  const operator = (document.getElementById('friendKind') as HTMLSelectElement).value === 'operator';
+  addFriendEl.placeholder = operator ? 'Paste their operator ID' : 'Paste their account ID';
+  document.getElementById('friendKindHint')!.textContent = operator
+    ? 'Only these two operators become friends. Your account and other operators stay private.'
+    : 'Account friends stay connected across operators and see which operator you are playing.';
+});
+for (const id of ['ownAccountId', 'ownOperatorId']) {
+  document.getElementById(id)!.addEventListener('click', event => (event.target as HTMLInputElement).select());
+}
 updateFriendsDOM();
 if (isLoggedIn) refreshFriends();
 
 // --- Static data (received once on init) ---
 let staticWalls: Wall[] = [];
 let staticMapWidth = 4640;
-let staticMapHeight = 3360;
+let staticMapHeight = 4000;
 let staticAmmoSpawns: { x: number; y: number; amount: number }[] = [];
 let staticExtracts: ExtractPoint[] = [];
 let staticCrates: Point[] = [];
@@ -1270,10 +1301,6 @@ function predictLocalMovement(dt: number) {
 
 // --- Mobile detection ---
 const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-
-// --- Input element wiring ---
-nameInputEl.value = playerName;
-nameInputEl.addEventListener('input', () => { playerName = nameInputEl.value; });
 
 document.querySelectorAll('.auth-tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -2085,13 +2112,12 @@ function connectToServer() {
   currentRoomName = rooms.find(r => r.id === currentRoomId)?.name ?? currentMap()?.name ?? 'the raid';
   resetGameState();
   setScreen('playing');
-  localStorage.setItem('boxhead_name', playerName);
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({ type: 'join', name: playerName, token: authToken || undefined, roomId: currentRoomId, insure: (document.getElementById('insureToggle') as HTMLInputElement).checked }));
+    ws!.send(JSON.stringify({ type: 'join', token: authToken || undefined, roomId: currentRoomId, insure: (document.getElementById('insureToggle') as HTMLInputElement).checked }));
   };
 
   ws.onmessage = (event) => {
@@ -3810,7 +3836,8 @@ function drawFullMap(state: GameState) {
   ctx.drawImage(layer.canvas, x0, y0, w, h);
   for (const n of staticNests) {
     ctx.fillStyle = withAlpha(theme.accent, 0.25);
-    ctx.beginPath(); ctx.arc(X(n.x), Y(n.y), 1500 * scale, 0, Math.PI * 2); ctx.fill();
+    // Match the monsters' home territory, rather than the nest activation range.
+    ctx.beginPath(); ctx.arc(X(n.x), Y(n.y), 800 * scale, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = theme.accent;
     ctx.beginPath(); ctx.arc(X(n.x), Y(n.y), 5, 0, Math.PI * 2); ctx.fill();
   }
@@ -4011,7 +4038,7 @@ function drawRaidHeader(state: GameState) {
     ctx.globalAlpha = 0.7 + 0.3 * Math.sin(performance.now() / 120);
     const mine = state.zombies.filter(z => z.target === myId);
     const boss = mine.some(z => z.type === 'abomination');
-    hudText(boss ? 'Hunted by an Abomination · extract or kill it' : 'Hunted by elites · extract or fight', x + pad, y + 80, { size: 13, weight: 800, color: theme.accent, maxWidth: w - pad * 2 - 60 });
+    hudText(boss ? 'Abomination hunt · survive 30s, extract or fight' : 'Elite hunt · survive 30s, extract or fight', x + pad, y + 80, { size: 13, weight: 800, color: theme.accent, maxWidth: w - pad * 2 - 60 });
     ctx.restore();
     const closest = nearest(mine.map(z => z.pos), me.pos.x, me.pos.y);
     if (closest) hudText(formatDistance(closest.dist), x + w - pad, y + 80, { size: 13, weight: 800, color: theme.accent, align: 'right' });

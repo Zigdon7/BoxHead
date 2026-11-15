@@ -22,6 +22,8 @@ pub struct StashItem {
 pub struct Operator {
     /// The operator's key (its stash profile).
     pub id: String,
+    /// Public identity, independent of legacy profiles that contain account IDs.
+    pub friend_id: String,
     pub name: String,
     /// Chosen at creation: raidable operators can run PvP and their Homefront
     /// can be raided; safe ones can't, and their Homefront stops at the safe tier.
@@ -168,8 +170,12 @@ pub struct UserRow {
 
 pub struct FriendRow {
     pub user_id: String,
-    pub display_name: String,
-    pub provider_handle: Option<String>,
+}
+
+pub struct OperatorFriendRow {
+    pub id: String,
+    pub name: String,
+    pub account: String,
 }
 
 impl Database {
@@ -249,11 +255,27 @@ impl Database {
             "produced_at INTEGER NOT NULL DEFAULT 0", "raid_map TEXT",
             // What the current raid cost, so a voided raid can pay it back.
             "raid_fee INTEGER NOT NULL DEFAULT 0", "raid_premium INTEGER NOT NULL DEFAULT 0",
+            "friend_id TEXT",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE operators ADD COLUMN {column}"), []);
         }
+        // Older single-operator profiles contained their account's ID. Give
+        // every operator an independent public ID before exposing friendships.
+        let missing: Vec<String> = conn.prepare("SELECT profile FROM operators WHERE friend_id IS NULL")
+            .and_then(|mut s| s.query_map([], |r| r.get(0)).map(|rows| rows.flatten().collect())).map_err(|e| e.to_string())?;
+        for profile in missing {
+            let id = format!("op:{}", uuid::Uuid::new_v4());
+            conn.execute("UPDATE operators SET friend_id = ?1 WHERE profile = ?2", params![id, profile]).map_err(|e| e.to_string())?;
+        }
         conn.execute_batch("
             CREATE INDEX IF NOT EXISTS operators_by_account ON operators(account);
+            CREATE UNIQUE INDEX IF NOT EXISTS operators_by_friend_id ON operators(friend_id);
+            CREATE TABLE IF NOT EXISTS operator_friends (
+                profile TEXT NOT NULL,
+                friend_profile TEXT NOT NULL,
+                PRIMARY KEY (profile, friend_profile)
+            );
+            CREATE INDEX IF NOT EXISTS operator_friends_by_target ON operator_friends(friend_profile);
             CREATE TABLE IF NOT EXISTS facilities (
                 profile TEXT NOT NULL,
                 facility TEXT NOT NULL,
@@ -324,7 +346,7 @@ impl Database {
     pub fn ensure_operator(&self, profile: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let created = tx.execute("INSERT OR IGNORE INTO operators (profile, cash) VALUES (?1, ?2)", params![profile, gear::STARTING_CASH])
+        let created = tx.execute("INSERT OR IGNORE INTO operators (profile, cash, friend_id) VALUES (?1, ?2, ?3)", params![profile, gear::STARTING_CASH, format!("op:{}", uuid::Uuid::new_v4())])
             .map_err(|e| e.to_string())?;
         if created > 0 {
             for (item, slot) in gear::starter_kit() { Self::insert_item(&tx, profile, &item, slot).map_err(|e| e.to_string())?; }
@@ -338,9 +360,9 @@ impl Database {
     }
 
     fn load_operator(conn: &Connection, profile: &str) -> Option<Operator> {
-        let (cash, raids, extracts, deaths, in_raid, name, raidable, tier) = conn.query_row(
-            "SELECT cash, raids, extracts, deaths, in_raid, name, raidable, tier FROM operators WHERE profile = ?1", params![profile],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, String>(5)?, r.get::<_, i32>(6)? != 0, r.get::<_, u32>(7)?)),
+        let (cash, raids, extracts, deaths, in_raid, name, raidable, tier, friend_id) = conn.query_row(
+            "SELECT cash, raids, extracts, deaths, in_raid, name, raidable, tier, friend_id FROM operators WHERE profile = ?1", params![profile],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, String>(5)?, r.get::<_, i32>(6)? != 0, r.get::<_, u32>(7)?, r.get(8)?)),
         ).optional().ok()??;
         let mut stmt = conn.prepare("SELECT id, kind, rarity, power, name, slot, carry FROM items WHERE profile = ?1 ORDER BY slot IS NULL, power DESC, name").ok()?;
         let rows = stmt.query_map(params![profile], |r| {
@@ -351,7 +373,7 @@ impl Database {
             let value = gear::sell_value(kind, rarity, power);
             Some(StashItem { item: Item { id, kind, rarity, power, name, value }, slot: slot.as_deref().and_then(Slot::parse), carry: carry != 0 })
         }).collect();
-        Some(Operator { id: profile.to_string(), name, raidable, tier, cash, raids, extracts, deaths, in_raid, items })
+        Some(Operator { id: profile.to_string(), friend_id, name, raidable, tier, cash, raids, extracts, deaths, in_raid, items })
     }
 
     fn not_in_raid(conn: &Connection, profile: &str) -> Result<(), String> {
@@ -496,17 +518,23 @@ impl Database {
     /// if asked, insurance on the loadout.
     #[cfg(test)]
     pub fn begin_raid_paying(&self, profile: &str, room_id: &str, min_gear_score: u32, fee: u32, insure: bool) -> Result<Loadout, String> {
-        self.begin(profile, room_id, min_gear_score, Some(fee), insure, None, now_secs())
+        self.begin(profile, room_id, min_gear_score, Some(fee), insure, None, now_secs()).map(|(loadout, _)| loadout)
     }
 
     /// Deploy to a map: its gear-score gate, its entry fee less the operator's
     /// Operations discount, and the operator's Homefront and Legacy bonuses.
+    #[cfg(test)]
     pub fn deploy(&self, profile: &str, room_id: &str, map: &'static MapDef, insure: bool) -> Result<Loadout, String> {
+        self.deploy_named(profile, room_id, map, insure).map(|(loadout, _)| loadout)
+    }
+
+    /// Return the stored callsign from the same transaction that locks the kit.
+    pub fn deploy_named(&self, profile: &str, room_id: &str, map: &'static MapDef, insure: bool) -> Result<(Loadout, String), String> {
         self.begin(profile, room_id, map.min_gear_score, None, insure, Some(map), now_secs())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin(&self, profile: &str, room_id: &str, min_gear_score: u32, fee: Option<u32>, insure: bool, map: Option<&'static MapDef>, now: i64) -> Result<Loadout, String> {
+    fn begin(&self, profile: &str, room_id: &str, min_gear_score: u32, fee: Option<u32>, insure: bool, map: Option<&'static MapDef>, now: i64) -> Result<(Loadout, String), String> {
         self.ensure_operator(profile)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -540,7 +568,7 @@ impl Database {
         tx.execute("UPDATE items SET carry = 2 WHERE id IN (SELECT id FROM items WHERE profile = ?1 AND carry = 1 AND slot IS NULL LIMIT ?2)",
             params![profile, room]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(loadout)
+        Ok((loadout, op.name))
     }
 
     /// Settle a finished raid. Extracting keeps the loadout, banks the bounty and
@@ -747,7 +775,7 @@ impl Database {
         if deployed { return Err("Finish your raid before creating another operator.".into()); }
         let name = prog::clean_operator_name(name, count + 1)?;
         let profile = format!("op:{}", uuid::Uuid::new_v4());
-        tx.execute("INSERT INTO operators (profile, cash, account, name, raidable, created_at, produced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        tx.execute("INSERT INTO operators (profile, friend_id, cash, account, name, raidable, created_at, produced_at) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![profile, gear::STARTING_CASH, user, name, raidable as i32, now]).map_err(|e| e.to_string())?;
         for (item, slot) in gear::starter_kit() { Self::insert_item(&tx, &profile, &item, slot).map_err(|e| e.to_string())?; }
         Self::set_active_in(&tx, user, &profile)?;
@@ -778,6 +806,7 @@ impl Database {
         if !Self::account_operator_ids(&tx, user).iter().any(|id| id == profile) { return Err("That operator isn't on your account".into()); }
         Self::not_in_raid(&tx, profile).map_err(|_| "That operator is in a raid. Finish it first.".to_string())?;
         let name: String = tx.query_row("SELECT name FROM operators WHERE profile = ?1", params![profile], |r| r.get(0)).map_err(|e| e.to_string())?;
+        Self::remove_operator_friends(&tx, profile)?;
         for table in ["items", "facilities", "operations", "operators"] {
             tx.execute(&format!("DELETE FROM {table} WHERE profile = ?1"), params![profile]).map_err(|e| e.to_string())?;
         }
@@ -933,6 +962,7 @@ impl Database {
         ).map_err(|e| e.to_string())?;
         tx.execute("INSERT OR REPLACE INTO account_badges (user_id, season, operator, value) VALUES (?1, ?2, ?3, ?4)",
             params![user, season.id, name, reward.value]).map_err(|e| e.to_string())?;
+        Self::remove_operator_friends(&tx, &profile)?;
         for table in ["items", "facilities", "operations", "operators"] {
             tx.execute(&format!("DELETE FROM {table} WHERE profile = ?1"), params![profile]).map_err(|e| e.to_string())?;
         }
@@ -1122,51 +1152,87 @@ impl Database {
 
     /// Add bidirectional friendship.
     pub fn add_friend(&self, user_id: &str, friend_id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        if user_id == friend_id { return Err("Cannot add yourself".into()); }
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)", params![friend_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !exists { return Err("Account ID not found".into()); }
+        tx.execute(
             "INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?1, ?2)",
             params![user_id, friend_id],
         ).map_err(|e| format!("Failed to add friend: {}", e))?;
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?1, ?2)",
             params![friend_id, user_id],
         ).map_err(|e| format!("Failed to add friend: {}", e))?;
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Remove bidirectional friendship.
     pub fn remove_friend(&self, user_id: &str, friend_id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
             "DELETE FROM friends WHERE user_id = ?1 AND friend_id = ?2",
             params![user_id, friend_id],
         ).map_err(|e| format!("Failed to remove friend: {}", e))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM friends WHERE user_id = ?1 AND friend_id = ?2",
             params![friend_id, user_id],
         ).map_err(|e| format!("Failed to remove friend: {}", e))?;
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Get friends list for a user.
     pub fn get_friends(&self, user_id: &str) -> Vec<FriendRow> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT u.id, u.display_name, la.provider_handle
+            "SELECT u.id
              FROM friends f
              JOIN users u ON u.id = f.friend_id
-             LEFT JOIN linked_accounts la ON la.user_id = f.friend_id
-             WHERE f.user_id = ?1
-             GROUP BY u.id"
+             WHERE f.user_id = ?1"
         ).unwrap();
 
         stmt.query_map(params![user_id], |row| {
             Ok(FriendRow {
                 user_id: row.get(0)?,
-                display_name: row.get(1)?,
-                provider_handle: row.get(2)?,
             })
         }).unwrap().filter_map(|r| r.ok()).collect()
+    }
+
+    /// Operator friends belong to the active operator, never the whole account.
+    pub fn get_operator_friends(&self, user: &str) -> Vec<OperatorFriendRow> {
+        let conn = self.conn.lock().unwrap();
+        let Some(profile) = Self::active_in(&conn, user) else { return Vec::new() };
+        let mut stmt = conn.prepare("SELECT o.friend_id, o.name, o.account FROM operator_friends f
+            JOIN operators o ON o.profile = f.friend_profile WHERE f.profile = ?1").unwrap();
+        stmt.query_map(params![profile], |r| Ok(OperatorFriendRow {
+            id: r.get(0)?, name: r.get(1)?, account: r.get(2)?,
+        })).unwrap().filter_map(|r| r.ok()).collect()
+    }
+
+    pub fn change_operator_friend(&self, user: &str, target: &str, add: bool) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let profile = Self::active_in(&tx, user).ok_or("Create an operator first")?;
+        let found: Option<(String, String)> = tx.query_row("SELECT profile, account FROM operators WHERE friend_id = ?1", params![target], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional().map_err(|e| e.to_string())?;
+        let (target, owner) = found.ok_or("Operator ID not found")?;
+        if add {
+            if owner == user { return Err("Cannot add an operator on your own account".into()); }
+            tx.execute("INSERT OR IGNORE INTO operator_friends (profile, friend_profile) VALUES (?1, ?2), (?2, ?1)", params![profile, target])
+                .map_err(|e| e.to_string())?;
+        } else {
+            tx.execute("DELETE FROM operator_friends WHERE (profile = ?1 AND friend_profile = ?2) OR (profile = ?2 AND friend_profile = ?1)", params![profile, target])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    fn remove_operator_friends(conn: &Connection, profile: &str) -> Result<(), String> {
+        conn.execute("DELETE FROM operator_friends WHERE profile = ?1 OR friend_profile = ?1", params![profile])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Find a user by provider handle (e.g., Bluesky handle or Google email).
@@ -1313,6 +1379,7 @@ impl Database {
             tx.execute(&format!("DELETE FROM {table} WHERE profile IN (SELECT profile FROM operators WHERE account = ?1)"), params![user_id])
                 .map_err(|e| e.to_string())?;
         }
+        tx.execute("DELETE FROM operator_friends WHERE profile IN (SELECT profile FROM operators WHERE account = ?1) OR friend_profile IN (SELECT profile FROM operators WHERE account = ?1)", params![user_id]).map_err(|e| e.to_string())?;
         for sql in [
             "DELETE FROM operators WHERE account = ?1",
             "DELETE FROM accounts WHERE user_id = ?1",
@@ -1350,6 +1417,54 @@ fn provider_label(provider: &str) -> &str {
 mod stash_tests {
     use super::*;
     use crate::types::RaidResult;
+
+    #[test]
+    fn operator_friends_are_separate_from_accounts_and_follow_only_the_selected_operator() {
+        let db = Database::open(":memory:").unwrap();
+        let a = account(&db);
+        let b = account(&db);
+        let first = db.create_operator(&a, "Ghost", false, 1).unwrap();
+        let friend = db.create_operator(&b, "Rook", false, 2).unwrap();
+        let friend_id = db.operator(&friend).unwrap().friend_id;
+        db.add_friend(&a, &b).unwrap();
+        db.change_operator_friend(&a, &friend_id, true).unwrap();
+        assert_eq!(db.get_operator_friends(&a)[0].name, "Rook");
+        assert_eq!(db.get_operator_friends(&b)[0].name, "Ghost");
+        assert!(db.change_operator_friend(&a, &db.operator(&first).unwrap().friend_id, true).is_err());
+        assert!(db.change_operator_friend(&a, "op:missing", true).is_err());
+        let second = db.create_operator(&a, "Sable", false, 3).unwrap();
+        assert!(db.get_operator_friends(&a).is_empty());
+        assert_eq!(db.get_friends(&a)[0].user_id, b);
+        db.switch_operator(&a, &first).unwrap();
+        assert_eq!(db.get_operator_friends(&a).len(), 1);
+        db.remove_friend(&a, &b).unwrap();
+        assert_eq!(db.get_operator_friends(&a).len(), 1);
+        db.delete_operator(&a, &first).unwrap();
+        assert!(db.get_operator_friends(&b).is_empty());
+        assert_eq!(db.active_operator(&a), Some(second));
+    }
+
+    #[test]
+    fn legacy_operator_friend_ids_do_not_expose_the_account_and_survive_reopening() {
+        let path = std::env::temp_dir().join(format!("boxhead-social-{}.db", uuid::Uuid::new_v4()));
+        let (user, public_id) = {
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            let user = account(&db);
+            let legacy = format!("user:{user}");
+            db.ensure_operator(&legacy).unwrap();
+            db.conn.lock().unwrap().execute("UPDATE operators SET friend_id = NULL WHERE profile = ?1", params![legacy]).unwrap();
+            drop(db);
+            let db = Database::open(path.to_str().unwrap()).unwrap();
+            let public_id = db.operator(&legacy).unwrap().friend_id;
+            assert!(!public_id.contains(&user));
+            assert!(public_id.starts_with("op:"));
+            (user, public_id)
+        };
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(db.operator(&format!("user:{user}")).unwrap().friend_id, public_id);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 
     fn outcome(result: RaidResult, loot: Vec<Item>, bounty: u32) -> RaidOutcome {
         RaidOutcome { player_id: "p".into(), name: "P".into(), result, extract_name: None, killed_by: None, loot, lost: Vec::new(), bounty, kills: 3, max_combo: 2, survived_secs: 60.0 }

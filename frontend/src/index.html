@@ -271,6 +271,11 @@
     .friend-item { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); min-height: 40px; padding: 0 var(--sp-1); border-bottom: 1px solid var(--border); }
     .friend-item:last-child { border-bottom: 0; }
     .friend-item > span:first-child { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; font-size: var(--fs-body); }
+    .friend-name { overflow-wrap: anywhere; }
+    .friend-tier { color: var(--text-secondary); font-size: var(--fs-meta); }
+    .friend-state { max-width: 45%; text-align: right; }
+    .friend-identity { display: grid; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+    .friend-identity input { font-family: var(--font-mono); font-size: 12px; }
     .friend-state { font-size: var(--fs-meta); color: var(--text-muted); }
     .friend-state.online { color: var(--text-secondary); }
     .friends-empty { padding: var(--sp-3) 0; font-size: var(--fs-meta); color: var(--text-muted); }
@@ -1525,7 +1530,7 @@
           <div class="hq-toolbar">
             <div id="traderFilters" class="chips" role="group" aria-label="Show"></div>
           </div>
-          <p class="trader-caption">The trader sells common gear up to power 24. Anything better comes out of raids.</p>
+          <p class="trader-caption">The trader starts with common gear up to power 24. Armory upgrades unlock stronger stock; reaching Quarantine Zone and Black Site still requires raid loot.</p>
           <p id="traderNote" class="trader-note" hidden></p>
           <div class="list-head list-head--trade" aria-hidden="true"><span></span><span>Item</span><span class="r">Power</span><span>Effect</span><span id="gsHead" class="r">GS gain</span><span class="r">Price</span></div>
           <div id="traderGrid" class="trade-list"></div>
@@ -1576,9 +1581,9 @@
       <div id="mapList" class="map-grid" aria-label="Maps"></div>
 
       <div class="option-row">
-        <label class="option-label" for="nameInput">Callsign</label>
-        <input id="nameInput" class="input input--compact" type="text" maxlength="16" placeholder="Enter a callsign" />
-        <p class="field-hint">Shown to other players in your raid</p>
+        <span class="option-label">Operator callsign</span>
+        <output id="operatorCallsign" class="input input--compact">Choose an operator</output>
+        <p class="field-hint">Your operator's name. Choose an operator in the hideout to change who you deploy as.</p>
       </div>
 
       <label class="crossplay-row" for="crossplayToggle">
@@ -1607,7 +1612,7 @@
       <p id="roomErrorMsg" class="error-text" role="alert"></p>
 
       <p class="risk-note"><svg class="icon"><use href="#i-info"/></svg><span id="deployRisk">Your equipped loadout goes in with you. Extract to keep it and your loot; die and it is lost.</span></p>
-      <label id="insureLabel" class="check" title="If you die, run out of time or leave, your equipped gear comes back. Your pack, bounty and entry fee don't."><input id="insureToggle" type="checkbox" /><span id="insureText">Insure my loadout</span></label>
+      <label id="insureLabel" class="check" title="If you die, run out of time or leave, your equipped gear, including the pack itself, comes back. Pack contents, bounty, entry fee and premium don't."><input id="insureToggle" type="checkbox" /><span id="insureText">Insure my loadout</span></label>
       <div class="action-row">
         <button id="hostToggleBtn" class="btn btn-secondary btn-hero" aria-expanded="false" aria-controls="hostForm"><svg class="icon"><use href="#i-plus"/></svg>Host lobby</button>
         <button id="deployBtn" class="btn btn-primary btn-hero action-main"><span id="deployLabel">Deploy</span><kbd class="kbd">Enter</kbd></button>
@@ -1687,13 +1692,20 @@
   <div id="friendsOverlay" class="overlay">
     <section class="panel" aria-label="Friends">
       <header class="dialog-head">
-        <div class="panel-title-group"><h2 class="panel-title">Friends</h2><p class="meta">Add friends by their Bluesky handle.</p></div>
+        <div class="panel-title-group"><h2 class="panel-title">Friends</h2><p class="meta">Connect as accounts or as individual operators.</p></div>
         <button id="closeFriendsBtn" class="close-btn" title="Close (Esc)" aria-label="Close"><svg class="icon"><use href="#i-close"/></svg><kbd class="kbd">Esc</kbd></button>
       </header>
+      <div class="friend-identity">
+        <label class="field"><span class="field-label">Your account ID</span><input id="ownAccountId" class="input" type="text" readonly aria-label="Your account ID" /></label>
+        <label class="field"><span class="field-label">Operator ID · <span id="ownOperatorName">No operator selected</span></span><input id="ownOperatorId" class="input" type="text" readonly placeholder="Create an operator first" aria-label="Your operator ID" /></label>
+        <p class="field-hint">Select an ID to copy and share it with your friend.</p>
+      </div>
       <div id="friendsListContainer" class="friends-list"></div>
+      <label class="field"><span class="field-label">Friendship</span><select id="friendKind" class="input"><option value="account">Account friend</option><option value="operator">Operator friend</option></select></label>
+      <p id="friendKindHint" class="field-hint">Account friends stay connected across operators and see which operator you are playing.</p>
       <label class="field">
         <span class="field-label">Add a friend</span>
-        <span class="input-row"><input id="addFriendInputEl" class="input" type="text" placeholder="name.bsky.social" /><button id="addFriendBtn" class="btn btn-secondary">Add</button></span>
+        <span class="input-row"><input id="addFriendInputEl" class="input" type="text" placeholder="Paste their account ID" /><button id="addFriendBtn" class="btn btn-secondary">Add</button></span>
       </label>
       <p id="addFriendErrorMsg" class="error-text" role="alert"></p>
     </section>

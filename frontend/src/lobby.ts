@@ -13,7 +13,24 @@ export interface RoomInfo {
 /** How the signed-in session matchmakes: its sign-in platform, and whether cross-play is on. */
 export interface Matchmaking { platform: PoolInfo; crossplay: boolean; pool: PoolInfo }
 
-export interface Friend { handle: string; display_name: string; user_id: string; online: boolean; }
+export type Friend = {
+  kind: 'account'; id: string; online: boolean; activity: 'offline' | 'hideout' | 'raid';
+  operator: { id: string; name: string } | null;
+} | {
+  kind: 'operator'; id: string; name: string; online: boolean; activity: 'offline' | 'hideout' | 'raid';
+};
+
+export interface FriendIdentity { accountId: string; operator: { id: string; name: string } | null }
+
+export function friendLabel(friend: Friend): string {
+  return friend.kind === 'account' ? friend.id : friend.name;
+}
+
+export function friendDetail(friend: Friend): string {
+  if (!friend.online) return 'Offline';
+  const activity = friend.activity === 'raid' ? 'In raid' : 'Online';
+  return friend.kind === 'account' && friend.operator ? `${activity} · ${friend.operator.name}` : activity;
+}
 
 /** The always-on raid on the first map, in the player's own pool: where a join without a choice lands. */
 export const OPEN_ROOM_ID = 'outskirts';
@@ -48,25 +65,10 @@ export function matchmakingText(mm: Matchmaking | null): string {
     : `Off: you only meet players who signed in with ${mm.platform.label}.`;
 }
 
-/** Online friends first, then alphabetical by handle. */
+/** Online friends first, then alphabetical by their visible identity. */
 export function sortFriends(friends: Friend[]): Friend[] {
   return [...friends].sort((a, b) =>
-    Number(b.online) - Number(a.online) || a.handle.toLowerCase().localeCompare(b.handle.toLowerCase()));
-}
-
-/**
- * Callsign other players see. Email-style handles (email and Google sign-ins)
- * must never leak the full address into lobbies with strangers.
- */
-export function defaultCallsign(handle: string): string {
-  const local = handle.includes('@') ? handle.slice(0, handle.indexOf('@')) : handle;
-  const name = local.trim().slice(0, 16);
-  return name || 'Operative';
-}
-
-/** Label for the signed-in chip: emails as-is, social handles with an @. */
-export function accountLabel(handle: string): string {
-  return handle.includes('@') ? handle : `@${handle}`;
+    Number(b.online) - Number(a.online) || friendLabel(a).toLowerCase().localeCompare(friendLabel(b).toLowerCase()));
 }
 
 export function friendsSummary(friends: Friend[]): string {
