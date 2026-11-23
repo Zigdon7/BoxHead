@@ -140,7 +140,7 @@ For a playtest with invited testers, use the shorter checklist in [PLAYTEST.md](
 - [ ] `BACKUP_DIR` points at another disk, and one restore has been tried.
 - [ ] A privacy policy and terms are linked from the site (not written yet).
 - [ ] An uptime check watches `https://<your domain>/healthz` (for example UptimeRobot or Uptime Kuma on another machine).
-- [ ] `BOXHEAD_PVP` is unset. PvP is not built; turning it on only lets players create Raidable operators.
+- [ ] `BOXHEAD_PVP` is unset, unless you mean to open base raids: it lets players create Raidable operators and take cash from each other's bases, with balance no player has tested.
 
 ## Troubleshooting
 

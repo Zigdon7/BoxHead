@@ -11,7 +11,7 @@ Progression has three scopes: loot at risk during a raid, persistent investment 
 | Account | Up to three operators, account friendships, Legacy perks, retirement stash bonus and badges | Survives operator loss or retirement; removed by account deletion |
 | Seasonal boost | Bonus bounty and Operations XP from retirement | Applies in the following season; permanent perks and stash rewards remain |
 
-Safe operators are PvE-only and have a Homefront tier cap of 3. That does not cap their map progression: they can reach Black Site. Raidable operator support and tier 4 rules exist behind `BOXHEAD_PVP`, but switching it on does not implement PvP or base raids.
+Safe operators are PvE-only and have a Homefront tier cap of 3. That does not cap their map progression: they can reach Black Site. Raidable operators, tier 4 and base raids sit behind `BOXHEAD_PVP`: with it on, Raidable operators can take cash from each other's bases ([BASES.md](BASES.md)). There is still no player-versus-player combat inside raids.
 
 ## Gear and map progression
 

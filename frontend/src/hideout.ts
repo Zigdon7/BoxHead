@@ -1,7 +1,8 @@
 // Hideout: one Stash screen (loadout on the left, every stash item on the right,
 // a compare panel under the loadout), a Trader screen (stock table plus a
-// sell list), the Homefront (tier, facilities, Operations ranks) and the
-// Operators screen (create/switch operators, season, Legacy, retiring).
+// sell list), the Homefront (tier, facilities, Operations ranks), the Base
+// (base.ts: defenses, attack waves, base raids) and the Operators screen
+// (create/switch operators, season, Legacy, retiring).
 // Talks to /api/hideout. DOM nodes only, never innerHTML with server strings.
 
 import type { Item, Slot } from './generated/types';
@@ -12,8 +13,9 @@ import {
   weaponDamageMult, armorMaxHealth, packCapacity, packMaxAmmo, weaponDps,
   daysUntil, opsProgress,
 } from './raid';
+import { BaseView } from './base';
 
-type HideoutTab = 'stash' | 'trader' | 'homefront' | 'operators';
+type HideoutTab = 'stash' | 'trader' | 'homefront' | 'base' | 'operators';
 type TraderGroup = 'all' | 'weapons' | 'armor' | 'packs';
 const RARITY_RANK = { common: 0, uncommon: 1, rare: 2, epic: 3, legendary: 4 } as const;
 const GROUPS: { id: ItemGroup; label: string }[] = [
@@ -122,8 +124,16 @@ export class HideoutView {
   newRaidable: boolean | null = null;
   /** Established accounts open the new-operator form on demand. */
   creating = false;
+  /** The Base tab: defenses, attack waves and base raids. */
+  base: BaseView;
 
   constructor(private deps: HideoutDeps) {
+    this.base = new BaseView({
+      auth: deps.auth,
+      onCash: () => void this.refresh(),
+      error: (msg) => this.error(msg),
+      note: (msg) => this.note(msg),
+    });
     document.querySelectorAll<HTMLButtonElement>('[data-hideout-tab]').forEach(btn => btn.addEventListener('click', () => {
       this.tab = btn.dataset.hideoutTab as HideoutTab;
       this.render();
@@ -173,6 +183,8 @@ export class HideoutView {
   }
 
   private apply(h: Hideout) {
+    // Another operator has its own base.
+    if (this.state?.id !== h.id) { this.base.reset(); if (this.base.visible && !h.needsOperator) void this.base.load(); }
     this.state = h;
     if (this.selectedId && !this.findItem(this.selectedId)) this.selectedId = null;
     for (const id of [...this.checked]) if (!h.stash.some(i => i.id === id)) this.checked.delete(id);
@@ -282,6 +294,8 @@ export class HideoutView {
     this.q('hideoutTrader').hidden = this.tab !== 'trader';
     this.q('hideoutHomefront').hidden = this.tab !== 'homefront';
     this.q('hideoutOperators').hidden = this.tab !== 'operators';
+    this.q('hideoutBase').hidden = this.tab !== 'base';
+    this.base.setVisible(this.tab === 'base');
     this.renderHomefront(h);
     this.renderOperators(h);
     this.renderSlots(h);
@@ -559,7 +573,7 @@ export class HideoutView {
     if (!pvp) this.newRaidable = false;
     const warn = el('p', 'warn-line', pvp
       ? '⚠ Safe or Raidable is permanent for this operator. You can create more operators later.'
-      : '⚠ Raidable operators arrive with PvP in a later season. Until then every operator is Safe.');
+      : '⚠ Raidable operators and base raids are switched off on this server. Every operator is Safe.');
     const grid = el('div', 'choice-grid');
     grid.setAttribute('role', 'radiogroup');
     grid.setAttribute('aria-label', 'Safe or Raidable');

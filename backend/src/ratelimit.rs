@@ -53,7 +53,7 @@ pub fn rule_for(method: &Method, path: &str) -> Option<Rule> {
         "/api/rooms" if post => HOST,
         "/api/friends/add" => FRIENDS,
         "/ws" | "/ws/presence" => JOIN,
-        p if p.starts_with("/api/hideout") => HIDEOUT,
+        p if p.starts_with("/api/hideout") || p.starts_with("/api/base") => HIDEOUT,
         p if p.starts_with("/api/") => API,
         _ => return None,
     })
@@ -169,6 +169,7 @@ mod tests {
         assert_eq!(rule_for(&Method::POST, "/api/rooms").unwrap().name, "host");
         assert_eq!(rule_for(&Method::GET, "/api/rooms").unwrap().name, "api");
         assert_eq!(rule_for(&Method::POST, "/api/hideout/sell").unwrap().name, "hideout");
+        assert_eq!(rule_for(&Method::POST, "/api/base/raid").unwrap().name, "hideout");
         assert_eq!(rule_for(&Method::GET, "/ws").unwrap().name, "join");
         assert!(rule_for(&Method::GET, "/assets/game.js").is_none());
     }

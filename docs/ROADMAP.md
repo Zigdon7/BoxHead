@@ -69,9 +69,9 @@ Complete touch controls and controller support are separate deliverables, not co
 
 ## Milestone 5 — Optional PvP and Homefront raiding
 
-**Explore; depends on reliable PvE, social consent and economy protections.** Raidable operators and tier 4 costs are foundations, not playable PvP.
+**Base raids implemented, unvalidated; in-raid PvP still to explore.** As of November 16, 2026, asynchronous base raids exist behind `BOXHEAD_PVP`: bases, three-wave attacks, fog of war, cash loot, shields, replays and practice raids ([BASES.md](BASES.md)). No player has tested them. Player-versus-player combat inside extraction raids is not built.
 
-Before implementation, resolve the following rules in a separate design proposal:
+The base-raid build made first-pass choices on several of the questions below (offline raids allowed, only cash stolen, 20% capped pool, 8-hour shield, Safe operators isolated). Treat them as open until measured. For in-raid PvP, resolve these in a separate design proposal before implementation:
 
 - Matchmaking and fair combat: gear/Legacy disparities, team size, damage rules, spawn safety and anti-cheat validation.
 - Risk consent: who opts into PvP, what can be stolen, how Safe operators remain isolated, and whether account-wide rewards cross modes.
@@ -79,7 +79,7 @@ Before implementation, resolve the following rules in a separate design proposal
 - Rewards and abuse: win trading, repeated victim farming, alternate-account transfers and disconnect outcomes.
 - Player communication: an explicit preview of exposed items and consequences before entering the mode.
 
-Implement and validate a small opt-in PvP raid mode before attempting persistent base raids. Base raiding is a further gate, not automatically bundled with PvP. Neither feature should be advertised as playable solely because `BOXHEAD_PVP=1` permits Raidable creation.
+Before turning `BOXHEAD_PVP` on for players: watch real raids for balance, add a notice when a base is raided, and decide whether cash transfers between cooperating accounts need a tighter limit. Do not advertise in-raid PvP as playable because `BOXHEAD_PVP=1` permits Raidable creation.
 
 ## Measurement and delivery rules
 

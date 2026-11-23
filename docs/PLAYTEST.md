@@ -9,7 +9,7 @@ The complete experience and current rules are covered in [USER_EXPERIENCE.md](US
 Version `3.0.0-playtest.1`: the first build of BoxHead as an extraction shooter.
 
 - **In:** four maps gated by gear score; hideout with stash, trader and insurance; sealed loot and uplinks; nests, camping punishment and the Abomination; co-op raids with revives; operators, Homefront, Operations, seasons and Legacy; sign-in with email, Steam and Bluesky (and Google, if the host sets it up); friends; matchmaking pools with opt-in cross-platform play.
-- **Not in:** player-versus-player raids and base raiding. `BOXHEAD_PVP` stays unset, so every operator is Safe and Homefront stops at tier 3.
+- **Not in:** player-versus-player combat and raiding other players' bases. `BOXHEAD_PVP` stays unset, so every operator is Safe and Homefront stops at tier 3. Testers do see the hideout's Base tab: they can build a base and run practice raids on it, and nothing there can be taken from them.
 - **First guesses:** every progression and economy number (Homefront and facility prices, Operations XP, Legacy rewards, entry fees, loot bands). Tuning them is the point of the playtest.
 
 ## Before the playtest
@@ -47,7 +47,7 @@ Set these in `.env` on the host before starting (see [HOSTING.md](HOSTING.md) fo
 | `BOXHEAD_NOTICE` | Tell testers what they are playing, for example `Playtest build. Progress may be wiped.` |
 | `BOXHEAD_FEEDBACK_URL` | Where **Report a bug** leads: a form, a Discord channel invite or an issue tracker. Without it there is no link. |
 | `SMTP_HOST` and the other mail settings | Needed for email sign-ups. Without them, tell testers to sign in with Steam or Bluesky, which need no email. |
-| `BOXHEAD_PVP` | Leave unset. |
+| `BOXHEAD_PVP` | Leave unset. Setting it opens base raids ([BASES.md](BASES.md)), which are untested. |
 
 Build with `BOXHEAD_BUILD=$(git rev-parse --short HEAD)` (see [HOSTING.md](HOSTING.md)) so the game shows which build testers are on.
 
@@ -185,6 +185,6 @@ Testers will have to sign up again. To keep accounts and progress, do nothing: t
 
 - **No privacy policy or terms.** Fine for invited testers who have been told what is stored (the paragraph above); needed before the public is let in.
 - **No load test on the real host yet.** The numbers under "Know your limits" come from a development machine and smaller maps.
-- **No PvP.** Raidable operators and Homefront tier 4 are switched off.
+- **No PvP.** Raidable operators, Homefront tier 4 and base raids are switched off. Base building and practice raids are on.
 - **Tuning is untested by players.** See the questions above.
 - **Built for a keyboard and mouse.** On a touch screen there is a move stick, touch-to-aim shooting, a katana button and a weapon-switch button, but no control for deployables, the pack or the full map, and no radar. Touch play was not tested for this build, so ask testers to use a desktop browser.

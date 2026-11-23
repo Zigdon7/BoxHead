@@ -2,7 +2,7 @@
 
 A co-op zombie **extraction shooter** built from the classic BoxHead, with a 60 Hz server-authoritative **Rust (Axum/Tokio)** backend and a **TypeScript + HTML5 Canvas (Vite)** frontend.
 
-**Status:** version `3.0.0-playtest.1`, the first playtest build. Raids are co-op against the infected (PvE). Player-versus-player raids and base raiding are not built yet.
+**Status:** version `3.0.0-playtest.1`, the first playtest build. Raids are co-op against the infected (PvE). Every operator can build a base and run practice raids on it; raiding other players' bases is built but off unless the server sets `BOXHEAD_PVP=1` (see [docs/BASES.md](docs/BASES.md)). Player-versus-player combat inside raids is not built.
 
 | If you want to… | Read |
 | --- | --- |
@@ -185,7 +185,7 @@ To serve the built site from the backend instead of the dev server, run `npm run
 | `BOXHEAD_MAIL_OUTBOX` | unset | Write emails as JSON files to this folder instead of sending (tests, local development). |
 | `BOXHEAD_TRUST_PROXY` | off | Behind one reverse proxy, read the client IP from the last `X-Forwarded-For` entry (for rate limits). Only enable when the proxy sets that header. |
 | `BOXHEAD_RATE_LIMIT` | on | `off` disables per-IP rate limits (load tests only). |
-| `BOXHEAD_PVP` | off | `1` allows Raidable operators. Off until PvP raids exist. |
+| `BOXHEAD_PVP` | off | `1` allows Raidable operators and lets them raid each other's bases for cash. Untested with players. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | unset | Google sign-in. Without them the sign-in screen doesn't offer Google. |
 | `STEAM_API_KEY` | unset | Optional: Steam persona names from the Web API. |
 | `BOXHEAD_BUILD` | unset | A short label for this build, usually the git commit. Shown next to the version at the foot of the home and sign-in screens, in the startup log and on the dashboard. Letters, digits and `. _ - +`, at most 40 characters. |
@@ -213,6 +213,7 @@ The database runs in WAL mode (`synchronous=NORMAL`): commits don't wait on a di
 - API:
   - `GET /api/rooms?token=` lists raids with their map and `canJoin`. `POST /api/rooms {token, name, map}` creates one in the host's pool.
   - `GET /api/hideout?token=` returns the account (operators, season, Legacy) and the active operator: stash, loadout, cash, gear score, trader offers, maps, Homefront, Operations and which sealed items are packed for the next raid. `POST /api/hideout/{equip|unequip|sell|sellMany|buy|carry} {token, itemId?, itemIds?, slot?, offerId?, carry?}` changes them and returns the new state. Account actions use the same route: `createOperator {name, raidable}`, `switchOperator {operatorId}`, `deleteOperator {operatorId, confirm: true}` (frees the slot, earns nothing, refused mid-raid), `upgradeTier`, `upgradeFacility {facility}`, `collectWorkshop`, `relocate {confirm: true}` and `buyPerk {perk}`. Gear is locked while you're in a raid.
+  - `GET /api/base?token=` returns the active operator's base (layout, owned pieces, waves, shield, scouted target, raid log and the rules). `POST /api/base/{save|practice|scout|raid|replay}` builds, tests, raids and replays; see [docs/BASES.md](docs/BASES.md).
   - `GET /api/maps` lists the maps.
 - Your raid callsign is fixed to the selected operator's stored name. The WebSocket `join` message takes `roomId`, `token` and `insure`; client-supplied names are ignored. The server checks verification and gear score, charges the entry fee, then locks the loadout into the raid. When a raid ends the server sends `raidEnd` (outcome + stash settlement) and closes the socket.
 

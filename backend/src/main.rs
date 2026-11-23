@@ -15,6 +15,8 @@ mod ratelimit;
 mod mail;
 mod auth;
 mod buildinfo;
+mod siege;
+mod base_api;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +55,7 @@ struct AppState {
     mailer: mail::Mailer,
 }
 
-/// PvP (raidable operators, base raids) is off until it is built: `BOXHEAD_PVP=1` turns it on.
+/// PvP (raidable operators and base raids) is opt-in per server: `BOXHEAD_PVP=1` turns it on.
 fn pvp_enabled() -> bool {
     static PVP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PVP.get_or_init(|| std::env::var("BOXHEAD_PVP").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on")))
@@ -102,7 +104,7 @@ async fn main() {
         Ok(base) => println!("Public address: {}", base.trim_end_matches('/')),
         Err(_) => println!("WARNING: BASE_URL is not set, so email and Steam links follow each request's Host header. Set it before letting the public in."),
     }
-    if !pvp_enabled() { println!("PvP is off: new operators are Safe (set BOXHEAD_PVP=1 to allow Raidable)"); }
+    if !pvp_enabled() { println!("PvP is off: new operators are Safe and bases can't be raided (set BOXHEAD_PVP=1 to allow Raidable operators and base raids)"); }
     if !build.notice.is_empty() { println!("Home screen notice: {}", build.notice); }
     if !build.feedback_url.is_empty() { println!("Feedback link: {}", build.feedback_url); }
 
@@ -129,6 +131,8 @@ async fn main() {
         .route("/api/matchmaking/crossplay", post(crossplay_set))
         .route("/api/hideout", get(hideout))
         .route("/api/hideout/{action}", post(hideout_action))
+        .route("/api/base", get(base_api::base))
+        .route("/api/base/{action}", post(base_api::base_action))
         .route("/api/maps", get(maps_list))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/email/register", post(auth::register))

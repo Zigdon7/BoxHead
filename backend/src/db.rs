@@ -6,6 +6,8 @@ use crate::gear::{self, Item, ItemKind, Loadout, MapDef, Rarity, Slot};
 use crate::progression::{self as prog, Facility, Perk, Perks, RelocationReward, FACILITIES};
 use crate::types::RaidOutcome;
 
+pub mod siege_store;
+
 /// An item in someone's stash, and the loadout slot it's equipped in (if any).
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -329,6 +331,7 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS sessions_by_user ON sessions(user_id);
         ").map_err(|e| format!("Failed to create auth schema: {}", e))?;
+        conn.execute_batch(siege_store::SCHEMA).map_err(|e| format!("Failed to create base schema: {}", e))?;
 
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -807,6 +810,7 @@ impl Database {
         Self::not_in_raid(&tx, profile).map_err(|_| "That operator is in a raid. Finish it first.".to_string())?;
         let name: String = tx.query_row("SELECT name FROM operators WHERE profile = ?1", params![profile], |r| r.get(0)).map_err(|e| e.to_string())?;
         Self::remove_operator_friends(&tx, profile)?;
+        Self::remove_base_data(&tx, profile)?;
         for table in ["items", "facilities", "operations", "operators"] {
             tx.execute(&format!("DELETE FROM {table} WHERE profile = ?1"), params![profile]).map_err(|e| e.to_string())?;
         }
@@ -963,6 +967,7 @@ impl Database {
         tx.execute("INSERT OR REPLACE INTO account_badges (user_id, season, operator, value) VALUES (?1, ?2, ?3, ?4)",
             params![user, season.id, name, reward.value]).map_err(|e| e.to_string())?;
         Self::remove_operator_friends(&tx, &profile)?;
+        Self::remove_base_data(&tx, &profile)?;
         for table in ["items", "facilities", "operations", "operators"] {
             tx.execute(&format!("DELETE FROM {table} WHERE profile = ?1"), params![profile]).map_err(|e| e.to_string())?;
         }
@@ -1375,6 +1380,7 @@ impl Database {
         let deployed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operators WHERE account = ?1 AND in_raid IS NOT NULL)", params![user_id], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         if deployed { return Err("One of your operators is in a raid. Finish it first.".into()); }
+        for profile in Self::account_operator_ids(&tx, user_id) { Self::remove_base_data(&tx, &profile)?; }
         for table in ["items", "facilities", "operations"] {
             tx.execute(&format!("DELETE FROM {table} WHERE profile IN (SELECT profile FROM operators WHERE account = ?1)"), params![user_id])
                 .map_err(|e| e.to_string())?;

@@ -959,6 +959,154 @@ describe('hideout: stash, trader and loadout', () => {
   });
 });
 
+// ---------------------------------------------------------------- base defense and base raids
+
+describe('base defense and base raids', () => {
+  const baseGet = token => api(`/api/base?token=${encodeURIComponent(token)}`);
+  const baseAct = (action, body) => api(`/api/base/${action}`, { method: 'POST', body });
+  const piece = (kind, x, y) => ({ kind, x, y });
+  /** Set an operator's cash directly (it normally comes from raids). */
+  function setCash(operatorId, cash) {
+    const db = new DatabaseSync(joinPath(workDir, 'boxhead.db'));
+    db.prepare('UPDATE operators SET cash = ? WHERE profile = ?').run(cash, operatorId);
+    db.close();
+  }
+  async function operator({ raidable = true, cash } = {}) {
+    const user = await signUp({ raidable });
+    const id = (await hideout(user.token)).id;
+    if (cash !== undefined) setCash(id, cash);
+    return { ...user, id };
+  }
+
+  test('a base is built on a side or corner, bought on save, and never walled off', async () => {
+    const me = await operator({ raidable: false, cash: 1000 });
+    let res = await baseGet(me.token);
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const { rules } = res.base;
+    assert.deepEqual([res.base.layout.site, res.base.layout.pieces.length, rules.grid, rules.kinds.length, rules.sites.length], ['west', 0, 17, 8, 8]);
+    for (const site of rules.sites) {
+      const [hx, hy] = [site.hq % 17, Math.floor(site.hq / 17)];
+      assert.ok([1, 15].includes(hx) || [1, 15].includes(hy), `${site.id}: the HQ hugs a side or corner`);
+      assert.equal(site.entrances.length, 3);
+    }
+
+    const layout = { site: 'northEast', pieces: [piece('wall', 10, 3), piece('wall', 10, 4), piece('turret', 12, 3), piece('mine', 8, 8)] };
+    res = await baseAct('save', { token: me.token, layout });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.spent, 2 * 25 + 450 + 140);
+    assert.deepEqual([res.base.cash, res.base.layout.site, res.base.owned], [1000 - 640, 'northEast', { wall: 2, turret: 1, mine: 1 }]);
+    assert.equal((await hideout(me.token)).cash, 1000 - 640, 'the hideout sees the spend');
+    // Removing a piece keeps it owned, so putting it back is free.
+    res = await baseAct('save', { token: me.token, layout: { site: 'northEast', pieces: layout.pieces.slice(1) } });
+    assert.deepEqual([res.spent, res.base.owned.wall], [0, 2]);
+
+    // Sealing an entrance, breaking a tier limit or overspending changes nothing.
+    const ne = rules.sites.find(s => s.id === 'northEast');
+    const [ex, ey] = [ne.entrances[1] % 17, Math.floor(ne.entrances[1] / 17)];
+    const sealed = { site: 'northEast', pieces: [piece('wall', ex + 1, ey), piece('wall', ex, ey - 1)] };
+    res = await baseAct('save', { token: me.token, layout: sealed });
+    assert.equal(res.ok, false);
+    assert.match(res.error, /Entrance B is walled off/);
+    assert.match((await baseAct('save', { token: me.token, layout: { site: 'west', pieces: [piece('sniper', 5, 5)] } })).error, /higher Homefront tier/);
+    assert.match((await baseAct('save', { token: me.token, waves: [{ heavy: 3 }, { heavy: 3 }, { heavy: 3 }] })).error, /need \$/);
+    assert.match((await baseAct('save', { token: me.token, waves: [{ rifleman: 7 }, {}, {}] })).error, /supply/);
+    res = await baseGet(me.token);
+    assert.deepEqual([res.base.cash, res.base.layout.pieces.length], [1000 - 640, 3]);
+  });
+
+  test('a practice raid costs nothing and shows the whole base', async () => {
+    const me = await operator({ raidable: false });
+    const cash = (await hideout(me.token)).cash;
+    const draft = { site: 'west', pieces: [piece('turret', 4, 7), piece('turret', 4, 9), piece('mine', 12, 8)] };
+    const res = await baseAct('practice', { token: me.token, layout: draft, waves: [{ rifleman: 4, heavy: 1 }, { rifleman: 6 }, { scout: 6 }], entrances: [1, 1, 0] });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const r = res.replay;
+    assert.deepEqual([r.fog, r.defenses.length, r.mines.length, r.troops.length > 0], [false, 2, 1, true]);
+    assert.ok(r.shots.length > 0 && r.reveals.length > 3 && r.outcome.ticks > 0);
+    assert.ok(r.troops.every(t => t.points.every(([, cell], i, pts) => i === 0 || Math.abs(cell % 17 - pts[i - 1][1] % 17) + Math.abs(Math.floor(cell / 17) - Math.floor(pts[i - 1][1] / 17)) === 1)),
+      'soldiers move one square at a time');
+    // Nothing was bought, saved or lost.
+    assert.deepEqual([res.base.cash, res.base.layout.pieces.length, res.base.owned], [cash, 0, {}]);
+    assert.match((await baseAct('practice', { token: me.token, waves: [{}, {}, {}], entrances: [0, 0, 0] })).error, /at least one soldier/);
+    assert.match((await baseAct('practice', { token: me.token, waves: [{ scout: 1 }, {}, {}], entrances: [0, 5, 0] })).error, /entrance/i);
+  });
+
+  test('a raid goes through fog, moves cash, costs dead soldiers and is replayed by both sides', async () => {
+    // Only this test's victim is worth raiding.
+    const wipe = new DatabaseSync(joinPath(workDir, 'boxhead.db'));
+    wipe.prepare('UPDATE operators SET cash = 0 WHERE raidable = 1').run();
+    wipe.close();
+    const raider = await operator({ cash: 5000 });
+    const victim = await operator({ cash: 10000 });
+    // A turret on the way in, and a tower and walls far from any route.
+    const defenses = { site: 'west', pieces: [piece('turret', 4, 7), piece('turret', 2, 15), piece('wall', 15, 1), piece('mine', 14, 14)] };
+    let res = await baseAct('save', { token: victim.token, layout: defenses });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const victimCash = res.base.cash;
+    assert.equal(res.base.atRisk, Math.floor(victimCash * 0.2));
+
+    assert.match((await baseAct('raid', { token: raider.token, entrances: [1, 1, 1] })).error, /Scout a base first/);
+    res = await baseAct('save', { token: raider.token, waves: [{ heavy: 1, rifleman: 4 }, { rifleman: 6 }, { grenadier: 2 }] });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const raiderCash = res.base.cash;
+    res = await baseAct('scout', { token: raider.token });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.deepEqual(Object.keys(res.base.target).sort(), ['entrances', 'hq', 'hqHp', 'lootPool', 'name', 'site', 'tier'], 'a scouted base shows no layout');
+    assert.deepEqual([res.base.target.name, res.base.target.site, res.base.target.lootPool], ['Tester', 'west', Math.floor(victimCash * 0.2)]);
+
+    res = await baseAct('raid', { token: raider.token, entrances: [1, 1, 1] });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const { replay, raid } = res;
+    const lost = Object.values(replay.outcome.lost).reduce((a, b) => a + b, 0);
+    assert.equal(replay.fog, true);
+    assert.ok(replay.outcome.hqDamage > 0, 'thirteen soldiers get past one turret');
+    assert.deepEqual([replay.defenses.length, replay.walls.length, replay.mines.length], [1, 0, 0], 'only the turret by the route was uncovered');
+    assert.ok(!JSON.stringify(replay).includes(`"cell":${15 * 17 + 2}`), 'the far turret never leaves the server');
+    assert.ok(raid.loot > 0 && raid.loot <= Math.floor(victimCash * 0.2));
+    assert.equal((await hideout(raider.token)).cash, raiderCash + raid.loot);
+    assert.equal((await hideout(victim.token)).cash, victimCash - raid.loot);
+    assert.equal(Object.values(res.base.owned).reduce((a, b) => a + b, 0), 13 - lost, 'dead soldiers are gone');
+    assert.equal(res.base.target, null);
+    assert.deepEqual([res.base.attacks.length, res.base.attacks[0].loot, res.base.attacks[0].opponent], [1, raid.loot, 'Tester']);
+
+    // The defender keeps every piece, is shielded, and replays the raid with the whole base in view.
+    const theirs = (await baseGet(victim.token)).base;
+    assert.deepEqual([theirs.layout.pieces.length, theirs.defenses.length, theirs.defenses[0].id], [4, 1, raid.id]);
+    assert.ok(theirs.shieldUntil > theirs.now);
+    const full = (await baseAct('replay', { token: victim.token, id: raid.id })).replay;
+    assert.deepEqual([full.fog, full.defenses.length, full.walls.length, full.mines.length], [false, 2, 1, 1]);
+    assert.deepEqual(full.outcome, replay.outcome, 'the replay is the same fight');
+    assert.equal((await baseAct('replay', { token: raider.token, id: raid.id })).replay.fog, true);
+    const stranger = await operator();
+    assert.match((await baseAct('replay', { token: stranger.token, id: raid.id })).error, /isn't in your log/);
+    assert.match((await baseAct('scout', { token: raider.token })).error, /No bases to raid/, 'the only target is shielded');
+  });
+
+  test('Safe operators build and practise but never raid or get raided', async () => {
+    const safe = await operator({ raidable: false, cash: 50000 });
+    const res = await baseGet(safe.token);
+    assert.match(res.base.raidBlocker, /Safe operator/);
+    assert.equal(res.base.atRisk, 0);
+    assert.match((await baseAct('scout', { token: safe.token })).error, /Safe operator/);
+    assert.match((await baseAct('raid', { token: safe.token, entrances: [0, 0, 0] })).error, /Safe operator/);
+    const hunter = await operator({ cash: 5000 });
+    const found = await baseAct('scout', { token: hunter.token });
+    assert.ok(found.ok === false || found.base.target.name !== undefined);
+    if (found.ok) assert.notEqual(found.base.target.lootPool, 10000, 'the rich Safe operator is not offered');
+  });
+
+  test('the base needs a signed-in account with an operator', async () => {
+    assert.equal((await baseGet('')).signedOut, true);
+    assert.equal((await baseAct('save', { token: 'nope', layout: { site: 'west', pieces: [] } })).signedOut, true);
+    const fresh = await signUp({ operator: false });
+    assert.match((await baseGet(fresh.token)).error, /Create an operator/);
+    const me = await operator({ raidable: false });
+    assert.match((await baseAct('dance', { token: me.token })).error, /Unknown action/);
+    assert.match((await baseAct('save', { token: me.token })).error, /Nothing to save/);
+    assert.match((await baseAct('save', { token: me.token, layout: { site: 'moon', pieces: [] } })).error, /can't be read/);
+  });
+});
+
 // ---------------------------------------------------------------- server-side simulation
 
 describe('server-hosted simulation', () => {
@@ -1228,6 +1376,13 @@ describe('production defaults (rate limits on, PvP off)', () => {
     assert.equal(raid.pvpEnabled, false);
     const safe = await (await post('/api/hideout/createOperator', { token: reg.token, name: 'Lamb', raidable: false })).json();
     assert.equal(safe.ok, true, JSON.stringify(safe));
+    // Bases can be built and practised on, but not raided, while PvP is off.
+    const mine = await (await fetch(`${prodBase}/api/base?token=${reg.token}`)).json();
+    assert.equal(mine.ok, true, JSON.stringify(mine));
+    assert.match(mine.base.raidBlocker, /switched off/);
+    const scout = await (await post('/api/base/scout', { token: reg.token })).json();
+    assert.equal(scout.ok, false);
+    assert.match(scout.error, /Confirm your email|switched off/);
   });
 
   test('an unlabelled build shows only its version, and a feedback link must be http(s)', async () => {
@@ -1416,7 +1571,8 @@ describe('static client', () => {
     const html = await res.text();
     for (const id of ['menuHome', 'playBtn', 'signInBtn', 'menuHideout', 'loadoutSlots', 'stashGrid', 'traderGrid', 'menuBrowser', 'mapList', 'roomList',
       'hostToggleBtn', 'deployBtn', 'menuSignIn', 'homeFriendsList', 'createRoomBtn', 'resultsOverlay', 'resultsDetails',
-      'hideoutStash', 'hideoutTrader', 'invSellSelected', 'sellList', 'raidInventory', 'steamLoginBtn', 'linkedAccounts']) {
+      'hideoutStash', 'hideoutTrader', 'invSellSelected', 'sellList', 'raidInventory', 'steamLoginBtn', 'linkedAccounts',
+      'hideoutBase', 'baseCanvas', 'basePanel', 'baseTransport']) {
       assert.ok(html.includes(`id="${id}"`), `missing #${id}`);
     }
     // One lobby list for your matchmaking pool, with the cross-platform switch above it.

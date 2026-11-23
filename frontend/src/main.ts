@@ -527,6 +527,7 @@ function showMenuView(view: MenuView) {
   if (view !== 'signin') { bskyLinkMode = false; if (resetToken) hideResetForm(); }
   menuView = view;
   for (const [name, el] of Object.entries(menuViews)) el.classList.toggle('hidden', name !== view);
+  if (view !== 'hideout') hideoutView.base.setVisible(false);
   if (view === 'browser') { void refreshRooms(); void hideoutView.refresh(); }
   if (view === 'hideout') void hideoutView.refresh();
 }
@@ -830,6 +831,7 @@ function clearAuthState() {
   friendsList = [];
   friendIdentity = null;
   hideoutView.state = null;
+  hideoutView.base.reset();
   updateAuthDOM();
   localStorage.removeItem('boxhead_auth_token');
   localStorage.removeItem('boxhead_auth_handle');
