@@ -731,6 +731,7 @@ function setAuthState(token: string, handle: string, userId: string, displayName
   updateAuthDOM();
   refreshFriends();
   refreshMe();
+  void hideoutView.refresh();
   void refreshRooms();
   if (menuView === 'signin') showMenuView('home');
 }
@@ -1412,6 +1413,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code !== 'Escape' || settingsListening || e.repeat) return;
   if (settingsOverlay.style.display === 'flex') { closeSettings(); e.stopPropagation(); return; }
   if (friendsOverlay.style.display === 'flex') { friendsOverlay.classList.add('hidden'); friendsOverlay.style.display = 'none'; e.stopPropagation(); return; }
+  if (currentScreen === 'menu' && menuView === 'hideout' && hideoutView.tab === 'base' && hideoutView.base.closeReplay()) { e.stopPropagation(); return; }
   if (currentScreen === 'menu' && menuView !== 'home') { showMenuView(menuView === 'browser' ? 'hideout' : 'home'); e.stopPropagation(); return; }
   if (currentScreen === 'playing' && mapOpen) { mapOpen = false; e.stopPropagation(); return; }
   if (currentScreen === 'playing' && raidInvOpen) { toggleRaidInventory(false); e.stopPropagation(); return; }
@@ -1421,9 +1423,9 @@ window.addEventListener('keydown', (e) => {
 // Enter presses the open screen's primary button (Play, Join, Sign in, Play again),
 // unless a focused control handles Enter itself.
 window.addEventListener('keydown', (e) => {
-  if (e.key !== 'Enter' || e.repeat || settingsListening) return;
+  if (e.key !== 'Enter' || e.repeat || e.defaultPrevented || settingsListening) return;
   const target = e.target as HTMLElement;
-  if (target.closest('button, a, select, textarea') || target === roomNameInput || target.id === 'addFriendInputEl') return;
+  if (target.closest('button, a, select, textarea, canvas') || target === roomNameInput || target.id === 'addFriendInputEl') return;
   if (settingsOverlay.style.display === 'flex' || friendsOverlay.style.display === 'flex') return;
   let primary: HTMLButtonElement | null = null;
   if (currentScreen === 'results') primary = backToMenuBtn as HTMLButtonElement;

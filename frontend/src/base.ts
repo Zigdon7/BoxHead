@@ -302,11 +302,10 @@ export class BaseView {
   }
 
   private async practice() {
-    if (this.waves.every(w => totalOf(w) === 0)) {
-      this.waves = sampleWaves(this.rules);
-      this.deps.note('Loaded balanced sample waves for practice (free — not bought).');
-    }
-    const data = await this.post('practice', { layout: this.draft, waves: this.waves, entrances: this.entrances });
+    const empty = this.waves.every(w => totalOf(w) === 0);
+    const waves = empty ? sampleWaves(this.rules) : this.waves;
+    if (empty) this.deps.note('Running practice with balanced sample waves (free — your Army tab is unchanged).');
+    const data = await this.post('practice', { layout: this.draft, waves, entrances: this.entrances });
     if (data?.replay) this.play(data.replay, 'Practice raid on your base', `Practice: ${outcomeLine(data.replay.outcome)}. Nothing was lost.`, false);
   }
 
@@ -375,6 +374,14 @@ export class BaseView {
     this.render();
     cancelAnimationFrame(this.raf);
     this.raf = requestAnimationFrame(t => this.frame(t));
+  }
+
+  /** Close an active replay (e.g. on Escape). Returns true if one was open. */
+  closeReplay(): boolean {
+    if (!this.playback) return false;
+    this.stopReplay();
+    this.render();
+    return true;
   }
 
   private stopReplay() {
@@ -457,9 +464,10 @@ export class BaseView {
         this.draw();
       }
       e.preventDefault();
+      e.stopPropagation();
       return;
     }
-    if (e.key === '0') { this.tool = 'erase'; this.renderPanel(); this.draw(); e.preventDefault(); return; }
+    if (e.key === '0') { this.tool = 'erase'; this.renderPanel(); this.draw(); e.preventDefault(); e.stopPropagation(); return; }
     const start = this.cursor ?? cellOf(g, Math.floor(g / 2), Math.floor(g / 2));
     let [x, y] = xyOf(g, start);
     if (e.key === 'ArrowUp') y = Math.max(0, y - 1);
@@ -468,6 +476,7 @@ export class BaseView {
     else if (e.key === 'ArrowRight') x = Math.min(g - 1, x + 1);
     else if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
+      e.stopPropagation();
       this.cursor = start;
       const at = this.pieceAt(start);
       const same = at >= 0 && this.draft.pieces[at].kind === this.tool;
@@ -477,6 +486,7 @@ export class BaseView {
       return;
     } else if (e.key === 'Backspace' || e.key === 'Delete') {
       e.preventDefault();
+      e.stopPropagation();
       this.cursor = start;
       this.painting = 'erase';
       this.paint(start);
@@ -484,6 +494,7 @@ export class BaseView {
       return;
     } else return;
     e.preventDefault();
+    e.stopPropagation();
     this.cursor = cellOf(g, x, y);
     this.draw();
   }
@@ -638,8 +649,12 @@ export class BaseView {
     const quickRow = el('div', 'base-actions');
     if (this.draft.pieces.length === 0) {
       quickRow.append(button('btn btn-secondary btn-sm', 'Starter blueprint', () => {
-        this.draft = starterBlueprint(rules, this.draft.site);
-        this.deps.note('Loaded starter blueprint (unsaved — test it in Practice or click Buy and save).');
+        const full = starterBlueprint(rules, this.draft.site);
+        const compact = saveCost(rules, full, this.waves, s.owned).total > s.cash;
+        this.draft = compact ? starterBlueprint(rules, this.draft.site, true) : full;
+        this.deps.note(compact
+          ? 'Loaded budget starter blueprint (fits your cash — test in Practice or click Buy and save).'
+          : 'Loaded starter blueprint (unsaved — test it in Practice or click Buy and save).');
         this.render();
       }));
     } else {
@@ -781,9 +796,10 @@ export class BaseView {
     }
     const spare = reserve(this.draft, this.waves, s.owned);
     if (totalOf(spare)) parts.push(el('p', 'hf-sub', `In reserve (owned, not assigned): ${this.waveSummary(spare)}.`));
-    parts.push(...this.saveBlock(layoutProblem(rules, this.draft)));
+    const layoutErr = layoutProblem(rules, this.draft);
+    parts.push(...this.saveBlock(layoutErr));
     const test = button('btn btn-secondary btn-sm btn-block', 'Run a practice raid on your base', () => void this.practice());
-    test.disabled = this.busy;
+    test.disabled = !!layoutErr || this.busy;
     parts.push(test, el('p', 'hf-sub', 'Practice is free and uses the waves on screen, owned or not.'));
     parts.push(...this.spareSection(true));
     return parts;
@@ -810,7 +826,7 @@ export class BaseView {
     else if (shield > 0) own.append(el('span', '', `Shielded for ${shortDuration(shield)} after the last raid on it. Raiding someone drops your shield (same rivals stay on a 24h cooldown).`));
     else if (s.atRisk === 0 || (s.cash + (s.workshopAtRisk ?? 0)) < s.rules.minTargetCash) own.append(el('span', '', `Not worth raiding: under ${money(s.rules.minTargetCash)} exposed cash, so nobody is offered your base.`));
     else {
-      const wsNote = (s.workshopAtRisk ?? 0) > 0 ? ` (includes ${money(s.workshopAtRisk!)} uncollected Workshop)` : '';
+      const wsNote = (s.workshopAtRisk ?? 0) > 0 ? ` (counting ${money(s.workshopAtRisk!)} uncollected Workshop)` : '';
       own.append(el('span', '', `Open to raids. Up to ${money(s.atRisk)} is at risk${wsNote}. Repelling an attack salvages ${Math.round((s.rules.defenderSalvageShare ?? 0.3) * 100)}% of dead attacker value; your pieces are never lost.`));
     }
     parts.push(own);

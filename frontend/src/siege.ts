@@ -189,8 +189,9 @@ export function spareOf(rules: Rules, layout: Layout, waves: Counts[], owned: Co
   }).filter(s => s.count > 0);
 }
 
-/** A quick, valid starter defense layout oriented around `site`'s HQ for practice/onboarding. */
-export function starterBlueprint(rules: Rules, site: SiteId): Layout {
+/** A quick, valid starter defense layout oriented around `site`'s HQ for practice/onboarding.
+ *  When `compact` is true, omits the two $450 turrets so fresh operators ($400 cash) can buy and save immediately. */
+export function starterBlueprint(rules: Rules, site: SiteId, compact = false): Layout {
   const g = rules.grid;
   const info = siteInfo(rules, site);
   const [hx, hy] = xyOf(g, info.hq);
@@ -209,22 +210,28 @@ export function starterBlueprint(rules: Rules, site: SiteId): Layout {
     used.add(cell);
     pieces.push({ kind, x, y });
   };
-  // Two turrets flanking forward of HQ, a guard beside HQ, a mine on the main approach, and a funnel wall.
+  // Two turrets flanking forward of HQ (when not compact), a guard beside HQ, a mine on the approach, and a funnel wall.
   if (dx !== 0 && dy === 0) {
-    put('turret', hx + dx * 3, hy - 2);
-    put('turret', hx + dx * 3, hy + 2);
+    if (!compact) {
+      put('turret', hx + dx * 3, hy - 2);
+      put('turret', hx + dx * 3, hy + 2);
+    }
     put('rifleman', hx + dx * 2, hy - 1);
     put('mine', hx + dx * 5, hy);
     for (const oy of [-4, -3, -2, 2, 3, 4]) put('wall', hx + dx * 5, hy + oy);
   } else if (dy !== 0 && dx === 0) {
-    put('turret', hx - 2, hy + dy * 3);
-    put('turret', hx + 2, hy + dy * 3);
+    if (!compact) {
+      put('turret', hx - 2, hy + dy * 3);
+      put('turret', hx + 2, hy + dy * 3);
+    }
     put('rifleman', hx - 1, hy + dy * 2);
     put('mine', hx, hy + dy * 5);
     for (const ox of [-4, -3, -2, 2, 3, 4]) put('wall', hx + ox, hy + dy * 5);
   } else {
-    put('turret', hx + dx * 3, hy + dy * 1);
-    put('turret', hx + dx * 1, hy + dy * 3);
+    if (!compact) {
+      put('turret', hx + dx * 3, hy + dy * 1);
+      put('turret', hx + dx * 1, hy + dy * 3);
+    }
     put('rifleman', hx + dx * 2, hy + dy * 2);
     put('mine', hx + dx * 4, hy + dy * 4);
     for (let k = 0; k <= 3; k++) {

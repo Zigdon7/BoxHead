@@ -89,8 +89,8 @@ pub const KINDS: [Kind; 8] = [
     Kind::Rifleman, Kind::Scout, Kind::Heavy, Kind::Grenadier,
 ];
 pub const SOLDIERS: [Kind; 4] = [Kind::Rifleman, Kind::Scout, Kind::Heavy, Kind::Grenadier];
-/// The order a wave walks in: the toughest soldiers lead.
-const MARCH_ORDER: [Kind; 4] = [Kind::Heavy, Kind::Rifleman, Kind::Grenadier, Kind::Scout];
+/// The order a wave walks in: scouts lead to spot fog and sweep mines, then heavies soak fire.
+const MARCH_ORDER: [Kind; 4] = [Kind::Scout, Kind::Heavy, Kind::Rifleman, Kind::Grenadier];
 
 /// How a soldier or a gun fights.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,8 +135,8 @@ impl Kind {
             Kind::Sniper => "Slow, hard-hitting shots down open firing lanes.",
             Kind::Mine => "Hidden until stepped on, then hurts everyone close by. Scouts can disarm it.",
             Kind::Rifleman => "Steady all-rounder. Deals 50% bonus damage to garrison soldiers.",
-            Kind::Scout => "Fast and fragile. Clears twice as much fog to spot targets and disarms mines.",
-            Kind::Heavy => "Slow, tough, leads the wave and soaks up fire.",
+            Kind::Scout => "Fast and fragile. Leads the wave to clear twice as much fog and disarm mines.",
+            Kind::Heavy => "Slow and tough. Marches behind scouts to soak up turret and sniper fire.",
             Kind::Grenadier => "Prioritizes turrets, towers and the HQ for 2.5× structure damage.",
         }
     }
@@ -1057,6 +1057,13 @@ mod tests {
         assert!(sweep.mines[0].disarmed.is_some() && sweep.mines[0].blown.is_none());
         assert_eq!(sweep.outcome.lost.total(), 0);
         assert_eq!(sweep.replay(true).mines.len(), 1, "disarmed mines appear in the attacker's replay");
+
+        // In a mixed wave, the Scout leads the column and disarms a near-entrance mine before Heavies hit it.
+        let near_mine = base(Site::West, vec![piece(Kind::Mine, 14, 8)], 1);
+        let mixed = simulate(&near_mine, &plan([&[(Kind::Heavy, 1), (Kind::Rifleman, 2), (Kind::Scout, 1)], &[], &[]], [1, 1, 1]));
+        assert!(mixed.blasts.is_empty(), "leading scout disarms near-entrance mine ahead of heavy");
+        assert!(mixed.mines[0].disarmed.is_some() && mixed.mines[0].blown.is_none());
+        assert_eq!(mixed.outcome.lost.total(), 0);
     }
 
     #[test]
@@ -1096,10 +1103,10 @@ mod tests {
 
     #[test]
     fn grenadiers_prioritize_structures_and_riflemen_counter_garrison() {
-        // A Garrison Heavy stands nearer on the path while a Turret is slightly farther (both in reach 2.8);
+        // A Garrison Heavy stands nearer on the path while a Turret is slightly farther (both revealed together at x=12, in reach 2.8);
         // Grenadiers still focus the Turret first instead of getting aggro-sponged by the Heavy.
         let b = base(Site::West, vec![piece(Kind::Heavy, 11, 8), piece(Kind::Turret, 11, 9)], 1);
-        let battle = simulate(&b, &plan([&[(Kind::Grenadier, 2), (Kind::Scout, 1)], &[], &[]], [1, 1, 1]));
+        let battle = simulate(&b, &plan([&[(Kind::Grenadier, 2)], &[], &[]], [1, 1, 1]));
         let turret_id = DEFENSE_ID + 1;
         let first_grenadier_shot = battle.shots.iter().find(|&&(_, from, _, _)| {
             from >= 0 && from < DEFENSE_ID && battle.troops[from as usize].kind == Kind::Grenadier

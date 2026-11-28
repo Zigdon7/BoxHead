@@ -123,6 +123,10 @@ describe('buying', () => {
       const bp = starterBlueprint(rules, s.id);
       expect(bp.pieces.length).toBeGreaterThan(0);
       expect(layoutProblem(rules, bp)).toBeNull();
+      const budget = starterBlueprint(rules, s.id, true);
+      expect(budget.pieces.length).toBeGreaterThan(0);
+      expect(layoutProblem(rules, budget)).toBeNull();
+      expect(saveCost(rules, budget, [{}, {}, {}], {}).total).toBeLessThanOrEqual(400);
     }
     const sample = sampleWaves(rules);
     expect(sample).toHaveLength(3);

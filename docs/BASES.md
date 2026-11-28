@@ -29,11 +29,11 @@ Limits follow the operator's Homefront tier. The HQ has `1,500 + 500 × tier` he
 | Soldier | Price | Supply | Health | Speed | Reach | Role |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | Rifleman | $60 | 1 | 120 | 1.6 | 3.0 | All-rounder. Deals **1.5× damage** to garrison soldiers. |
-| Scout | $45 | 1 | 70 | 2.8 | 2.0 | Fast, clears fog two squares out (spotting defenses for allies) and **disarms nearby mines**. |
-| Heavy | $150 | 2 | 420 | 1.2 | 1.6 | Leads the wave and soaks up turret and sniper fire. |
+| Scout | $45 | 1 | 70 | 2.8 | 2.0 | Fast, **leads the wave**, clears fog two squares out (spotting defenses for allies) and **disarms nearby mines**. |
+| Heavy | $150 | 2 | 420 | 1.2 | 1.6 | Tough vanguard that marches behind scouts and soaks up turret and sniper fire. |
 | Grenadier | $170 | 2 | 110 | 1.4 | 2.8 | **Prioritizes structures** over garrison infantry and deals **2.5× damage** to turrets, towers and the HQ. |
 
-An attack is three waves. Each wave holds `3 + 3 × tier` supply (6, 9, 12 or 15) and sets out 8 seconds after the one before, soldiers stepping through the entrance half a second apart with heavies first. Soldiers shoot on the move at revealed defenses in reach with clear line of sight, or the HQ when none is. A raid ends when the HQ is destroyed, the last soldier dies, or after 150 seconds.
+An attack is three waves. Each wave holds `3 + 3 × tier` supply (6, 9, 12 or 15) and sets out 8 seconds after the one before, soldiers stepping through the entrance half a second apart with scouts leading and heavies next. Soldiers shoot on the move at revealed defenses in reach with clear line of sight, or the HQ when none is. A raid ends when the HQ is destroyed, the last soldier dies, or after 150 seconds.
 
 ## Buying, selling and refilling
 
