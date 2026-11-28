@@ -75,6 +75,8 @@ export interface Hideout {
   gearScore: number; loadout: Partial<Record<Slot, Item | null>>; stash: Item[]; stashCapacity: number;
   offers: Offer[]; maps: MapSummary[];
   overflow?: Item[]; investmentValue?: number;
+  /** Unread incoming base raids on the active operator. */
+  unreadBaseDefenses?: number;
   /** Raidable operators (PvP) are available on this server. */
   pvpEnabled?: boolean;
   /** What insuring the current loadout for one raid costs. */

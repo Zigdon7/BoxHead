@@ -67,7 +67,7 @@ Each operator starts at tier 1. Higher tiers unlock higher facility levels, with
 | Storage | `$400 × L²` | `10 × L` additional stash slots |
 | Armory | `$600 × L²` | Adds trader power 28, 32, 35, then 38 at successive levels |
 | Insurance Office | `$500 × L²` | Reduces the premium rate by `4 × L` percentage points |
-| Workshop | `$800 × L²` | `$60 × L` per hour, banked automatically on returning to the hideout, capped at 48 hours of production |
+| Workshop | `$800 × L²` | `$60 × L` per hour (+15% for Raidable operators), banked automatically on returning to the hideout, capped at 48 hours of production |
 
 Costs are per purchase, not cumulative. For example, Storage levels 1, 2 and 3 cost $400, $1,600 and $3,600, or $5,600 in total. A level 3 Workshop holds at most $8,640. Homefront tier spending does not automatically build facilities.
 
@@ -90,7 +90,7 @@ Operations rank never substitutes for gear score. Rank 5 Black Site costs $1,000
 
 Seasons are calendar quarters in UTC. In the last 28 days, an account can retire one operator with Homefront tier 3 or higher, once per season. The player-facing action is **Retire**; code and API names use `relocate`. Retirement deletes the operator, cash, items, facilities, Operations and operator friendships. It is optional: season rollover does not automatically wipe operators.
 
-Retirement value includes cash, item sale values, cash invested in installed Homefront tiers/facilities, and the sale value of materials consumed by tier upgrades after this update. Investment is counted once: upgrading transfers cash/material value into installed value. Existing installations receive their known cash value; historical material values were not recorded and cannot be reconstructed. Preview and settlement use the same valuation; settlement recomputes it inside its transaction.
+Retirement value includes cash, item sale values, cash invested in installed Homefront tiers/facilities, owned permanent base structures (walls, turrets, sniper towers and mines), and the sale value of materials consumed by tier upgrades after this update. Investment is counted once: upgrading transfers cash/material value into installed value. Existing installations receive their known cash value; historical material values were not recorded and cannot be reconstructed. Preview and settlement use the same valuation; settlement recomputes it inside its transaction.
 
 | Operator value | Legacy points earned before the lifetime cap |
 | --- | ---: |

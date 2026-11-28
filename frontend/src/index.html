@@ -1374,6 +1374,10 @@
     .base-stage { min-height: 0; }
     .base-canvas-wrap { flex: 1; min-height: 240px; position: relative; overflow: hidden; }
     .base-canvas { position: absolute; inset: auto; top: 50%; left: 50%; transform: translate(-50%, -50%); display: block; border: 1px solid var(--border-strong); background: #161910; touch-action: none; cursor: crosshair; }
+    .base-canvas:focus-visible { outline: 2px solid var(--you); outline-offset: 2px; }
+    .tab-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 4px; border-radius: 999px; background: var(--accent); color: #fff; font: 700 11px var(--font-mono); line-height: 1; }
+    .base-intro { border-left: 3px solid var(--you); }
+    .base-spare-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--text-secondary); }
     .base-hint { min-height: 1.3em; }
     .base-tabs { display: flex; }
     .base-tabs button { flex: 1; justify-content: center; }
@@ -1552,7 +1556,7 @@
           <button type="button" data-hideout-tab="stash" aria-pressed="true"><svg class="icon"><use href="#i-crate"/></svg>Stash</button>
           <button type="button" data-hideout-tab="trader" aria-pressed="false"><svg class="icon"><use href="#i-star"/></svg>Trader</button>
           <button type="button" data-hideout-tab="homefront" aria-pressed="false"><svg class="icon"><use href="#i-home"/></svg>Homefront</button>
-          <button type="button" data-hideout-tab="base" aria-pressed="false"><svg class="icon"><use href="#i-flag"/></svg>Base</button>
+          <button type="button" data-hideout-tab="base" aria-pressed="false"><svg class="icon"><use href="#i-flag"/></svg>Base<span id="baseUnreadBadge" class="tab-badge" hidden></span></button>
           <button type="button" data-hideout-tab="operators" aria-pressed="false"><svg class="icon"><use href="#i-users"/></svg>Operators</button>
         </div>
         <button id="operatorChip" class="op-chip" type="button" data-hideout-tab="operators" title="Switch or create operators">
@@ -1639,7 +1643,7 @@
       <div id="hideoutBase" class="hq-body hq-body--base" hidden>
         <section class="hq-main base-stage" aria-label="Base map">
           <div class="pane-head"><span id="baseStageTitle" class="label">Your base</span><span id="baseStageMeta" class="meta"></span></div>
-          <div id="baseCanvasWrap" class="base-canvas-wrap"><canvas id="baseCanvas" class="base-canvas" width="544" height="544" aria-label="Base map"></canvas></div>
+          <div id="baseCanvasWrap" class="base-canvas-wrap"><canvas id="baseCanvas" class="base-canvas" width="544" height="544" tabindex="0" aria-label="Base map (arrow keys move cursor, Space places or removes)"></canvas></div>
           <div id="baseTransport" class="base-transport" hidden></div>
           <p id="baseHint" class="hq-hint base-hint"></p>
         </section>
@@ -1648,7 +1652,7 @@
             <button type="button" data-base-tab="build" aria-pressed="true">Build</button>
             <button type="button" data-base-tab="army" aria-pressed="false">Army</button>
             <button type="button" data-base-tab="raid" aria-pressed="false">Raid</button>
-            <button type="button" data-base-tab="log" aria-pressed="false">Log</button>
+            <button type="button" data-base-tab="log" aria-pressed="false">Log<span id="baseLogBadge" class="tab-badge" hidden></span></button>
           </div>
           <div id="basePanel" class="base-panel"></div>
         </aside>

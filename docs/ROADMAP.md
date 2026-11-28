@@ -77,7 +77,7 @@ Complete touch controls and controller support are separate deliverables, not co
 
 **Base raids implemented, unvalidated; in-raid PvP still to explore.** As of November 16, 2026, asynchronous base raids exist behind `BOXHEAD_PVP`: bases, three-wave attacks, fog of war, cash loot, shields, replays and practice raids ([BASES.md](BASES.md)). No player has tested them. Player-versus-player combat inside extraction raids is not built.
 
-The base-raid build made first-pass choices on several of the questions below (offline raids allowed, only cash stolen, 20% capped pool, 8-hour shield, Safe operators isolated). Treat them as open until measured. For in-raid PvP, resolve these in a separate design proposal before implementation:
+The base-raid build implements offline asynchronous raids with cash-only stakes (liquid + uncollected Workshop, 20% capped at $15k), 15% raid fencing burn, 24h per-account-pair cooldown on top of 8h shields, hard ±1 tier scouting with escalating re-scout fees, defender salvage bounties, defended-HQ contract bonuses, wall line of sight, sight-gated targeting with Scout mine-sweeping, unread defense badges, keyboard base editing, and one-way Safe→Raidable promotion (+15% Workshop rate). For in-raid PvP, resolve these in a separate design proposal before implementation:
 
 - Matchmaking and fair combat: gear/Legacy disparities, team size, damage rules, spawn safety and anti-cheat validation.
 - Risk consent: who opts into PvP, what can be stolen, how Safe operators remain isolated, and whether account-wide rewards cross modes.

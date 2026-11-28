@@ -7,6 +7,9 @@
 //!   POST /api/base/scout             find a base to raid
 //!   POST /api/base/raid              {entrances}                   raid the scouted base
 //!   POST /api/base/replay            {id}                          replay a logged raid
+//!   POST /api/base/refill            restore and buy back lost wave troops
+//!   POST /api/base/sell              {kind, count?}                sell spare owned pieces/troops (50%)
+//!   POST /api/base/ack               mark defense raid notifications read
 //!
 //! Every reply carries the base as it now stands.
 
@@ -105,10 +108,23 @@ pub async fn base_action(State(state): State<Arc<AppState>>, Path(action): Path<
                     let plan = Plan { waves, entrances: entrances_of(&body)? };
                     db.practice_raid(&profile, layout_of(&body)?, &plan).map(|replay| json!({ "replay": replay }))
                 }
-                "scout" => db.scout_base(&profile, now).map(|_| Value::Null),
+                "scout" => db.scout_base(&profile, now).map(|(_, fee)| json!({ "fee": fee })),
                 "raid" => db.launch_base_raid(&profile, entrances_of(&body)?, now)
-                    .map(|report| json!({ "raid": { "id": report.id, "defender": report.defender, "loot": report.loot }, "replay": report.replay })),
+                    .map(|report| json!({
+                        "raid": {
+                            "id": report.id, "defender": report.defender, "loot": report.loot,
+                            "payout": report.payout, "contractBonus": report.contract_bonus, "salvage": report.salvage,
+                        },
+                        "replay": report.replay,
+                    })),
                 "replay" => db.base_replay(&profile, body["id"].as_str().unwrap_or("")).map(|replay| json!({ "replay": replay })),
+                "refill" => db.refill_waves(&profile).map(|spent| json!({ "spent": spent })),
+                "sell" => {
+                    let kind = body["kind"].as_str().and_then(siege::Kind::parse).ok_or("Unknown piece or soldier")?;
+                    let count = body["count"].as_u64().unwrap_or(1).min(9_999) as u32;
+                    db.sell_base_spare(&profile, kind, count).map(|earned| json!({ "earned": earned }))
+                }
+                "ack" => db.ack_base_defenses(&profile, now).map(|_| Value::Null),
                 _ => Err("Unknown action".into()),
             }
         })();

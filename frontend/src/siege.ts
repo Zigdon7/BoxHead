@@ -13,23 +13,28 @@ export interface Layout { site: SiteId; pieces: Piece[] }
 export interface KindInfo {
   id: Kind; name: string; blurb: string; price: number; soldier: boolean; blocks: boolean; cap: number;
   hp: number | null; range: number | null; dps: number | null; speed: number | null; supply: number | null;
-  sight: number | null; structureMult: number | null;
+  sight: number | null; structureMult: number | null; infantryMult?: number | null;
 }
 export interface SiteInfo { id: SiteId; name: string; hq: number; entrances: number[] }
 export interface Rules {
   grid: number; kinds: KindInfo[]; sites: SiteInfo[];
   guardCap: number; waveSupply: number; hqHp: number; guardHpMult: number; mineDamage: number; mineRadius: number;
   waveGapSecs: number; maxSecs: number; lootShare: number; lootCap: number; minTargetCash: number; shieldSecs: number;
+  lootBurnShare?: number; defenderSalvageShare?: number; contractShare?: number; contractCap?: number;
+  pairCooldownSecs?: number; maxTierGap?: number; scoutFees?: number[]; sellRefundRate?: number;
 }
 
 export interface Target { name: string; tier: number; site: SiteId; hq: number; entrances: number[]; lootPool: number; hqHp: number }
 export interface RaidLog {
   id: string; at: number; opponent: string; hqDamage: number; destroyed: boolean; loot: number;
+  payout?: number; contractBonus?: number; salvage?: number;
   sent: Counts; lost: Counts; replayable: boolean;
 }
 export interface BaseState {
   name: string; tier: number; raidable: boolean; cash: number;
   layout: Layout; owned: Counts; waves: Counts[]; shieldUntil: number; atRisk: number;
+  workshopAtRisk?: number; scoutFee?: number; unreadDefenses?: number;
+  refillWaves?: Counts[]; refillCost?: number;
   target: Target | null; attacks: RaidLog[]; defenses: RaidLog[];
   rules: Rules; now: number; raidBlocker: string | null;
 }
@@ -42,7 +47,7 @@ export interface Replay {
   hq: number; hqHp: number; entrances: number[]; waveEntrances: number[];
   walls: [number, number | null][];
   defenses: ReplayDefense[];
-  mines: { cell: number; blown: number | null }[];
+  mines: { cell: number; blown: number | null; disarmed?: number | null }[];
   troops: ReplayTroop[];
   /** [tick, attacker id, target id, damage]; -1 is a gun the attacker never saw. */
   shots: [number, number, number, number][];
@@ -172,6 +177,83 @@ export function reserve(layout: Layout, waves: Counts[], owned: Counts): Counts 
   const out: Counts = {};
   for (const k of SOLDIERS) { const spare = (owned[k] ?? 0) - (need[k] ?? 0); if (spare > 0) out[k] = spare; }
   return out;
+}
+
+/** Everything owned (equipment or soldiers) not currently placed or assigned. */
+export function spareOf(rules: Rules, layout: Layout, waves: Counts[], owned: Counts): { kind: Kind; count: number; refund: number }[] {
+  const need = needed(layout, waves);
+  const rate = rules.sellRefundRate ?? 0.5;
+  return rules.kinds.map(k => {
+    const count = Math.max(0, (owned[k.id] ?? 0) - (need[k.id] ?? 0));
+    return { kind: k.id, count, refund: Math.floor(count * k.price * rate) };
+  }).filter(s => s.count > 0);
+}
+
+/** A quick, valid starter defense layout oriented around `site`'s HQ for practice/onboarding. */
+export function starterBlueprint(rules: Rules, site: SiteId): Layout {
+  const g = rules.grid;
+  const info = siteInfo(rules, site);
+  const [hx, hy] = xyOf(g, info.hq);
+  const mid = Math.floor(g / 2);
+  const dx = hx < mid ? 1 : hx > mid ? -1 : 0;
+  const dy = hy < mid ? 1 : hy > mid ? -1 : 0;
+  const keepOut = new Set([info.hq, ...info.entrances]);
+  const used = new Set<number>();
+  const pieces: Piece[] = [];
+  const put = (kind: Kind, x: number, y: number) => {
+    if (x < 0 || y < 0 || x >= g || y >= g) return;
+    const cell = cellOf(g, x, y);
+    if (keepOut.has(cell) || used.has(cell)) return;
+    const candidate: Layout = { site, pieces: [...pieces, { kind, x, y }] };
+    if (layoutProblem(rules, candidate)) return;
+    used.add(cell);
+    pieces.push({ kind, x, y });
+  };
+  // Two turrets flanking forward of HQ, a guard beside HQ, a mine on the main approach, and a funnel wall.
+  if (dx !== 0 && dy === 0) {
+    put('turret', hx + dx * 3, hy - 2);
+    put('turret', hx + dx * 3, hy + 2);
+    put('rifleman', hx + dx * 2, hy - 1);
+    put('mine', hx + dx * 5, hy);
+    for (const oy of [-4, -3, -2, 2, 3, 4]) put('wall', hx + dx * 5, hy + oy);
+  } else if (dy !== 0 && dx === 0) {
+    put('turret', hx - 2, hy + dy * 3);
+    put('turret', hx + 2, hy + dy * 3);
+    put('rifleman', hx - 1, hy + dy * 2);
+    put('mine', hx, hy + dy * 5);
+    for (const ox of [-4, -3, -2, 2, 3, 4]) put('wall', hx + ox, hy + dy * 5);
+  } else {
+    put('turret', hx + dx * 3, hy + dy * 1);
+    put('turret', hx + dx * 1, hy + dy * 3);
+    put('rifleman', hx + dx * 2, hy + dy * 2);
+    put('mine', hx + dx * 4, hy + dy * 4);
+    for (let k = 0; k <= 3; k++) {
+      put('wall', hx + dx * 5, hy + dy * k);
+      put('wall', hx + dx * k, hy + dy * 5);
+    }
+  }
+  return { site, pieces };
+}
+
+/** A balanced 3-wave sample army fitting `rules.waveSupply`, for instant practice testing. */
+export function sampleWaves(rules: Rules): Counts[] {
+  const room = rules.waveSupply;
+  const build = (plan: [Kind, number][]): Counts => {
+    const w: Counts = {};
+    let left = room;
+    for (const [k, want] of plan) {
+      const sup = kindInfo(rules, k).supply ?? 1;
+      const take = Math.min(want, Math.floor(left / sup));
+      if (take > 0) { w[k] = (w[k] ?? 0) + take; left -= take * sup; }
+    }
+    if (left > 0) w.rifleman = (w.rifleman ?? 0) + left;
+    return w;
+  };
+  return [
+    build([['heavy', 1], ['scout', 1], ['rifleman', 6]]),
+    build([['heavy', 1], ['grenadier', 1], ['rifleman', 6]]),
+    build([['grenadier', 2], ['scout', 1], ['rifleman', 6]]),
+  ];
 }
 
 export const sameLayout = (a: Layout, b: Layout) => {

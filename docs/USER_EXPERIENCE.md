@@ -40,7 +40,8 @@ New operators receive a power 6 Service Pistol, power 4 Padded Vest, power 4 Can
 | Stash | Filter and sort items, inspect comparisons, equip, sell or bulk-sell, pack sealed loot | Keep an upgrade, bank cash, or risk a sealed item again |
 | Trader | Buy replacement equipment and inspect available power levels | Spend now to recover or save for a larger upgrade |
 | Homefront | Raise the tier, build facilities, collect Workshop cash, inspect Operations | Invest earnings in lasting operator benefits |
-| Operators | Create, select or delete characters; inspect Legacy and retirement | Commit to one character or maintain separate progression paths |
+| Base | Build a 17×17 defense map, compose 3 attack waves, run free practice raids, scout and raid rivals (when PvP is on), watch fogged replays | Turn cash into base defense, test layouts safely, and strike rival bases |
+| Operators | Create, select, opt Safe→Raidable (when PvP is on) or delete characters; inspect Legacy and retirement | Commit to one character or maintain separate progression paths |
 
 The stash and raid pack are different inventories. The equipped pack is a piece of gear; its contents are carried loot. Insurance returns the equipped pack on a loss, along with the other equipped gear, but never its contents. Valuables also fund Homefront tier upgrades. Protect items to reserve them against sale, automatic pack replacement and tier consumption; unprotect them before spending them. This is distinct from raid insurance. Homefront offers targeted gear requisitions earned through extraction, and Workshop income banks automatically on return. Legacy allocations can be reset for $1,000 with confirmation.
 
@@ -48,7 +49,7 @@ The stash and raid pack are different inventories. The equipped pack is a piece 
 
 The deploy screen connects the selected operator, map requirement, entry fee, insurance premium and raid choice. Locked maps require gear score, not account age or Operations rank. Filling an empty slot can matter more than replacing an already strong item.
 
-Players initially match with the platform used for the current sign-in. Cross-platform play moves them into the shared opt-in pool. Friends who cannot find the same raid should compare their pools first. Hosting and choosing a shared raid are available; a party invitation and ready-check system is future work.
+Players start in the shared cross-platform matchmaking pool by default and can switch off cross-platform play to match only within their current sign-in platform pool. Friends who cannot find the same raid should compare their pools first. Hosting and choosing a shared raid are available; a party invitation and ready-check system is future work.
 
 ### The raid experience
 

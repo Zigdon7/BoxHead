@@ -133,6 +133,7 @@ export class HideoutView {
     this.base = new BaseView({
       auth: deps.auth,
       onCash: () => void this.refresh(),
+      onUnread: (n) => this.setBaseUnread(n),
       error: (msg) => this.error(msg),
       note: (msg) => this.note(msg),
     });
@@ -238,6 +239,7 @@ export class HideoutView {
       else if (action === 'createOperator') { this.newName = ''; this.newRaidable = null; this.creating = false; this.tab = 'stash'; this.render(); this.note(`${data.name} reporting in. Starter kit and $${data.cash} are in the stash.`); }
       else if (action === 'switchOperator') this.note(`Now playing ${data.name}.`);
       else if (action === 'upgradeTier') this.note(`Homefront raised to tier ${data.homefront?.tier}.`);
+      else if (action === 'promoteRaidable') this.note(`${data.name} is now Raidable: Tier 4, +15% Workshop income and base raids unlocked.`);
       else if (action === 'upgradeFacility') this.note('Facility upgraded.');
       else if (action === 'collectWorkshop') this.note(`Collected ${money(before?.cash !== undefined ? data.cash - before.cash : 0)} from the Workshop.`);
       else if (action === 'requisition') this.note('Requested gear added to your stash, protected from accidental sale.');
@@ -281,11 +283,19 @@ export class HideoutView {
 
   private select(id: string | null) { this.selectedId = id; this.render(); }
 
+  private setBaseUnread(n: number) {
+    const badge = document.getElementById('baseUnreadBadge');
+    if (!badge) return;
+    badge.hidden = n <= 0;
+    badge.textContent = n > 0 ? String(n) : '';
+  }
+
   // ---------- Rendering ----------
 
   render() {
     const h = this.state;
     if (!h) return;
+    this.setBaseUnread(h.unreadBaseDefenses ?? 0);
     // With no operator there's nothing to manage but operators.
     if (h.needsOperator) this.tab = 'operators';
     this.q('menuHideout').classList.toggle('first-run', !!h.needsOperator);
@@ -520,6 +530,12 @@ export class HideoutView {
         btn.addEventListener('click', () => void this.act('switchOperator', { operatorId: o.id }));
         row.append(btn);
       }
+      if (o.active && !o.raidable && h.pvpEnabled !== false && !o.inRaid && !h.inRaid) {
+        const promo = confirmButton('btn btn-secondary btn-sm', 'Opt into Raidable', `Confirm: ${o.name} becomes Raidable permanently (+15% Workshop, Tier 4, base raids)`,
+          () => void this.act('promoteRaidable', { confirm: true }));
+        promo.title = 'Permanently promote this Safe operator to Raidable.';
+        row.append(promo);
+      }
       if (!o.inRaid && !h.inRaid) {
         const del = confirmButton('link link--muted op-delete', 'Delete', `Click again: ${o.name} and everything they own is gone for good`,
           () => void this.act('deleteOperator', { operatorId: o.id, confirm: true }));
@@ -611,10 +627,10 @@ export class HideoutView {
       return b;
     };
     grid.append(
-      choice(false, 'Safe', 'Zombies only. Other players can never attack you or raid your base.',
-        [['PvP', 'Off', 'good'], ['Base raids', 'Immune', 'good'], ['Base max', `Tier ${safeTier}`, 'neutral']], pvp ? 'Recommended' : undefined),
-      choice(true, 'Raidable', 'Zombies and players. Others can attack you (PvP) and raid your base.',
-        [['PvP', 'On', 'bad'], ['Base raids', 'Exposed', 'bad'], ['Base max', `Tier ${top}`, 'neutral']]),
+      choice(false, 'Safe', 'Zombies only. Your base can never be raided; you can opt into Raidable later when ready.',
+        [['Base raids', 'Immune', 'good'], ['Base max', `Tier ${safeTier}`, 'neutral'], ['Workshop', 'Standard', 'neutral']], pvp ? 'Recommended' : undefined),
+      choice(true, 'Raidable', 'Strike rival bases for cash. Only cash (max 20%) is at risk; gear, stash and pieces stay safe.',
+        [['Base raids', 'Active', 'bad'], ['Base max', `Tier ${top}`, 'good'], ['Workshop', '+15% rate', 'good']]),
     );
     const create = el('button', 'btn btn-primary', this.newRaidable === null ? 'Choose Safe or Raidable' : `Create ${this.newRaidable ? 'Raidable' : 'Safe'} operator`);
     create.type = 'button';

@@ -540,8 +540,8 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
         let next = (level < cap).then_some(level + 1);
         serde_json::json!({
             "id": f.as_str(), "name": f.label(), "level": level, "maxLevel": op.tier,
-            "effect": f.effect(level),
-            "next": next.map(|n| serde_json::json!({ "level": n, "cost": f.cost(n), "effect": f.effect(n), "needsTier": n > op.tier })),
+            "effect": f.effect_for(level, op.raidable),
+            "next": next.map(|n| serde_json::json!({ "level": n, "cost": f.cost(n), "effect": f.effect_for(n, op.raidable), "needsTier": n > op.tier })),
         })
     }).collect();
     let operations: Vec<serde_json::Value> = db.operations(profile).into_iter().map(|(m, xp)| {
@@ -567,6 +567,7 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
         "stash": stash,
         "overflow": op.items.iter().filter(|s| s.overflow).map(|s| &s.item).collect::<Vec<_>>(),
         "investmentValue": db.investment_value(profile),
+        "unreadBaseDefenses": db.unread_base_defenses(profile),
         "carry": op.items.iter().filter(|s| s.carry).map(|s| s.item.id.clone()).collect::<Vec<_>>(),
         "stashCapacity": ctx.stash_capacity(),
         "insuranceCost": gear::insurance_cost_at(&loadout, ctx.insurance_rate()),
@@ -584,8 +585,8 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
             "workshop": {
                 "collected": collected,
                 "stored": ctx.workshop_stored(now),
-                "perHour": progression::workshop_rate(ctx.facility(progression::Facility::Workshop)),
-                "capacity": progression::workshop_rate(ctx.facility(progression::Facility::Workshop)) * progression::WORKSHOP_HOURS,
+                "perHour": ctx.workshop_rate(),
+                "capacity": ctx.workshop_rate() * progression::WORKSHOP_HOURS,
             },
         },
     })
@@ -708,6 +709,11 @@ async fn hideout_action(
         };
         match (action.as_str(), slot) {
             ("upgradeTier", _) => db.upgrade_tier(&profile).map(|_| ()),
+            ("promoteRaidable", _) => {
+                if !pvp_enabled() { Err("Raidable operators arrive with PvP.".into()) }
+                else if body["confirm"].as_bool() != Some(true) { Err("Confirm promoting this operator to Raidable.".into()) }
+                else { db.promote_raidable(&profile) }
+            }
             ("upgradeFacility", _) => match body["facility"].as_str().and_then(progression::Facility::parse) {
                 Some(f) => db.upgrade_facility(&profile, f, now).map(|_| ()),
                 None => Err("Unknown facility".into()),

@@ -93,7 +93,11 @@ impl Facility {
     pub fn cost(&self, level: u32) -> u32 { self.base_cost() * level * level }
 
     /// What the facility does at `level`, in words.
-    pub fn effect(&self, level: u32) -> String {
+    #[cfg(test)]
+    pub fn effect(&self, level: u32) -> String { self.effect_for(level, false) }
+
+    /// What the facility does at `level` for a Safe or Raidable operator.
+    pub fn effect_for(&self, level: u32, raidable: bool) -> String {
         match self {
             Facility::Storage => format!("+{} stash slots", storage_bonus(level)),
             Facility::Armory => match armory_powers(level).last() {
@@ -102,7 +106,9 @@ impl Facility {
             },
             Facility::Office => format!("Insurance {}% of gear value", (insurance_rate(level, 0) * 100.0).round()),
             Facility::Workshop => if level == 0 { "Idle".into() } else {
-                format!("${}/hr, holds {}h", workshop_rate(level), WORKSHOP_HOURS)
+                let rate = workshop_rate_for(level, raidable);
+                if raidable { format!("${rate}/hr (+15% Raidable), holds {WORKSHOP_HOURS}h") }
+                else { format!("${rate}/hr, holds {WORKSHOP_HOURS}h") }
             },
         }
     }
@@ -126,6 +132,8 @@ pub fn insurance_rate(office: u32, broker: u32) -> f64 {
 }
 
 pub const WORKSHOP_HOURS: u32 = 48;
+/// Extra Workshop income rate for Raidable operators (+15% risk dividend).
+pub const RAIDABLE_WORKSHOP_BONUS: f64 = 0.15;
 pub const RESPEC_COST: u32 = 1_000;
 /// Earn one selected piece of gear after this much extracted activity on a map.
 pub const REQUISITION_COST: u32 = 120;
@@ -133,10 +141,19 @@ pub const REQUISITION_COST: u32 = 120;
 /// Cash per hour the Workshop makes at `level`.
 pub fn workshop_rate(level: u32) -> u32 { 60 * level }
 
+/// Cash per hour the Workshop makes for a Safe or Raidable operator.
+pub fn workshop_rate_for(level: u32, raidable: bool) -> u32 {
+    if raidable { (workshop_rate(level) as f64 * (1.0 + RAIDABLE_WORKSHOP_BONUS)).round() as u32 }
+    else { workshop_rate(level) }
+}
+
 /// Cash waiting in the Workshop after `secs` since the last collection.
-pub fn workshop_stored(level: u32, secs: i64) -> u32 {
+#[cfg(test)]
+pub fn workshop_stored(level: u32, secs: i64) -> u32 { workshop_stored_for(level, false, secs) }
+
+pub fn workshop_stored_for(level: u32, raidable: bool, secs: i64) -> u32 {
     let hours = (secs.max(0) as f64 / 3600.0).min(WORKSHOP_HOURS as f64);
-    (hours * workshop_rate(level) as f64).floor() as u32
+    (hours * workshop_rate_for(level, raidable) as f64).floor() as u32
 }
 
 // ---------- Operations ----------

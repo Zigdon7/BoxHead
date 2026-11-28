@@ -150,8 +150,11 @@ impl OperatorContext {
     pub fn raid_boost(&self) -> gear::RaidBoost {
         gear::RaidBoost { max_health: self.perks.health_bonus(), damage: self.perks.damage_mult() - 1.0 }
     }
+    pub fn workshop_rate(&self) -> u32 {
+        prog::workshop_rate_for(self.facility(Facility::Workshop), self.raidable)
+    }
     pub fn workshop_stored(&self, now: i64) -> u32 {
-        prog::workshop_stored(self.facility(Facility::Workshop), now - self.produced_at)
+        prog::workshop_stored_for(self.facility(Facility::Workshop), self.raidable, now - self.produced_at)
     }
 }
 
@@ -327,9 +330,9 @@ impl Database {
             UPDATE operators SET account = substr(profile, 6) WHERE account IS NULL AND profile LIKE 'user:%';
         ").map_err(|e| format!("Failed to create progression schema: {}", e))?;
         let _ = conn.execute("ALTER TABLE operations ADD COLUMN requisition INTEGER NOT NULL DEFAULT 0", []);
-        // Matchmaking: the platform a session signed in with, and the account's cross-platform opt-in.
+        // Matchmaking: the platform a session signed in with, and the account's cross-platform setting (default on).
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN platform TEXT NOT NULL DEFAULT 'direct'", []);
-        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN crossplay INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN crossplay INTEGER NOT NULL DEFAULT 1", []);
         // Email confirmation. Accounts from before it existed count as confirmed.
         let _ = conn.execute("ALTER TABLE email_credentials ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1", []);
         conn.execute_batch("
@@ -342,7 +345,7 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS sessions_by_user ON sessions(user_id);
         ").map_err(|e| format!("Failed to create auth schema: {}", e))?;
-        conn.execute_batch(siege_store::SCHEMA).map_err(|e| format!("Failed to create base schema: {}", e))?;
+        siege_store::migrate(&conn)?;
 
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -976,19 +979,36 @@ impl Database {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         Self::not_in_raid(&tx, profile)?;
         let ctx = Self::context_in(&tx, profile, now);
-        let rate = prog::workshop_rate(ctx.facility(Facility::Workshop));
+        let rate = ctx.workshop_rate();
         if rate == 0 { return Ok(0); }
         let made = ctx.workshop_stored(now);
         if made > 0 {
-            let seconds_per_dollar = 3600 / rate as i64;
             let elapsed = (now - ctx.produced_at).max(0);
             let collected_at = if elapsed >= prog::WORKSHOP_HOURS as i64 * 3600 {
-                now - elapsed % seconds_per_dollar
-            } else { ctx.produced_at + made as i64 * seconds_per_dollar };
+                now
+            } else { ctx.produced_at + (made as i64 * 3600) / rate as i64 };
             tx.execute("UPDATE operators SET cash = cash + ?1, produced_at = ?2 WHERE profile = ?3", params![made, collected_at, profile]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(made)
+    }
+
+    /// Permanently opt a Safe operator into Raidable (one-way promotion).
+    pub fn promote_raidable(&self, profile: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        Self::not_in_raid(&tx, profile)?;
+        let raidable: i32 = tx.query_row("SELECT raidable FROM operators WHERE profile = ?1", params![profile], |r| r.get(0))
+            .map_err(|_| "No operator for this profile".to_string())?;
+        if raidable != 0 { return Err("This operator is already Raidable.".into()); }
+        tx.execute("UPDATE operators SET raidable = 1 WHERE profile = ?1", params![profile]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn unread_base_defenses(&self, profile: &str) -> u32 {
+        let conn = self.conn.lock().unwrap();
+        Self::unread_base_defenses_in(&conn, profile)
     }
 
     pub fn account_state(&self, user: &str) -> AccountState {
@@ -1013,6 +1033,7 @@ impl Database {
         let materials: u32 = conn.query_row("SELECT material_investment FROM operators WHERE profile = ?1", params![profile], |r| r.get(0)).unwrap_or(0);
         materials + (2..=ctx.tier).filter_map(prog::tier_cost).map(|c| c.cash).sum::<u32>()
             + FACILITIES.iter().map(|&f| (1..=ctx.facility(f)).map(|l| f.cost(l)).sum::<u32>()).sum::<u32>()
+            + Self::base_structure_investment(conn, profile)
     }
 
     fn value_in(conn: &Connection, profile: &str) -> u32 {
@@ -1213,7 +1234,7 @@ impl Database {
         if token.is_empty() { return None; }
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT s.user_id, s.platform, COALESCE(a.crossplay, 0) FROM sessions s
+            "SELECT s.user_id, s.platform, COALESCE(a.crossplay, 1) FROM sessions s
              LEFT JOIN accounts a ON a.user_id = s.user_id
              WHERE s.token = ?1 AND s.expires_at > datetime('now')",
             params![token],
@@ -1889,7 +1910,7 @@ mod stash_tests {
         let cash = db.operator(&op).unwrap().cash;
         db.upgrade_facility(&op, Facility::Workshop, 1_000).unwrap();
         assert_eq!(db.operator(&op).unwrap().cash, cash - Facility::Workshop.cost(1));
-        assert_eq!(db.collect_workshop(&op, 1_000 + 2 * 3600).unwrap(), 2 * prog::workshop_rate(1));
+        assert_eq!(db.collect_workshop(&op, 1_000 + 2 * 3600).unwrap(), 2 * prog::workshop_rate_for(1, true));
         assert_eq!(db.collect_workshop(&op, 1_000 + 2 * 3600).unwrap(), 0, "collected already");
         assert_eq!(db.collect_workshop(&db.create_operator(&user, "Idle", false, 0).unwrap(), 99_999).unwrap(), 0);
     }
@@ -2123,12 +2144,12 @@ mod stash_tests {
         let user = db.find_or_create_user("steam", "765", "Gabe", "Gabe").unwrap();
         let steam = db.create_session(&user, "steam").unwrap();
         let web = db.create_session(&user, "direct").unwrap();
-        assert_eq!(db.session_matchmaking(&steam), Some((user.clone(), "steam".into(), false)));
+        assert_eq!(db.session_matchmaking(&steam), Some((user.clone(), "steam".into(), true)));
         assert_eq!(db.session_matchmaking(&web).unwrap().1, "direct", "the same account can sign in on another platform");
-        db.set_crossplay(&user, true).unwrap();
-        assert!(db.session_matchmaking(&steam).unwrap().2 && db.session_matchmaking(&web).unwrap().2, "cross-play is per account");
         db.set_crossplay(&user, false).unwrap();
-        assert!(!db.session_matchmaking(&steam).unwrap().2);
+        assert!(!db.session_matchmaking(&steam).unwrap().2 && !db.session_matchmaking(&web).unwrap().2, "cross-play is per account");
+        db.set_crossplay(&user, true).unwrap();
+        assert!(db.session_matchmaking(&steam).unwrap().2);
         assert_eq!(db.session_matchmaking("bogus"), None);
         assert_eq!(db.session_matchmaking(""), None);
     }

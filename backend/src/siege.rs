@@ -35,17 +35,32 @@ pub const WAVE_GAP: u32 = 8 * TICKS_PER_SEC;
 /// Time between soldiers of one wave stepping through the entrance.
 pub const SPAWN_GAP: u32 = 5;
 /// Garrison soldiers are dug in: this much more health than the same soldier attacking.
-pub const GUARD_HP_MULT: f32 = 1.5;
+pub const GUARD_HP_MULT: f32 = 1.25;
 pub const MINE_DAMAGE: u32 = 130;
 pub const MINE_RADIUS: f32 = 1.5;
 
 /// Share of the defender's cash a raid can take, and the most it can ever take.
 pub const LOOT_SHARE: f64 = 0.20;
 pub const LOOT_CAP: u32 = 15_000;
+/// Share of stolen cash burnt as raid logistics/fencing cost (prevents ping-pong laundering).
+pub const LOOT_BURN_SHARE: f64 = 0.15;
+/// Share of dead attackers' purchase price salvaged by the defender when the HQ survives.
+pub const DEFENDER_SALVAGE_SHARE: f64 = 0.30;
+/// System contract payout when destroying an HQ on a defended base, capped per tier.
+pub const CONTRACT_SHARE: f64 = 0.25;
+pub const CONTRACT_CAP_PER_TIER: u32 = 600;
 /// Operators with less cash than this aren't offered as targets: nothing to take.
 pub const MIN_TARGET_CASH: u32 = 500;
 /// After being raided a base can't be raided again for this long.
 pub const SHIELD_SECS: i64 = 8 * 3600;
+/// One account can't raid the same rival account again for this long, even if shields drop.
+pub const PAIR_COOLDOWN_SECS: i64 = 24 * 3600;
+/// Maximum Homefront tier difference allowed when scouting targets.
+pub const MAX_TIER_GAP: u32 = 1;
+/// Escalating fee for re-scouting before launching a raid (first scout is free).
+pub const SCOUT_FEES: [u32; 4] = [0, 50, 150, 400];
+/// Cash refunded when selling spare owned base equipment or reserve soldiers.
+pub const SELL_REFUND_RATE: f64 = 0.50;
 /// Raid logs kept per operator, per side.
 pub const LOG_KEEP: u32 = 30;
 
@@ -90,6 +105,8 @@ pub struct Combat {
     pub speed: f32,
     /// Damage multiplier against turrets, towers and the HQ.
     pub structure_mult: f32,
+    /// Damage multiplier against garrisoned soldiers.
+    pub infantry_mult: f32,
     /// How far around itself a soldier clears the fog, in cells.
     pub sight: i32,
     /// Room a soldier takes in a wave.
@@ -113,14 +130,14 @@ impl Kind {
     }
     pub fn blurb(&self) -> &'static str {
         match self {
-            Kind::Wall => "Blocks the way. Can't be destroyed, so it can never seal the HQ off.",
-            Kind::Turret => "Fast, short-range gun. Blocks the way until it is destroyed.",
-            Kind::Sniper => "Slow, hard-hitting shots across half the map.",
-            Kind::Mine => "Hidden until stepped on, then hurts everyone close by. One use per raid.",
-            Kind::Rifleman => "Steady all-rounder.",
-            Kind::Scout => "Fast and fragile. Clears twice as much fog.",
+            Kind::Wall => "Blocks movement and line of sight. Indestructible, so it can never seal the HQ off.",
+            Kind::Turret => "Fast, short-range gun. Blocks movement until destroyed; needs clear line of sight.",
+            Kind::Sniper => "Slow, hard-hitting shots down open firing lanes.",
+            Kind::Mine => "Hidden until stepped on, then hurts everyone close by. Scouts can disarm it.",
+            Kind::Rifleman => "Steady all-rounder. Deals 50% bonus damage to garrison soldiers.",
+            Kind::Scout => "Fast and fragile. Clears twice as much fog to spot targets and disarms mines.",
             Kind::Heavy => "Slow, tough, leads the wave and soaks up fire.",
-            Kind::Grenadier => "Wrecks turrets, towers and the HQ.",
+            Kind::Grenadier => "Prioritizes turrets, towers and the HQ for 2.5× structure damage.",
         }
     }
     pub fn is_soldier(&self) -> bool { SOLDIERS.contains(self) }
@@ -134,15 +151,17 @@ impl Kind {
     }
     /// How it fights. Walls and mines don't.
     pub fn combat(&self) -> Option<Combat> {
-        let c = |hp, range, damage, cooldown, speed, structure_mult, sight, supply| Combat { hp, range, damage, cooldown, speed, structure_mult, sight, supply };
+        let c = |hp, range, damage, cooldown, speed, structure_mult, infantry_mult, sight, supply| Combat {
+            hp, range, damage, cooldown, speed, structure_mult, infantry_mult, sight, supply,
+        };
         Some(match self {
             Kind::Wall | Kind::Mine => return None,
-            Kind::Turret => c(300.0, 3.5, 7, 3, 0.0, 1.0, 0, 0),
-            Kind::Sniper => c(200.0, 6.0, 45, 24, 0.0, 1.0, 0, 0),
-            Kind::Rifleman => c(120.0, 3.0, 10, 5, 1.6, 1.0, 1, 1),
-            Kind::Scout => c(70.0, 2.0, 5, 4, 2.8, 1.0, 2, 1),
-            Kind::Heavy => c(420.0, 1.6, 16, 8, 1.2, 1.0, 1, 2),
-            Kind::Grenadier => c(110.0, 2.8, 30, 15, 1.4, 2.5, 1, 2),
+            Kind::Turret => c(300.0, 3.5, 7, 3, 0.0, 1.0, 1.0, 0, 0),
+            Kind::Sniper => c(200.0, 6.0, 45, 24, 0.0, 1.0, 1.0, 0, 0),
+            Kind::Rifleman => c(120.0, 3.0, 10, 5, 1.6, 1.0, 1.5, 1, 1),
+            Kind::Scout => c(70.0, 2.0, 5, 4, 2.8, 1.0, 1.0, 2, 1),
+            Kind::Heavy => c(420.0, 1.6, 16, 8, 1.2, 1.0, 1.0, 1, 2),
+            Kind::Grenadier => c(110.0, 2.8, 30, 15, 1.4, 2.5, 1.0, 1, 2),
         })
     }
     /// Most of this equipment a base of `tier` can have placed. Garrison
@@ -171,6 +190,35 @@ pub fn loot_pool(cash: u32) -> u32 { ((cash as f64 * LOOT_SHARE).floor() as u32)
 pub fn loot_for(cash: u32, hq_damage: f64, destroyed: bool) -> u32 {
     let share = if destroyed { 1.0 } else { 0.5 * hq_damage.clamp(0.0, 1.0) };
     ((loot_pool(cash) as f64 * share).floor() as u32).min(cash)
+}
+/// Net cash the attacker receives from stolen loot after the fencing burn.
+pub fn attacker_loot(defender_loss: u32) -> u32 {
+    ((defender_loss as f64 * (1.0 - LOOT_BURN_SHARE)).floor() as u32).min(defender_loss)
+}
+/// Cash the defender salvages from dead attackers when the HQ survives.
+pub fn defender_salvage(lost: &Counts, destroyed: bool) -> u32 {
+    if destroyed { return 0; }
+    let lost_value: u32 = lost.iter().map(|(k, n)| n * k.price()).sum();
+    (lost_value as f64 * DEFENDER_SALVAGE_SHARE).floor() as u32
+}
+/// System contract bonus for destroying the HQ of a genuinely defended base.
+pub fn contract_bonus(layout: &Layout, tier: u32, destroyed: bool) -> u32 {
+    if !destroyed { return 0; }
+    let defense_value: u32 = layout.pieces.iter().map(|p| p.kind.price()).sum();
+    if defense_value == 0 { return 0; }
+    ((defense_value as f64 * CONTRACT_SHARE).floor() as u32).min(tier.clamp(1, 4) * CONTRACT_CAP_PER_TIER)
+}
+/// Fee to scout a target given how many consecutive scouts were used without raiding.
+pub fn scout_fee(streak: u32) -> u32 {
+    SCOUT_FEES[(streak as usize).min(SCOUT_FEES.len() - 1)]
+}
+/// Cash refunded when selling `count` spare pieces or reserve soldiers.
+pub fn sell_refund(kind: Kind, count: u32) -> u32 {
+    ((kind.price() * count) as f64 * SELL_REFUND_RATE).floor() as u32
+}
+/// Value of permanent base structures owned (counted in seasonal retirement value).
+pub fn structure_value(owned: &Counts) -> u32 {
+    KINDS.iter().filter(|k| !k.is_soldier()).map(|&k| owned.get(k) * k.price()).sum()
 }
 
 /// A count of each kind: what's owned, what a wave holds, what was lost.
@@ -445,6 +493,7 @@ struct Defense {
 struct Mine {
     cell: usize,
     blown: Option<u32>,
+    disarmed: Option<u32>,
 }
 
 struct Blast {
@@ -475,6 +524,25 @@ fn center(cell: usize) -> (f32, f32) {
     (x as f32 + 0.5, y as f32 + 0.5)
 }
 
+/// True when no wall cell lies strictly between `a` and `b`.
+fn has_los(wall_grid: &[bool], a: (f32, f32), b: (f32, f32)) -> bool {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let dist = f32::hypot(dx, dy);
+    if dist <= 1.0 { return true; }
+    let start = cell_of((a.0.floor() as usize).min(GRID - 1), (a.1.floor() as usize).min(GRID - 1));
+    let end = cell_of((b.0.floor() as usize).min(GRID - 1), (b.1.floor() as usize).min(GRID - 1));
+    let steps = (dist * 8.0).ceil() as usize;
+    for s in 1..steps {
+        let f = s as f32 / steps as f32;
+        let x = (a.0 + dx * f).floor() as isize;
+        let y = (a.1 + dy * f).floor() as isize;
+        if x < 0 || y < 0 || x >= GRID as isize || y >= GRID as isize { continue; }
+        let c = cell_of(x as usize, y as usize);
+        if c != start && c != end && wall_grid[c] { return false; }
+    }
+    true
+}
+
 fn reveal(seen: &mut [Option<u32>], cell: usize, sight: i32, tick: u32) {
     let (cx, cy) = xy_of(cell);
     for dy in -sight..=sight {
@@ -483,6 +551,17 @@ fn reveal(seen: &mut [Option<u32>], cell: usize, sight: i32, tick: u32) {
             if x < 0 || y < 0 || x >= GRID as i32 || y >= GRID as i32 { continue; }
             let c = cell_of(x as usize, y as usize);
             if seen[c].is_none() { seen[c] = Some(tick); }
+        }
+    }
+}
+
+fn disarm_nearby_mines(mines: &mut [Mine], cell: usize, tick: u32) {
+    let (sx, sy) = xy_of(cell);
+    for m in mines.iter_mut() {
+        if m.blown.is_some() || m.disarmed.is_some() { continue; }
+        let (mx, my) = xy_of(m.cell);
+        if sx.abs_diff(mx) <= 1 && sy.abs_diff(my) <= 1 {
+            m.disarmed = Some(tick);
         }
     }
 }
@@ -497,14 +576,15 @@ pub fn simulate(base: &Snapshot, plan: &Plan) -> Battle {
     let hq_at = center(hq);
 
     let mut blocked = base.layout.blocked();
+    let mut wall_grid = vec![false; CELLS];
     let mut dist = distances(&blocked, hq);
     let mut walls = Vec::new();
     let mut defenses = Vec::new();
     let mut mines = Vec::new();
     for p in &base.layout.pieces {
         match (p.kind, p.kind.combat()) {
-            (Kind::Wall, _) => walls.push(p.cell()),
-            (Kind::Mine, _) => mines.push(Mine { cell: p.cell(), blown: None }),
+            (Kind::Wall, _) => { walls.push(p.cell()); wall_grid[p.cell()] = true; }
+            (Kind::Mine, _) => mines.push(Mine { cell: p.cell(), blown: None, disarmed: None }),
             (kind, Some(c)) => {
                 let hp = if kind.is_soldier() { c.hp * GUARD_HP_MULT } else { c.hp };
                 defenses.push(Defense { kind, cell: p.cell(), c, hp, max_hp: hp, cd: 0, destroyed: None });
@@ -545,6 +625,7 @@ pub fn simulate(base: &Snapshot, plan: &Plan) -> Battle {
             t.spawned = true;
             t.points.push((tick, t.cell as u16));
             reveal(&mut seen, t.cell, t.c.sight, tick);
+            if t.kind == Kind::Scout { disarm_nearby_mines(&mut mines, t.cell, tick); }
         }
 
         // March: always toward a neighbour that is closer to the HQ.
@@ -571,13 +652,14 @@ pub fn simulate(base: &Snapshot, plan: &Plan) -> Battle {
                 (t.x, t.y, t.cell, t.next) = (nx, ny, next, None);
                 t.points.push((tick, next as u16));
                 reveal(&mut seen, next, t.c.sight, tick);
-                arrivals.push(next);
+                if t.kind == Kind::Scout { disarm_nearby_mines(&mut mines, next, tick); }
+                else { arrivals.push(next); }
             }
         }
 
-        // Mines go off under the first soldier to step on them.
+        // Mines go off under the first non-Scout soldier to step on an armed mine.
         for cell in arrivals {
-            let Some(mine) = mines.iter_mut().find(|m| m.cell == cell && m.blown.is_none()) else { continue };
+            let Some(mine) = mines.iter_mut().find(|m| m.cell == cell && m.blown.is_none() && m.disarmed.is_none()) else { continue };
             mine.blown = Some(tick);
             let (mx, my) = center(cell);
             let mut hits = Vec::new();
@@ -591,17 +673,24 @@ pub fn simulate(base: &Snapshot, plan: &Plan) -> Battle {
             blasts.push(Blast { tick, cell, hits });
         }
 
-        // Soldiers shoot the nearest gun in reach, or the HQ when no gun is.
+        // Soldiers shoot revealed defenses in reach with clear wall LOS, or the HQ.
+        // Grenadiers prioritize structures (turrets/snipers) over garrison infantry.
         let mut reopened = false;
         for (i, t) in troops.iter_mut().enumerate().filter(|(_, t)| t.alive()) {
             if t.cd > 0 { t.cd -= 1; continue; }
-            let target = defenses.iter().enumerate().filter(|(_, d)| d.destroyed.is_none())
-                .map(|(j, d)| { let (dx, dy) = center(d.cell); (f32::hypot(dx - t.x, dy - t.y), j) })
-                .filter(|&(gap, _)| gap <= t.c.range)
-                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            if let Some((_, j)) = target {
+            let prefer_structures = t.kind == Kind::Grenadier;
+            let target = defenses.iter().enumerate()
+                .filter(|(_, d)| d.destroyed.is_none() && seen[d.cell].is_some())
+                .filter_map(|(j, d)| {
+                    let dc = center(d.cell);
+                    let gap = f32::hypot(dc.0 - t.x, dc.1 - t.y);
+                    (gap <= t.c.range && has_los(&wall_grid, (t.x, t.y), dc)).then_some((prefer_structures && d.kind.is_soldier(), gap, j))
+                })
+                .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
+            if let Some((_, _, j)) = target {
                 let d = &mut defenses[j];
-                let dmg = if d.kind.is_soldier() { t.c.damage } else { (t.c.damage as f32 * t.c.structure_mult).round() as u32 };
+                let mult = if d.kind.is_soldier() { t.c.infantry_mult } else { t.c.structure_mult };
+                let dmg = (t.c.damage as f32 * mult).round() as u32;
                 d.hp -= dmg as f32;
                 shots.push((tick, i as i32, DEFENSE_ID + j as i32, dmg));
                 if d.hp <= 0.0 {
@@ -609,7 +698,7 @@ pub fn simulate(base: &Snapshot, plan: &Plan) -> Battle {
                     if d.kind.blocks() { blocked[d.cell] = false; reopened = true; }
                 }
                 t.cd = t.c.cooldown;
-            } else if f32::hypot(hq_at.0 - t.x, hq_at.1 - t.y) <= t.c.range && hq_left > 0.0 {
+            } else if f32::hypot(hq_at.0 - t.x, hq_at.1 - t.y) <= t.c.range && hq_left > 0.0 && has_los(&wall_grid, (t.x, t.y), hq_at) {
                 let dmg = (t.c.damage as f32 * t.c.structure_mult).round() as u32;
                 hq_left -= dmg as f32;
                 shots.push((tick, i as i32, HQ_ID, dmg));
@@ -618,12 +707,12 @@ pub fn simulate(base: &Snapshot, plan: &Plan) -> Battle {
         }
         if reopened { dist = distances(&blocked, hq); }
 
-        // Guns shoot whoever in reach is closest to the HQ.
+        // Guns shoot whoever in reach (with clear wall LOS) is closest to the HQ.
         for (j, d) in defenses.iter_mut().enumerate().filter(|(_, d)| d.destroyed.is_none()) {
             if d.cd > 0 { d.cd -= 1; continue; }
-            let (dx, dy) = center(d.cell);
+            let dc = center(d.cell);
             let target = troops.iter().enumerate().filter(|(_, t)| t.alive())
-                .filter(|(_, t)| f32::hypot(t.x - dx, t.y - dy) <= d.c.range)
+                .filter(|(_, t)| f32::hypot(t.x - dc.0, t.y - dc.1) <= d.c.range && has_los(&wall_grid, dc, (t.x, t.y)))
                 .min_by_key(|(i, t)| (dist[t.cell], *i)).map(|(i, _)| i);
             let Some(i) = target else { continue };
             let t = &mut troops[i];
@@ -667,6 +756,7 @@ pub struct ReplayDefense {
 pub struct ReplayMine {
     pub cell: usize,
     pub blown: Option<u32>,
+    pub disarmed: Option<u32>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -737,8 +827,9 @@ impl Battle {
                 id: DEFENSE_ID + j as i32, kind: d.kind, cell: d.cell, hp: d.max_hp.round() as u32,
                 seen: self.seen[d.cell], destroyed: d.destroyed,
             }).collect(),
-            // A mine stays hidden until it goes off, even on a square in plain view.
-            mines: self.mines.iter().filter(|m| !fog || m.blown.is_some()).map(|m| ReplayMine { cell: m.cell, blown: m.blown }).collect(),
+            // A mine stays hidden until it goes off or a Scout disarms it.
+            mines: self.mines.iter().filter(|m| !fog || m.blown.is_some() || m.disarmed.is_some())
+                .map(|m| ReplayMine { cell: m.cell, blown: m.blown, disarmed: m.disarmed }).collect(),
             troops: self.troops.iter().enumerate().filter(|(_, t)| t.spawned).map(|(i, t)| ReplayTroop {
                 id: i as i32, kind: t.kind, wave: t.wave, hp: t.c.hp.round() as u32, points: t.points.clone(), died: t.died,
             }).collect(),
@@ -764,7 +855,7 @@ pub fn catalog_json(tier: u32) -> serde_json::Value {
             "hp": c.map(|c| c.hp), "range": c.map(|c| c.range),
             "dps": c.map(|c| (c.damage as f32 * TICKS_PER_SEC as f32 / (c.cooldown + 1) as f32).round()),
             "speed": c.map(|c| c.speed), "supply": c.map(|c| c.supply), "sight": c.map(|c| c.sight),
-            "structureMult": c.map(|c| c.structure_mult),
+            "structureMult": c.map(|c| c.structure_mult), "infantryMult": c.map(|c| c.infantry_mult),
         })
     }).collect();
     let sites: Vec<serde_json::Value> = SITES.iter().map(|s| serde_json::json!({
@@ -775,7 +866,12 @@ pub fn catalog_json(tier: u32) -> serde_json::Value {
         "guardCap": guard_cap(tier), "waveSupply": wave_supply(tier), "hqHp": hq_hp(tier),
         "guardHpMult": GUARD_HP_MULT, "mineDamage": MINE_DAMAGE, "mineRadius": MINE_RADIUS,
         "waveGapSecs": WAVE_GAP / TICKS_PER_SEC, "maxSecs": MAX_TICKS / TICKS_PER_SEC,
-        "lootShare": LOOT_SHARE, "lootCap": LOOT_CAP, "minTargetCash": MIN_TARGET_CASH, "shieldSecs": SHIELD_SECS,
+        "lootShare": LOOT_SHARE, "lootCap": LOOT_CAP, "lootBurnShare": LOOT_BURN_SHARE,
+        "defenderSalvageShare": DEFENDER_SALVAGE_SHARE, "contractShare": CONTRACT_SHARE,
+        "contractCap": tier.clamp(1, 4) * CONTRACT_CAP_PER_TIER,
+        "minTargetCash": MIN_TARGET_CASH, "shieldSecs": SHIELD_SECS,
+        "pairCooldownSecs": PAIR_COOLDOWN_SECS, "maxTierGap": MAX_TIER_GAP,
+        "scoutFees": SCOUT_FEES, "sellRefundRate": SELL_REFUND_RATE,
     })
 }
 
@@ -947,13 +1043,89 @@ mod tests {
     }
 
     #[test]
-    fn mines_hit_everyone_nearby_once() {
+    fn mines_hit_everyone_nearby_once_and_scouts_disarm_them() {
         let (ex, ey) = xy_of(Site::West.entrances()[1]);
         let b = base(Site::West, vec![piece(Kind::Mine, ex as u8 - 1, ey as u8)], 1);
-        let battle = simulate(&b, &plan([&[(Kind::Scout, 2)], &[], &[]], [1, 1, 1]));
+        let battle = simulate(&b, &plan([&[(Kind::Rifleman, 2)], &[], &[]], [1, 1, 1]));
         assert_eq!(battle.blasts.len(), 1);
-        assert!(battle.outcome.lost.get(Kind::Scout) >= 1, "a mine kills a scout outright");
+        assert!(battle.outcome.lost.get(Kind::Rifleman) >= 1, "a mine kills a rifleman outright");
         assert!(battle.mines[0].blown.is_some());
+
+        // A Scout sweeps nearby mines harmlessly without triggering a blast.
+        let sweep = simulate(&b, &plan([&[(Kind::Scout, 1)], &[], &[]], [1, 1, 1]));
+        assert!(sweep.blasts.is_empty(), "scouts disarm mines instead of detonating them");
+        assert!(sweep.mines[0].disarmed.is_some() && sweep.mines[0].blown.is_none());
+        assert_eq!(sweep.outcome.lost.total(), 0);
+        assert_eq!(sweep.replay(true).mines.len(), 1, "disarmed mines appear in the attacker's replay");
+    }
+
+    #[test]
+    fn walls_block_line_of_sight_and_soldiers_only_shoot_revealed_defenses() {
+        // A sniper tower tucked behind a solid wall line cannot shoot attackers on the other side.
+        let mut pieces: Vec<Piece> = (5..=11u8).map(|y| piece(Kind::Wall, 9, y)).collect();
+        pieces.push(piece(Kind::Sniper, 7, 8));
+        let b = base(Site::West, pieces, 2);
+        let wall_grid = {
+            let mut g = vec![false; CELLS];
+            for p in &b.layout.pieces { if p.kind == Kind::Wall { g[p.cell()] = true; } }
+            g
+        };
+        assert!(!has_los(&wall_grid, center(cell_of(7, 8)), center(cell_of(11, 8))), "wall at x=9 blocks LOS");
+        assert!(has_los(&wall_grid, center(cell_of(7, 8)), center(cell_of(7, 4))), "open lane has LOS");
+        // With walls from y=0..=15 at x=9, a Sniper at (7,8) can NEVER shoot a Heavy walking down to (9,16)
+        // while the Heavy is east of the wall within y <= 14.
+        let mut full_wall: Vec<Piece> = (0..=15u8).map(|y| piece(Kind::Wall, 9, y)).collect();
+        full_wall.push(piece(Kind::Sniper, 7, 8));
+        let b_wall = base(Site::West, full_wall, 2);
+        let w_battle = simulate(&b_wall, &plan([&[(Kind::Heavy, 1)], &[], &[]], [1, 1, 1]));
+        let reached_gap = w_battle.troops[0].points.iter()
+            .find(|&&(_, c)| c as usize == cell_of(9, 16))
+            .map(|&(t, _)| t).expect("heavy walked to the gap");
+        assert!(w_battle.shots.iter().filter(|&&(_, from, _, _)| from == DEFENSE_ID).all(|&(t, _, _, _)| t > reached_gap),
+            "sniper cannot shoot through the solid wall before heavy rounds the gap");
+
+        // Sight-gated targeting: a turret 2 squares off the path isn't shot by a Rifleman alone (sight 1)
+        // before it's revealed, whereas a Scout (sight 2) reveals it earlier so Riflemen engage immediately.
+        let off_path = base(Site::West, vec![piece(Kind::Turret, 10, 6)], 1);
+        let no_scout = simulate(&off_path, &plan([&[(Kind::Rifleman, 2)], &[], &[]], [1, 1, 1]));
+        let with_scout = simulate(&off_path, &plan([&[(Kind::Rifleman, 2), (Kind::Scout, 1)], &[], &[]], [1, 1, 1]));
+        assert!(no_scout.replay(true).defenses.is_empty(), "without a scout, a turret 2 cells off-path stays unseen and unshot");
+        assert_eq!(with_scout.replay(true).defenses.len(), 1, "a scout spots the turret 2 cells off-path");
+        assert!(with_scout.shots.iter().any(|&(_, from, to, _)| from >= 0 && from < DEFENSE_ID && to == DEFENSE_ID), "revealed turret is engaged");
+    }
+
+    #[test]
+    fn grenadiers_prioritize_structures_and_riflemen_counter_garrison() {
+        // A Garrison Heavy stands nearer on the path while a Turret is slightly farther (both in reach 2.8);
+        // Grenadiers still focus the Turret first instead of getting aggro-sponged by the Heavy.
+        let b = base(Site::West, vec![piece(Kind::Heavy, 11, 8), piece(Kind::Turret, 11, 9)], 1);
+        let battle = simulate(&b, &plan([&[(Kind::Grenadier, 2), (Kind::Scout, 1)], &[], &[]], [1, 1, 1]));
+        let turret_id = DEFENSE_ID + 1;
+        let first_grenadier_shot = battle.shots.iter().find(|&&(_, from, _, _)| {
+            from >= 0 && from < DEFENSE_ID && battle.troops[from as usize].kind == Kind::Grenadier
+        }).expect("grenadier fired");
+        assert_eq!(first_grenadier_shot.2, turret_id, "grenadier prioritizes turret over nearer garrison heavy");
+
+        // Rifleman deals 1.5x damage to garrison guards (10 * 1.5 = 15).
+        let guard_only = base(Site::West, vec![piece(Kind::Heavy, 12, 8)], 1);
+        let r_battle = simulate(&guard_only, &plan([&[(Kind::Rifleman, 1)], &[], &[]], [1, 1, 1]));
+        let r_shot = r_battle.shots.iter().find(|&&(_, from, to, _)| from == 0 && to == DEFENSE_ID).expect("rifleman shot guard");
+        assert_eq!(r_shot.3, 15, "rifleman hits garrison for 1.5x damage");
+    }
+
+    #[test]
+    fn pvp_economics_burn_salvage_contract_fees_and_refunds() {
+        assert_eq!(attacker_loot(1_000), 850, "15% fencing burn on stolen loot");
+        assert_eq!(defender_salvage(&squad(&[(Kind::Heavy, 2)]), false), 90, "30% of $300 dead attackers");
+        assert_eq!(defender_salvage(&squad(&[(Kind::Heavy, 2)]), true), 0, "no salvage if HQ fell");
+        let empty = Layout::default();
+        assert_eq!(contract_bonus(&empty, 1, true), 0, "undefended base pays no contract bonus");
+        let defended = Layout { site: Site::West, pieces: vec![piece(Kind::Turret, 4, 8), piece(Kind::Turret, 4, 6)] };
+        assert_eq!(contract_bonus(&defended, 1, true), 225, "25% of $900 defenses");
+        assert_eq!(contract_bonus(&defended, 1, false), 0, "contract bonus requires destroying HQ");
+        assert_eq!([scout_fee(0), scout_fee(1), scout_fee(2), scout_fee(3), scout_fee(9)], [0, 50, 150, 400, 400]);
+        assert_eq!(sell_refund(Kind::Turret, 2), 450, "50% refund on spare pieces");
+        assert_eq!(structure_value(&squad(&[(Kind::Turret, 2), (Kind::Wall, 4), (Kind::Heavy, 3)])), 1_000, "only permanent structures count");
     }
 
     #[test]

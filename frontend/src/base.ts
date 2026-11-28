@@ -8,13 +8,16 @@ import {
   BaseState, Counts, Kind, Layout, Replay, Rules, SiteId, RaidLog,
   ENTRANCE_NAMES, SOLDIERS, WAVES, HQ_ID, HIDDEN_ID,
   kindInfo, siteInfo, cellOf, xyOf, routes, placed, guardsPlaced, roomFor, layoutProblem, supplyOf, totalOf,
-  saveCost, reserve, sameLayout, sameWaves, moveSite, troopAt, damageAt, revealedAt, outcomeLine, shortDuration, ago,
+  saveCost, reserve, spareOf, starterBlueprint, sampleWaves, sameLayout, sameWaves, moveSite,
+  troopAt, damageAt, revealedAt, outcomeLine, shortDuration, ago,
 } from './siege';
 
 export interface BaseDeps {
   auth: () => { token: string };
   /** Cash changed: the rest of the hideout should reload. */
   onCash: () => void;
+  /** Unread incoming defense raid count changed. */
+  onUnread?: (count: number) => void;
   error: (msg: string) => void;
   note: (msg: string) => void;
 }
@@ -33,6 +36,12 @@ interface Playback {
   title: string;
   /** Shown when the replay ends. */
   result: string;
+}
+
+interface PendingRaid {
+  state: BaseState;
+  raid: { defender: string; loot: number; payout: number; contractBonus: number; salvage: number };
+  line: string;
 }
 
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text?: string): HTMLElementTagNameMap[K] => {
@@ -58,6 +67,7 @@ const plural = (name: string, n: number) => {
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 const SITE_GRID: (SiteId | null)[] = ['northWest', 'north', 'northEast', 'west', null, 'east', 'southWest', 'south', 'southEast'];
 const SITE_SHORT: Record<SiteId, string> = { northWest: 'NW', north: 'N', northEast: 'NE', west: 'W', east: 'E', southWest: 'SW', south: 'S', southEast: 'SE' };
+const TOOL_KEYS: Kind[] = ['wall', 'turret', 'sniper', 'mine', 'rifleman', 'scout', 'heavy', 'grenadier'];
 const GROUND = '#161910';
 const CONCRETE = '#7d7f6c';
 
@@ -137,14 +147,16 @@ export class BaseView {
   /** Entrance (0-2) each wave uses, for practice and for raids. */
   entrances = [0, 1, 2];
   playback: Playback | null = null;
-  lastRaid: { defender: string; loot: number; line: string } | null = null;
+  lastRaid: { defender: string; loot: number; payout: number; contractBonus: number; line: string } | null = null;
   busy = false;
   visible = false;
 
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private hover: number | null = null;
+  private cursor: number | null = null;
   private painting: 'place' | 'erase' | null = null;
+  private pendingRaid: PendingRaid | null = null;
   private raf = 0;
   private lastFrame = 0;
   private limitNote = '';
@@ -155,6 +167,7 @@ export class BaseView {
     document.querySelectorAll<HTMLButtonElement>('[data-base-tab]').forEach(btn => btn.addEventListener('click', () => {
       this.tab = btn.dataset.baseTab as BaseTab;
       this.stopReplay();
+      if (this.tab === 'log' && (this.state?.unreadDefenses ?? 0) > 0) void this.ackDefenses();
       this.render();
     }));
     new ResizeObserver(() => this.resize()).observe(this.q('baseCanvasWrap'));
@@ -162,6 +175,8 @@ export class BaseView {
     this.canvas.addEventListener('pointerdown', e => this.pointerDown(e));
     this.canvas.addEventListener('pointermove', e => this.pointerMove(e));
     this.canvas.addEventListener('pointerleave', () => { this.hover = null; if (!this.painting) this.draw(); });
+    this.canvas.addEventListener('keydown', e => this.keyDown(e));
+    this.canvas.addEventListener('blur', () => { this.cursor = null; this.draw(); });
     const stop = () => { this.painting = null; };
     this.canvas.addEventListener('pointerup', stop);
     this.canvas.addEventListener('pointercancel', stop);
@@ -184,7 +199,9 @@ export class BaseView {
   reset() {
     this.state = null;
     this.playback = null;
+    this.pendingRaid = null;
     this.lastRaid = null;
+    this.cursor = null;
     cancelAnimationFrame(this.raf);
   }
 
@@ -199,6 +216,8 @@ export class BaseView {
     if (first || take) this.waves = [0, 1, 2].map(i => ({ ...(base.waves[i] ?? {}) }));
     const k = this.tool === 'erase' ? null : kindInfo(base.rules, this.tool);
     if (k && !k.soldier && k.cap === 0) this.tool = 'wall';
+    this.deps.onUnread?.(base.unreadDefenses ?? 0);
+    if (this.tab === 'log' && (base.unreadDefenses ?? 0) > 0) void this.ackDefenses();
     this.render();
   }
 
@@ -214,7 +233,7 @@ export class BaseView {
     }
   }
 
-  private async post(action: string, body: Record<string, unknown>, take: 'all' | 'waves' | null = null) {
+  private async post(action: string, body: Record<string, unknown>, take: 'all' | 'waves' | null = null, deferApply = false) {
     if (this.busy) return null;
     this.busy = true;
     this.deps.error('');
@@ -224,11 +243,11 @@ export class BaseView {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, ...body }),
       });
       const data = await res.json() as {
-        ok: boolean; error?: string; base?: BaseState | null; replay?: Replay; spent?: number;
-        raid?: { id: string; defender: string; loot: number };
+        ok: boolean; error?: string; base?: BaseState | null; replay?: Replay; spent?: number; earned?: number; fee?: number;
+        raid?: { id: string; defender: string; loot: number; payout?: number; contractBonus?: number; salvage?: number };
       };
       this.busy = false;
-      if (data.base) this.apply(data.base, data.ok ? take : null);
+      if (data.base && (!deferApply || !data.ok)) this.apply(data.base, data.ok ? take : null);
       if (!data.ok) { this.deps.error(data.error || 'That did not work'); return null; }
       return data;
     } catch {
@@ -236,6 +255,19 @@ export class BaseView {
       this.deps.error('Network error');
       return null;
     }
+  }
+
+  private async ackDefenses() {
+    if (!this.state || (this.state.unreadDefenses ?? 0) === 0) return;
+    this.state.unreadDefenses = 0;
+    this.deps.onUnread?.(0);
+    this.updateLogBadge();
+    const { token } = this.deps.auth();
+    try {
+      await fetch('/api/base/ack', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }),
+      });
+    } catch { /* ignore transient ack failure */ }
   }
 
   private async save() {
@@ -248,6 +280,20 @@ export class BaseView {
     if (data.spent) this.deps.onCash();
   }
 
+  private async refill() {
+    const data = await this.post('refill', {}, 'waves');
+    if (!data) return;
+    this.deps.note(data.spent ? `Refilled lost troops for ${money(data.spent)}.` : 'Restored troops from reserve.');
+    if (data.spent) this.deps.onCash();
+  }
+
+  private async sellSpare(kind: Kind, count: number) {
+    const data = await this.post('sell', { kind, count });
+    if (!data) return;
+    this.deps.note(`Sold ${count} spare ${plural(kindInfo(this.rules, kind).name, count)} for ${money(data.earned ?? 0)}.`);
+    this.deps.onCash();
+  }
+
   private revert() {
     if (!this.state) return;
     this.draft = clone(this.state.layout);
@@ -256,33 +302,69 @@ export class BaseView {
   }
 
   private async practice() {
-    if (this.waves.every(w => totalOf(w) === 0)) { this.tab = 'army'; this.render(); this.deps.error('Put soldiers in a wave on the Army tab, then run the practice raid.'); return; }
+    if (this.waves.every(w => totalOf(w) === 0)) {
+      this.waves = sampleWaves(this.rules);
+      this.deps.note('Loaded balanced sample waves for practice (free — not bought).');
+    }
     const data = await this.post('practice', { layout: this.draft, waves: this.waves, entrances: this.entrances });
     if (data?.replay) this.play(data.replay, 'Practice raid on your base', `Practice: ${outcomeLine(data.replay.outcome)}. Nothing was lost.`, false);
   }
 
   private async scout() {
     const data = await this.post('scout', {});
-    if (data) this.lastRaid = null;
+    if (!data) return;
+    this.lastRaid = null;
+    if (data.fee) {
+      this.deps.note(`Scouted a new target (${money(data.fee)} fee).`);
+      this.deps.onCash();
+    }
     this.render();
   }
 
   private async launch() {
     const target = this.state?.target;
     if (!target) return;
-    const data = await this.post('raid', { entrances: this.entrances }, 'waves');
-    if (!data?.replay || !data.raid) return;
+    // Defer applying post-raid state/cash until the replay finishes or is skipped/closed
+    // so the outcome isn't spoiled at tick 00:00.
+    const data = await this.post('raid', { entrances: this.entrances }, 'waves', true);
+    if (!data?.replay || !data.raid || !data.base) return;
+    const payout = data.raid.payout ?? data.raid.loot;
+    const contractBonus = data.raid.contractBonus ?? 0;
+    const salvage = data.raid.salvage ?? 0;
     const line = outcomeLine(data.replay.outcome);
-    this.lastRaid = { defender: data.raid.defender, loot: data.raid.loot, line };
+    const bonusNote = contractBonus > 0 ? ` (incl. ${money(contractBonus)} contract bonus)` : '';
+    this.pendingRaid = {
+      state: data.base,
+      raid: { defender: data.raid.defender, loot: data.raid.loot, payout, contractBonus, salvage },
+      line,
+    };
+    this.play(data.replay, `Raid on ${data.raid.defender}'s base`, `${line} · earned ${money(payout)}${bonusNote}`, true);
+  }
+
+  /** Reveal the deferred raid outcome and sync post-raid cash & waves. */
+  private commitPendingRaid() {
+    const pending = this.pendingRaid;
+    if (!pending) return;
+    this.pendingRaid = null;
+    this.lastRaid = {
+      defender: pending.raid.defender,
+      loot: pending.raid.loot,
+      payout: pending.raid.payout,
+      contractBonus: pending.raid.contractBonus,
+      line: pending.line,
+    };
+    this.apply(pending.state, 'waves');
     this.deps.onCash();
-    this.play(data.replay, `Raid on ${data.raid.defender}'s base`, `${line} · took ${money(data.raid.loot)}`, true);
   }
 
   private async watch(log: RaidLog, attacking: boolean) {
     const data = await this.post('replay', { id: log.id });
     if (!data?.replay) return;
-    const loot = attacking ? `took ${money(log.loot)}` : `lost ${money(log.loot)}`;
-    this.play(data.replay, attacking ? `Your raid on ${log.opponent}` : `${log.opponent}'s raid on your base`, `${outcomeLine(data.replay.outcome)} · ${loot}`, attacking);
+    const payout = log.payout ?? log.loot;
+    const cashNote = attacking
+      ? `earned ${money(payout)}${log.contractBonus ? ` (incl. ${money(log.contractBonus)} contract)` : ''}`
+      : `lost ${money(log.loot)}${log.salvage ? ` · salvaged ${money(log.salvage)}` : ''}`;
+    this.play(data.replay, attacking ? `Your raid on ${log.opponent}` : `${log.opponent}'s raid on your base`, `${outcomeLine(data.replay.outcome)} · ${cashNote}`, attacking);
   }
 
   // ---------- Replays ----------
@@ -299,6 +381,7 @@ export class BaseView {
     if (!this.playback) return;
     this.playback = null;
     cancelAnimationFrame(this.raf);
+    if (this.pendingRaid) this.commitPendingRaid();
   }
 
   private get endTick() { return this.playback ? this.playback.data.outcome.ticks + 8 : 0; }
@@ -310,7 +393,11 @@ export class BaseView {
     this.lastFrame = now;
     if (p.playing) {
       p.tick = Math.min(this.endTick, p.tick + dt * p.data.ticksPerSec * p.speed);
-      if (p.tick >= this.endTick) { p.playing = false; this.renderTransport(); }
+      if (p.tick >= this.endTick) {
+        p.playing = false;
+        if (this.pendingRaid) this.commitPendingRaid();
+        else this.renderTransport();
+      }
       this.syncTransport();
     }
     this.draw();
@@ -340,6 +427,7 @@ export class BaseView {
     const cell = this.cellAt(e);
     if (cell === null) return;
     e.preventDefault();
+    this.cursor = cell;
     const at = this.pieceAt(cell);
     const same = at >= 0 && this.draft.pieces[at].kind === this.tool;
     this.painting = this.tool === 'erase' || e.button === 2 || same ? 'erase' : 'place';
@@ -353,6 +441,51 @@ export class BaseView {
     this.hover = cell;
     if (this.painting && cell !== null && this.editing()) this.paint(cell);
     else this.draw();
+  }
+
+  /** Keyboard grid editor: arrow keys move cursor, Space/Enter toggles, Backspace/Delete erases, 1-8/0 pick tool. */
+  private keyDown(e: KeyboardEvent) {
+    if (!this.editing()) return;
+    const g = this.rules.grid;
+    if (e.key >= '1' && e.key <= '8') {
+      const k = TOOL_KEYS[Number(e.key) - 1];
+      const info = kindInfo(this.rules, k);
+      if (info && (info.soldier || info.cap > 0)) {
+        this.tool = k;
+        this.limitNote = '';
+        this.renderPanel();
+        this.draw();
+      }
+      e.preventDefault();
+      return;
+    }
+    if (e.key === '0') { this.tool = 'erase'; this.renderPanel(); this.draw(); e.preventDefault(); return; }
+    const start = this.cursor ?? cellOf(g, Math.floor(g / 2), Math.floor(g / 2));
+    let [x, y] = xyOf(g, start);
+    if (e.key === 'ArrowUp') y = Math.max(0, y - 1);
+    else if (e.key === 'ArrowDown') y = Math.min(g - 1, y + 1);
+    else if (e.key === 'ArrowLeft') x = Math.max(0, x - 1);
+    else if (e.key === 'ArrowRight') x = Math.min(g - 1, x + 1);
+    else if (e.key === ' ' || e.key === 'Enter') {
+      e.preventDefault();
+      this.cursor = start;
+      const at = this.pieceAt(start);
+      const same = at >= 0 && this.draft.pieces[at].kind === this.tool;
+      this.painting = this.tool === 'erase' || same ? 'erase' : 'place';
+      this.paint(start);
+      this.painting = null;
+      return;
+    } else if (e.key === 'Backspace' || e.key === 'Delete') {
+      e.preventDefault();
+      this.cursor = start;
+      this.painting = 'erase';
+      this.paint(start);
+      this.painting = null;
+      return;
+    } else return;
+    e.preventDefault();
+    this.cursor = cellOf(g, x, y);
+    this.draw();
   }
 
   private paint(cell: number) {
@@ -382,9 +515,18 @@ export class BaseView {
 
   // ---------- Panels ----------
 
+  private updateLogBadge() {
+    const badge = document.getElementById('baseLogBadge');
+    if (!badge) return;
+    const n = this.state?.unreadDefenses ?? 0;
+    badge.hidden = n <= 0;
+    badge.textContent = n > 0 ? String(n) : '';
+  }
+
   render() {
     if (!this.state) return;
     document.querySelectorAll<HTMLButtonElement>('[data-base-tab]').forEach(btn => btn.setAttribute('aria-pressed', String(btn.dataset.baseTab === this.tab)));
+    this.updateLogBadge();
     this.renderPanel();
     this.renderTransport();
     this.draw();
@@ -406,7 +548,7 @@ export class BaseView {
     const parts = this.tab === 'build' ? this.buildPanel() : this.tab === 'army' ? this.armyPanel() : this.tab === 'raid' ? this.raidPanel() : this.logPanel();
     panel.replaceChildren(...parts);
     this.q('baseHint').textContent = this.playback ? '' : this.tab === 'build'
-      ? 'Click or drag to place · click a piece again or right-click to remove · dashed lines show how soldiers will walk in'
+      ? 'Click/drag or use arrow keys + Space to edit · right-click to remove · walls block movement and line of sight'
       : this.tab === 'raid' && this.state.target && !this.state.raidBlocker ? 'You only know where the HQ and the entrances are.' : '';
   }
 
@@ -443,11 +585,41 @@ export class BaseView {
     return out;
   }
 
+  private spareSection(soldiersOnly: boolean): HTMLElement[] {
+    const s = this.state!;
+    const spares = spareOf(s.rules, s.layout, s.waves, s.owned)
+      .filter(sp => kindInfo(s.rules, sp.kind).soldier === soldiersOnly);
+    if (!spares.length) return [];
+    const head = el('div', 'pane-head');
+    head.append(el('span', 'label', soldiersOnly ? 'Reserve soldiers' : 'Spare equipment'),
+      el('span', 'meta', `Sell back (${Math.round((s.rules.sellRefundRate ?? 0.5) * 100)}%)`));
+    const box = el('div', 'base-info');
+    for (const sp of spares) {
+      const info = kindInfo(s.rules, sp.kind);
+      const row = el('div', 'base-spare-row');
+      row.append(el('span', '', `${sp.count} ${plural(info.name, sp.count)}`));
+      const sell = button('btn btn-ghost btn-sm', `Sell all · +${money(sp.refund)}`, () => void this.sellSpare(sp.kind, sp.count));
+      sell.disabled = this.busy;
+      row.append(sell);
+      box.append(row);
+    }
+    return [head, box];
+  }
+
   private buildPanel(): HTMLElement[] {
     const s = this.state!;
     const rules = s.rules;
     const have = placed(this.draft);
     const parts: HTMLElement[] = [];
+
+    if (s.layout.pieces.length === 0) {
+      const intro = el('div', 'base-info base-intro');
+      intro.append(
+        el('b', '', 'Base Command — Design the Kill-Zone'),
+        el('span', '', 'Place your HQ on a side or corner, then shape open firing lanes with walls, turrets, mines and garrison guards. Every entrance must keep a route in. Draft freely and run a free Practice raid before spending cash.'),
+      );
+      parts.push(intro);
+    }
 
     const siteHead = el('div', 'pane-head');
     siteHead.append(el('span', 'label', 'HQ position'), el('span', 'meta', siteInfo(rules, this.draft.site).name));
@@ -463,7 +635,20 @@ export class BaseView {
       b.setAttribute('aria-label', siteInfo(rules, id).name);
       compass.append(b);
     }
-    parts.push(siteHead, compass, el('p', 'hf-sub', 'Your HQ sits on a side or in a corner. The three entrances are on the far edges.'));
+    const quickRow = el('div', 'base-actions');
+    if (this.draft.pieces.length === 0) {
+      quickRow.append(button('btn btn-secondary btn-sm', 'Starter blueprint', () => {
+        this.draft = starterBlueprint(rules, this.draft.site);
+        this.deps.note('Loaded starter blueprint (unsaved — test it in Practice or click Buy and save).');
+        this.render();
+      }));
+    } else {
+      quickRow.append(button('btn btn-ghost btn-sm', 'Clear map', () => {
+        this.draft = { site: this.draft.site, pieces: [] };
+        this.render();
+      }));
+    }
+    parts.push(siteHead, compass, quickRow);
 
     const row = (kind: Kind, group: 'gear' | 'guard') => {
       const info = kindInfo(rules, kind);
@@ -515,8 +700,9 @@ export class BaseView {
     parts.push(...this.saveBlock(problem));
     const test = button('btn btn-secondary btn-sm btn-block', 'Run a practice raid', () => void this.practice());
     test.disabled = !!problem || this.busy;
-    test.title = 'Send your waves at this layout. Free: nothing is bought, lost or saved.';
-    parts.push(test, el('p', 'hf-sub', 'Practice uses the layout on screen, even before you buy it.'));
+    test.title = 'Send your waves (or sample waves) at this layout. Free: nothing is bought, lost or saved.';
+    parts.push(test, el('p', 'hf-sub', 'Practice is free and uses the layout on screen, even before you buy it.'));
+    parts.push(...this.spareSection(false));
     return parts;
   }
 
@@ -539,12 +725,35 @@ export class BaseView {
     return bits.length ? bits.join(', ') : 'Empty';
   }
 
+  private refillButton(): HTMLElement | null {
+    const s = this.state!;
+    const hasRefill = (s.refillWaves ?? []).some(w => totalOf(w) > 0);
+    if (!hasRefill) return null;
+    const cost = s.refillCost ?? 0;
+    const short = cost - s.cash;
+    const label = short > 0 ? `Refill lost troops · need ${money(short)} more` : cost > 0 ? `Refill lost troops · ${money(cost)}` : 'Restore lost troops (from reserve)';
+    const btn = button('btn btn-money-solid btn-sm btn-block', label, () => void this.refill());
+    btn.disabled = short > 0 || this.busy;
+    return btn;
+  }
+
   private armyPanel(): HTMLElement[] {
     const s = this.state!;
     const rules = s.rules;
-    const parts: HTMLElement[] = [
-      el('p', 'hf-sub', `Three waves set out ${rules.waveGapSecs} seconds apart. Each holds ${rules.waveSupply} supply at Homefront tier ${s.tier}. Soldiers that die in a raid are gone; the rest come home.`),
-    ];
+    const intro = el('div', 'base-info base-intro');
+    intro.append(
+      el('b', '', 'Strike Force — 3 Waves, 4 Roles'),
+      el('span', '', `Waves set out ${rules.waveGapSecs}s apart (${rules.waveSupply} supply/wave at tier ${s.tier}). Heavies soak fire, Riflemen deal +50% to garrison, Grenadiers prioritize turrets/HQ (2.5×), and Scouts spot fog & disarm mines.`),
+    );
+    const parts: HTMLElement[] = [intro];
+    const refillBtn = this.refillButton();
+    if (refillBtn) parts.push(refillBtn);
+    if (this.waves.every(w => totalOf(w) === 0)) {
+      parts.push(button('btn btn-secondary btn-sm btn-block', 'Load sample waves', () => {
+        this.waves = sampleWaves(rules);
+        this.render();
+      }));
+    }
     for (let w = 0; w < WAVES; w++) {
       const wave = this.waves[w];
       const used = supplyOf(rules, wave);
@@ -576,20 +785,34 @@ export class BaseView {
     const test = button('btn btn-secondary btn-sm btn-block', 'Run a practice raid on your base', () => void this.practice());
     test.disabled = this.busy;
     parts.push(test, el('p', 'hf-sub', 'Practice is free and uses the waves on screen, owned or not.'));
+    parts.push(...this.spareSection(true));
     return parts;
   }
 
   private raidPanel(): HTMLElement[] {
     const s = this.state!;
     const parts: HTMLElement[] = [];
+    if (this.pendingRaid) {
+      const live = el('div', 'base-info base-intro');
+      live.append(
+        el('b', '', `Raid on ${this.pendingRaid.raid.defender} in progress`),
+        el('span', '', 'Watch the replay unfold on the map, or click Skip to result in the playback bar.'),
+      );
+      parts.push(live);
+      return parts;
+    }
+
     const shield = s.shieldUntil - s.now;
     const own = el('div', 'base-info');
     own.append(el('b', '', 'Your base'));
     if (!s.raidable) own.append(el('span', '', 'Safe operator: this base can never be raided.'));
     else if (s.raidBlocker) own.append(el('span', '', 'Base raids are off on this server.'));
-    else if (shield > 0) own.append(el('span', '', `Shielded for ${shortDuration(shield)} after the last raid on it. Raiding someone drops the shield.`));
-    else if (s.cash < s.rules.minTargetCash) own.append(el('span', '', `Not worth raiding: under ${money(s.rules.minTargetCash)} cash, so nobody is offered your base.`));
-    else own.append(el('span', '', `Open to raids. Up to ${money(s.atRisk)} of your cash is at risk (${Math.round(s.rules.lootShare * 100)}%, at most ${money(s.rules.lootCap)}). Your pieces are never lost.`));
+    else if (shield > 0) own.append(el('span', '', `Shielded for ${shortDuration(shield)} after the last raid on it. Raiding someone drops your shield (same rivals stay on a 24h cooldown).`));
+    else if (s.atRisk === 0 || (s.cash + (s.workshopAtRisk ?? 0)) < s.rules.minTargetCash) own.append(el('span', '', `Not worth raiding: under ${money(s.rules.minTargetCash)} exposed cash, so nobody is offered your base.`));
+    else {
+      const wsNote = (s.workshopAtRisk ?? 0) > 0 ? ` (includes ${money(s.workshopAtRisk!)} uncollected Workshop)` : '';
+      own.append(el('span', '', `Open to raids. Up to ${money(s.atRisk)} is at risk${wsNote}. Repelling an attack salvages ${Math.round((s.rules.defenderSalvageShare ?? 0.3) * 100)}% of dead attacker value; your pieces are never lost.`));
+    }
     parts.push(own);
     if (s.raidBlocker) {
       const line = el('p', 'locked-line');
@@ -597,27 +820,38 @@ export class BaseView {
       parts.push(line);
       return parts;
     }
+    const refillBtn = this.refillButton();
+    if (refillBtn) parts.push(refillBtn);
     if (this.lastRaid) {
       const r = this.lastRaid;
       const card = el('div', 'base-result');
-      card.append(el('b', '', `Raid on ${r.defender}`), el('span', '', r.line), el('span', 'money-text', `Took ${money(r.loot)}`));
+      const bonus = r.contractBonus > 0 ? ` (incl. ${money(r.contractBonus)} contract bonus)` : '';
+      card.append(el('b', '', `Raid on ${r.defender}`), el('span', '', r.line), el('span', 'money-text', `Earned ${money(r.payout)}${bonus}`));
       parts.push(card);
     }
+    const fee = s.scoutFee ?? 0;
+    const scoutLabel = (verb: string) => fee > 0 ? `${verb} · ${money(fee)}` : `${verb} · Free`;
     const t = s.target;
     if (!t) {
-      parts.push(el('p', 'hf-sub', 'Scout a base to raid: another Raidable operator with cash worth taking and no shield. You see where its HQ and entrances are, and nothing else.'));
-      const scout = button('btn btn-primary btn-block', this.lastRaid ? 'Scout another base' : 'Scout a base', () => void this.scout());
-      scout.disabled = this.busy;
+      const intro = el('div', 'base-info base-intro');
+      intro.append(
+        el('b', '', 'Raid Ops — 1. Scout · 2. Pick A/B/C · 3. Launch'),
+        el('span', '', `Matches unshielded Raidable rivals within ${s.rules.maxTierGap ?? 1} tier (24h per-rival cooldown). Destroying a defended HQ also pays a contract bonus up to ${money(s.rules.contractCap ?? 600)}.`),
+      );
+      parts.push(intro);
+      const scout = button('btn btn-primary btn-block', scoutLabel(this.lastRaid ? 'Scout another base' : 'Scout a base'), () => void this.scout());
+      scout.disabled = this.busy || s.cash < fee;
       parts.push(scout);
       return parts;
     }
     const card = el('div', 'base-target');
     const name = el('div', 'base-target-name', t.name);
     name.append(el('span', 'tag tag--raid', `Tier ${t.tier}`));
+    const netMax = Math.floor(t.lootPool * (1 - (s.rules.lootBurnShare ?? 0.15)));
     card.append(name,
       el('span', 'hf-sub', `HQ on the ${siteInfo(s.rules, t.site).name.toLowerCase()} · ${t.hqHp.toLocaleString('en-US')} health`),
-      el('span', 'money-text', `Up to ${money(t.lootPool)}`),
-      el('span', 'hf-sub', 'Destroying the HQ takes all of it. Otherwise you take half of it, scaled by the damage you did.'));
+      el('span', 'money-text', `Up to ${money(netMax)} net loot + contract bonus`),
+      el('span', 'hf-sub', `Defender risks up to ${money(t.lootPool)} (${Math.round((s.rules.lootBurnShare ?? 0.15) * 100)}% raid burn). Defended HQs pay up to ${money(s.rules.contractCap ?? 600)} extra on destruction.`));
     parts.push(card);
     const wavesHead = el('div', 'pane-head');
     wavesHead.append(el('span', 'label', 'Your waves'), el('span', 'meta', 'Pick an entrance for each'));
@@ -633,12 +867,12 @@ export class BaseView {
     const empty = saved.every(w => totalOf(w ?? {}) === 0);
     if (this.dirtyWaves()) parts.push(el('p', 'warn-line', 'Your Army tab has unsaved changes. The raid uses the saved waves above.'));
     if (empty) {
-      parts.push(el('p', 'base-problem', 'Your waves are empty. Buy soldiers on the Army tab first.'));
+      parts.push(el('p', 'base-problem', 'Your waves are empty. Buy or refill soldiers on the Army tab first.'));
     } else {
       parts.push(this.confirm('btn btn-primary btn-block', `Raid ${t.name}`, 'Click again: soldiers that die are gone', () => void this.launch()));
     }
-    const again = button('link link--muted', 'Scout a different base', () => void this.scout());
-    again.disabled = this.busy;
+    const again = button('link link--muted', scoutLabel('Scout a different base'), () => void this.scout());
+    again.disabled = this.busy || s.cash < fee;
     parts.push(again);
     return parts;
   }
@@ -670,9 +904,13 @@ export class BaseView {
       for (const log of logs) {
         const row = el('div', `base-log${log.destroyed ? (attacking ? ' won' : ' lost') : ''}`);
         const text = el('span', 'base-tool-text');
+        const extra = attacking
+          ? (log.contractBonus ? ` · +${money(log.contractBonus)} contract` : '')
+          : (log.salvage ? ` · +${money(log.salvage)} salvage` : '');
         text.append(el('span', 'base-tool-name', `${attacking ? 'vs' : 'by'} ${log.opponent}`),
-          el('span', 'base-tool-sub', `${ago(s.now, log.at)} · ${outcomeLine(log)}`));
-        const cash = el('span', `num base-log-cash ${attacking ? 'gain' : 'loss'}`, `${attacking ? '+' : '−'}${money(log.loot)}`);
+          el('span', 'base-tool-sub', `${ago(s.now, log.at)} · ${outcomeLine(log)}${extra}`));
+        const net = attacking ? (log.payout ?? log.loot) : ((log.salvage ?? 0) - log.loot);
+        const cash = el('span', `num base-log-cash ${net >= 0 ? 'gain' : 'loss'}`, `${net >= 0 ? '+' : '−'}${money(Math.abs(net))}`);
         row.append(text, cash);
         if (log.replayable) {
           const w = button('btn btn-secondary btn-sm', 'Watch', () => void this.watch(log, attacking));
@@ -714,12 +952,25 @@ export class BaseView {
     scrub.step = '1';
     scrub.value = String(Math.floor(p.tick));
     scrub.setAttribute('aria-label', 'Replay position');
-    scrub.addEventListener('input', () => { p.tick = Number(scrub.value); p.playing = false; this.syncTransport(); this.draw(); });
+    scrub.addEventListener('input', () => {
+      p.tick = Number(scrub.value);
+      p.playing = false;
+      if (p.tick >= this.endTick && this.pendingRaid) this.commitPendingRaid();
+      this.syncTransport();
+      this.draw();
+    });
     scrub.addEventListener('change', () => this.renderTransport());
     const time = el('span', 'num base-time');
     time.id = 'baseTime';
     const row = el('div', 'base-transport-row');
     row.append(toggle, speed, scrub, time);
+    if (!done && this.pendingRaid) {
+      row.append(button('btn btn-secondary btn-sm', 'Skip to result', () => {
+        p.tick = this.endTick;
+        p.playing = false;
+        this.commitPendingRaid();
+      }));
+    }
     if (!p.data.fog) {
       const label = el('label', 'check');
       const box = el('input');
@@ -881,7 +1132,8 @@ export class BaseView {
       ctx.stroke();
     });
     ctx.restore();
-    // The reach of the selected gun, around the square under the pointer or every one placed.
+    // The reach of the selected gun, around the square under the pointer/cursor or every one placed.
+    const activeCell = this.hover ?? this.cursor;
     const info = this.tool !== 'erase' ? kindInfo(rules, this.tool) : null;
     const ring = (cell: number, range: number, alpha: number) => {
       const [cx, cy] = this.center(cell, s);
@@ -892,7 +1144,7 @@ export class BaseView {
     };
     if (this.tab === 'build' && info?.range) {
       for (const p of this.draft.pieces) if (p.kind === this.tool) ring(cellOf(g, p.x, p.y), info.range, 0.18);
-      if (this.hover !== null && this.pieceAt(this.hover) < 0) ring(this.hover, info.range, 0.4);
+      if (activeCell !== null && this.pieceAt(activeCell) < 0) ring(activeCell, info.range, 0.4);
     }
     for (const p of this.draft.pieces) {
       const [cx, cy] = this.center(cellOf(g, p.x, p.y), s);
@@ -908,12 +1160,12 @@ export class BaseView {
       ctx.lineWidth = 3;
       ctx.strokeRect(cx - s / 2 + 1.5, cy - s / 2 + 1.5, s - 3, s - 3);
     });
-    if (this.tab === 'build' && this.hover !== null && this.hover !== site.hq && !site.entrances.includes(this.hover)) {
-      const [cx, cy] = this.center(this.hover, s);
+    if (this.tab === 'build' && activeCell !== null && activeCell !== site.hq && !site.entrances.includes(activeCell)) {
+      const [cx, cy] = this.center(activeCell, s);
       ctx.strokeStyle = this.tool === 'erase' ? theme.accent : theme.text;
       ctx.lineWidth = 2;
       ctx.strokeRect(cx - s / 2 + 1, cy - s / 2 + 1, s - 2, s - 2);
-      if (this.tool !== 'erase' && this.pieceAt(this.hover) < 0) {
+      if (this.tool !== 'erase' && this.pieceAt(activeCell) < 0) {
         ctx.globalAlpha = 0.5;
         drawPiece(ctx, this.tool, cx, cy, s, this.tool === 'mine' ? theme.money : theme.you, kindInfo(rules, this.tool).soldier);
         ctx.globalAlpha = 1;
@@ -953,11 +1205,19 @@ export class BaseView {
     }
     for (const m of r.mines) {
       const blown = m.blown !== null && m.blown <= tick;
-      if (fog && !blown) continue;
+      const disarmed = m.disarmed != null && m.disarmed <= tick;
+      if (fog && !blown && !disarmed) continue;
       const [cx, cy] = this.center(m.cell, s);
       if (blown) {
         ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
         ctx.beginPath(); ctx.arc(cx, cy, s * 0.36, 0, Math.PI * 2); ctx.fill();
+      } else if (disarmed) {
+        ctx.strokeStyle = troopColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(cx, cy, s * 0.22, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - s * 0.16, cy - s * 0.16); ctx.lineTo(cx + s * 0.16, cy + s * 0.16);
+        ctx.stroke();
       } else drawPiece(ctx, 'mine', cx, cy, s, theme.money);
     }
     const where = new Map<number, [number, number]>();

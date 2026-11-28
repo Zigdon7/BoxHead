@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import {
   Counts, Kind, KindInfo, Layout, Replay, Rules, SiteInfo,
   ago, cellOf, damageAt, distances, layoutProblem, moveSite, needed, outcomeLine, placed, reserve, revealedAt, roomFor, routes,
-  sameLayout, sameWaves, saveCost, shortDuration, supplyOf, troopAt, HQ_ID,
+  sameLayout, sameWaves, sampleWaves, saveCost, shortDuration, spareOf, starterBlueprint, supplyOf, troopAt, HQ_ID,
 } from './siege';
 
 const GRID = 17;
@@ -110,10 +110,26 @@ describe('buying', () => {
     expect(saveCost(rules, l, waves, needed(l, waves)).total).toBe(0);
   });
 
-  test('supply and reserves', () => {
+  test('supply, reserves, spares and starter helpers', () => {
     expect(supplyOf(rules, waves[0])).toBe(5);
     expect(supplyOf(rules, {})).toBe(0);
     expect(reserve(l, waves, { rifleman: 7, scout: 2, wall: 99 })).toEqual({ rifleman: 2, scout: 2 });
+    const spares = spareOf(rules, l, waves, { wall: 6, rifleman: 7 });
+    expect(spares).toEqual([
+      { kind: 'wall', count: 4, refund: 50 },
+      { kind: 'rifleman', count: 2, refund: 60 },
+    ]);
+    for (const s of rules.sites) {
+      const bp = starterBlueprint(rules, s.id);
+      expect(bp.pieces.length).toBeGreaterThan(0);
+      expect(layoutProblem(rules, bp)).toBeNull();
+    }
+    const sample = sampleWaves(rules);
+    expect(sample).toHaveLength(3);
+    for (const w of sample) {
+      expect(supplyOf(rules, w)).toBeGreaterThan(0);
+      expect(supplyOf(rules, w)).toBeLessThanOrEqual(rules.waveSupply);
+    }
   });
 });
 

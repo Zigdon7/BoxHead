@@ -296,16 +296,16 @@ describe('server browser API', () => {
     const res = await listRooms();
     assert.equal(res.ok, true);
     assert.deepEqual(res.matchmaking, {
-      platform: { id: 'direct', label: 'Email & Google' }, crossplay: false, pool: { id: 'direct', label: 'Email & Google' },
+      platform: { id: 'direct', label: 'Email & Google' }, crossplay: true, pool: { id: 'cross', label: 'Cross-platform' },
     });
     for (const map of ['outskirts', 'rustyard', 'quarantine', 'blacksite']) {
-      const open = res.rooms.find(r => r.id === `${map}-direct`);
+      const open = res.rooms.find(r => r.id === `${map}-cross`);
       assert.ok(open, `official raid for ${map}`);
-      assert.deepEqual([open.pool.id, open.permanent, open.map.id, open.canJoin], ['direct', true, map, true]);
+      assert.deepEqual([open.pool.id, open.permanent, open.map.id, open.canJoin], ['cross', true, map, true]);
     }
-    assert.ok(res.rooms.every(r => r.pool.id === 'direct'), 'only your own pool is listed');
-    assert.equal(res.rooms.find(r => r.id === 'outskirts-direct').name, 'Outskirts');
-    assert.equal(res.rooms.find(r => r.id === 'rustyard-direct').map.minGearScore, 20);
+    assert.ok(res.rooms.every(r => r.pool.id === 'cross'), 'only your own pool is listed');
+    assert.equal(res.rooms.find(r => r.id === 'outskirts-cross').name, 'Outskirts');
+    assert.equal(res.rooms.find(r => r.id === 'rustyard-cross').map.minGearScore, 20);
     const tiers = res.rooms.map(r => r.map.tier);
     assert.deepEqual(tiers, [...tiers].sort((a, b) => a - b), 'listed in map order');
   });
@@ -340,7 +340,7 @@ describe('server browser API', () => {
   test('signed-in players host open lobbies that others can see and join', async () => {
     const created = await createRoom('Randos Welcome');
     assert.equal(created.ok, true, JSON.stringify(created));
-    assert.equal(created.room.pool.id, 'direct');
+    assert.equal(created.room.pool.id, 'cross');
     assert.equal(created.room.permanent, false);
     const { token } = await signUp();
     const asOther = await listRooms(token);
@@ -357,29 +357,29 @@ describe('server browser API', () => {
     }
   });
 
-  test('cross-platform play is off by default and moves you into the shared pool', async () => {
+  test('cross-platform play is on by default and can be toggled to platform-only', async () => {
     const { token } = await signUp();
-    const res = await setCrossplay(token, true);
-    assert.equal(res.ok, true, JSON.stringify(res));
-    assert.deepEqual([res.matchmaking.crossplay, res.matchmaking.pool.id, res.matchmaking.platform.id], [true, 'cross', 'direct']);
-    const list = await listRooms(token);
-    assert.equal(list.matchmaking.pool.id, 'cross');
-    assert.ok(list.rooms.length >= 4 && list.rooms.every(r => r.pool.id === 'cross' && r.canJoin));
-    // A lobby hosted with cross-play on is a cross-platform lobby.
-    const hosted = await createRoom('Everyone', { token });
-    assert.equal(hosted.room.pool.id, 'cross');
-    assert.ok(!(await listRooms()).rooms.some(r => r.id === hosted.room.id), 'hidden from players who kept it off');
     const off = await setCrossplay(token, false);
-    assert.deepEqual([off.matchmaking.crossplay, off.matchmaking.pool.id], [false, 'direct']);
+    assert.equal(off.ok, true, JSON.stringify(off));
+    assert.deepEqual([off.matchmaking.crossplay, off.matchmaking.pool.id, off.matchmaking.platform.id], [false, 'direct', 'direct']);
+    const list = await listRooms(token);
+    assert.equal(list.matchmaking.pool.id, 'direct');
+    assert.ok(list.rooms.length >= 4 && list.rooms.every(r => r.pool.id === 'direct' && r.canJoin));
+    // A lobby hosted with cross-play off is a platform-only lobby.
+    const hosted = await createRoom('Platform Only', { token });
+    assert.equal(hosted.room.pool.id, 'direct');
+    assert.ok(!(await listRooms()).rooms.some(r => r.id === hosted.room.id), 'hidden from cross-platform players');
+    const on = await setCrossplay(token, true);
+    assert.deepEqual([on.matchmaking.crossplay, on.matchmaking.pool.id], [true, 'cross']);
     assert.match((await setCrossplay('', true)).error, /sign in/i);
     assert.equal((await setCrossplay(token, 'yes')).ok, false);
   });
 
   test('raids only admit players from their own pool', async () => {
     const host = await signUp();
+    await setCrossplay(host.token, false);
     const { room } = await mustCreate('Home Turf', { token: host.token });
     const crosser = await signUp();
-    await setCrossplay(crosser.token, true);
     assert.match((await joinRefused({ roomId: room.id, token: crosser.token })).error, /Email & Google players only.*Turn off cross-platform/);
     assert.match((await joinRefused({ roomId: 'outskirts-direct', token: crosser.token })).error, /Turn off cross-platform/);
     // A bare map id is that map's raid in your own pool.
@@ -387,6 +387,7 @@ describe('server browser API', () => {
     assert.equal((await c.waitFor(m => m.type === 'room')).roomId, 'outskirts-cross');
     await c.close();
     const stayer = await signUp();
+    await setCrossplay(stayer.token, false);
     assert.match((await joinRefused({ roomId: 'outskirts-cross', token: stayer.token })).error, /cross-platform\. Turn on/);
     await setCrossplay(crosser.token, false);
     const back = await joinOk({ roomId: room.id, token: crosser.token });
@@ -637,9 +638,9 @@ describe('joining rooms over WebSocket', () => {
   test('a new account joins Outskirts and gets the map, room status and snapshot', async () => {
     const c = await joinOk({ roomId: 'outskirts' });
     const room = await c.waitFor(m => m.type === 'room');
-    assert.equal(room.roomId, 'outskirts-direct');
+    assert.equal(room.roomId, 'outskirts-cross');
     assert.equal(room.roomName, 'Outskirts');
-    assert.equal(room.pool, 'direct');
+    assert.equal(room.pool, 'cross');
     const init = c.messages.find(m => m.type === 'init');
     assert.equal(init.map.id, 'outskirts');
     assert.ok(init.mapWidth >= 4000 && init.mapHeight >= 3000, 'a large map');
@@ -680,7 +681,7 @@ describe('joining rooms over WebSocket', () => {
 
   test('omitting roomId lands in the Outskirts raid of your pool', async () => {
     const c = await joinOk({});
-    assert.equal((await c.waitFor(m => m.type === 'room')).roomId, 'outskirts-direct');
+    assert.equal((await c.waitFor(m => m.type === 'room')).roomId, 'outskirts-cross');
     await c.close();
   });
 
@@ -1101,15 +1102,24 @@ describe('base defense and base raids', () => {
     assert.deepEqual([replay.defenses.length, replay.walls.length, replay.mines.length], [1, 0, 0], 'only the turret by the route was uncovered');
     assert.ok(!JSON.stringify(replay).includes(`"cell":${15 * 17 + 2}`), 'the far turret never leaves the server');
     assert.ok(raid.loot > 0 && raid.loot <= Math.floor(victimCash * 0.2));
-    assert.equal((await hideout(raider.token)).cash, raiderCash + raid.loot);
-    assert.equal((await hideout(victim.token)).cash, victimCash - raid.loot);
+    assert.equal(raid.payout, Math.floor(raid.loot * 0.85) + raid.contractBonus);
+    assert.equal((await hideout(raider.token)).cash, raiderCash + raid.payout);
+    assert.equal((await hideout(victim.token)).cash, victimCash - raid.loot + raid.salvage);
     assert.equal(Object.values(res.base.owned).reduce((a, b) => a + b, 0), 13 - lost, 'dead soldiers are gone');
     assert.equal(res.base.target, null);
     assert.deepEqual([res.base.attacks.length, res.base.attacks[0].loot, res.base.attacks[0].opponent], [1, raid.loot, 'Tester']);
+    // 1-click refill buys back lost soldiers.
+    if (lost > 0) {
+      const refilled = await baseAct('refill', { token: raider.token });
+      assert.equal(refilled.ok, true, JSON.stringify(refilled));
+      assert.equal(Object.values(refilled.base.owned).reduce((a, b) => a + b, 0), 13);
+    }
 
-    // The defender keeps every piece, is shielded, and replays the raid with the whole base in view.
+    // The defender keeps every piece, sees an unread defense, is shielded, and replays the raid with the whole base in view.
     const theirs = (await baseGet(victim.token)).base;
-    assert.deepEqual([theirs.layout.pieces.length, theirs.defenses.length, theirs.defenses[0].id], [4, 1, raid.id]);
+    assert.deepEqual([theirs.layout.pieces.length, theirs.defenses.length, theirs.defenses[0].id, theirs.unreadDefenses], [4, 1, raid.id, 1]);
+    assert.equal((await hideout(victim.token)).unreadBaseDefenses, 1);
+    assert.equal((await baseAct('ack', { token: victim.token })).base.unreadDefenses, 0);
     assert.ok(theirs.shieldUntil > theirs.now);
     const full = (await baseAct('replay', { token: victim.token, id: raid.id })).replay;
     assert.deepEqual([full.fog, full.defenses.length, full.walls.length, full.mines.length], [false, 2, 1, 1]);
@@ -1120,17 +1130,30 @@ describe('base defense and base raids', () => {
     assert.match((await baseAct('scout', { token: raider.token })).error, /No bases to raid/, 'the only target is shielded');
   });
 
-  test('Safe operators build and practise but never raid or get raided', async () => {
+  test('Safe operators build, sell spares, practise, and can promote one-way to Raidable', async () => {
     const safe = await operator({ raidable: false, cash: 50000 });
-    const res = await baseGet(safe.token);
+    let res = await baseGet(safe.token);
     assert.match(res.base.raidBlocker, /Safe operator/);
     assert.equal(res.base.atRisk, 0);
     assert.match((await baseAct('scout', { token: safe.token })).error, /Safe operator/);
     assert.match((await baseAct('raid', { token: safe.token, entrances: [0, 0, 0] })).error, /Safe operator/);
+    // Buy 2 walls, remove them, sell spare walls back for 50%.
+    await baseAct('save', { token: safe.token, layout: { site: 'west', pieces: [piece('wall', 5, 5), piece('wall', 5, 6)] } });
+    await baseAct('save', { token: safe.token, layout: { site: 'west', pieces: [] } });
+    const sold = await baseAct('sell', { token: safe.token, kind: 'wall', count: 2 });
+    assert.equal(sold.ok, true);
+    assert.equal(sold.earned, 25);
     const hunter = await operator({ cash: 5000 });
     const found = await baseAct('scout', { token: hunter.token });
     assert.ok(found.ok === false || found.base.target.name !== undefined);
     if (found.ok) assert.notEqual(found.base.target.lootPool, 10000, 'the rich Safe operator is not offered');
+    // One-way Safe -> Raidable promotion requires confirmation and unlocks raiding.
+    const noConfirm = await hideoutAct('promoteRaidable', { token: safe.token });
+    assert.equal(noConfirm.ok, false);
+    const promoted = await hideoutAct('promoteRaidable', { token: safe.token, confirm: true });
+    assert.equal(promoted.ok, true, JSON.stringify(promoted));
+    assert.equal(promoted.raidable, true);
+    assert.equal((await baseGet(safe.token)).base.raidBlocker, null);
   });
 
   test('the base needs a signed-in account with an operator', async () => {
@@ -1257,7 +1280,7 @@ describe('lobby lifetime', () => {
   test('official rooms never shut down', async () => {
     await sleep(EMPTY_TTL_SECS * 1000 + 500);
     const ids = (await listRooms()).rooms.map(r => r.id);
-    assert.ok(ids.includes('outskirts-direct') && ids.includes('blacksite-direct'));
+    assert.ok(ids.includes('outskirts-cross') && ids.includes('blacksite-cross'));
   });
 });
 
