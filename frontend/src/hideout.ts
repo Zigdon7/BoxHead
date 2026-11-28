@@ -126,6 +126,8 @@ export class HideoutView {
   creating = false;
   /** The Base tab: defenses, attack waves and base raids. */
   base: BaseView;
+  overflowKeep = new Set<string>();
+  private overflowOperator: string | undefined;
 
   constructor(private deps: HideoutDeps) {
     this.base = new BaseView({
@@ -141,7 +143,7 @@ export class HideoutView {
     const sort = document.getElementById('invSort') as HTMLSelectElement | null;
     sort?.addEventListener('change', () => { this.sort = sort.value as typeof this.sort; this.render(); });
     document.getElementById('invSelectValuables')?.addEventListener('click', () => {
-      for (const i of this.state?.stash ?? []) if (i.kind === 'valuable') this.checked.add(i.id);
+      for (const i of this.state?.stash ?? []) if (i.kind === 'valuable' && !i.protected) this.checked.add(i.id);
       this.render();
     });
     document.getElementById('invClear')?.addEventListener('click', () => { this.checked.clear(); this.render(); });
@@ -186,8 +188,11 @@ export class HideoutView {
     // Another operator has its own base.
     if (this.state?.id !== h.id) { this.base.reset(); if (this.base.visible && !h.needsOperator) void this.base.load(); }
     this.state = h;
+    if (this.overflowOperator !== h.id) { this.overflowKeep.clear(); this.overflowOperator = h.id; }
+    for (const item of h.overflow ?? []) if (item.protected) this.overflowKeep.add(item.id);
+    for (const id of this.overflowKeep) if (!h.overflow?.some(i => i.id === id)) this.overflowKeep.delete(id);
     if (this.selectedId && !this.findItem(this.selectedId)) this.selectedId = null;
-    for (const id of [...this.checked]) if (!h.stash.some(i => i.id === id)) this.checked.delete(id);
+    for (const id of [...this.checked]) if (!h.stash.some(i => i.id === id && !i.protected)) this.checked.delete(id);
     this.render();
     this.deps.onChange(h);
   }
@@ -235,12 +240,16 @@ export class HideoutView {
       else if (action === 'upgradeTier') this.note(`Homefront raised to tier ${data.homefront?.tier}.`);
       else if (action === 'upgradeFacility') this.note('Facility upgraded.');
       else if (action === 'collectWorkshop') this.note(`Collected ${money(before?.cash !== undefined ? data.cash - before.cash : 0)} from the Workshop.`);
+      else if (action === 'requisition') this.note('Requested gear added to your stash, protected from accidental sale.');
+      else if (action === 'resolveOverflow') this.note('Extraction loot selection saved.');
+      else if (action === 'respec') this.note('Legacy points refunded. Choose your new perks.');
       else if (action === 'relocate') this.note('Retired. Your Legacy grew: spend points on perks, then create a new operator.');
       else if (action === 'buyPerk') this.note('Perk upgraded. It applies to every operator on your account.');
     } catch {
       this.error('Network error');
     } finally {
       this.busy = false;
+      this.render();
     }
   }
 
@@ -304,6 +313,7 @@ export class HideoutView {
     this.renderStash(h);
     this.renderTrader(h);
     this.renderSellList(h);
+    this.renderRewardChoices(h);
   }
 
   /** A line explaining why something is locked, with the lock icon. */
@@ -398,13 +408,9 @@ export class HideoutView {
         const w = hf.workshop;
         const strip = el('div', 'collect-strip');
         const txt = el('div');
-        txt.append(el('div', 'money-text', `${money(w.stored)} ready to collect`), el('div', 'hf-sub', `Holds up to ${money(w.capacity)}`));
+        txt.append(el('div', 'money-text', w.collected ? `${money(w.collected)} automatically banked` : 'Automatically banks when you return'),
+          el('div', 'hf-sub', `Accumulates up to 48 hours (${money(w.capacity)}). No collection schedule needed.`));
         strip.append(txt);
-        const collect = el('button', 'btn btn-money-solid btn-sm', w.stored > 0 ? 'Collect' : 'Empty');
-        collect.type = 'button';
-        collect.disabled = w.stored <= 0;
-        collect.addEventListener('click', () => void this.act('collectWorkshop', {}));
-        strip.append(collect);
         card.append(strip);
       }
       const fx = el('div', 'fac-fx');
@@ -483,7 +489,7 @@ export class HideoutView {
         : `Retirement window: ${range} (opens in ${days} day${days === 1 ? '' : 's'})`);
       const more = el('details', 'more');
       more.append(el('summary', '', 'How retiring works'),
-        el('p', 'hf-sub', 'Seasons follow the calendar quarter. Your account can retire one operator per season, and it leaves with everything it owns. Legacy points depend on its total value (cash plus items): $5,000 earns 1, $20,000 earns 2 and $50,000 earns 3, up to 12 in total. Retiring is optional, and skipping a season costs nothing.'));
+        el('p', 'hf-sub', 'Seasons follow the calendar quarter. Your account can retire one operator per season, and it leaves with everything it owns. Legacy points depend on its total value (cash, items and installed Homefront investment): $5,000 earns 1, $20,000 earns 2 and $50,000 earns 3, up to 12 in total. Retiring is optional, and skipping a season costs nothing.'));
       seasonBox.replaceChildren(head, what, when, this.q('opRelocate'), more);
     }
 
@@ -650,6 +656,11 @@ export class HideoutView {
       row.append(meta);
       parts.push(row);
     }
+    if (lg.earned > lg.available) {
+      const reset = confirmButton('btn btn-secondary btn-sm', `Reset perks · ${money(lg.respecCost ?? 1000)}`, 'Confirm: refund all allocated points', () => void this.act('respec', { confirm: true }));
+      reset.disabled = h.inRaid || h.cash < (lg.respecCost ?? 1000);
+      parts.push(reset, el('p', 'hf-sub', 'Refunds every allocated point. All operators must be home and fit their stash without Packrat.'));
+    }
     if (lg.badges.length) {
       const badges = el('div', 'badge-list');
       for (const b of lg.badges) {
@@ -669,8 +680,9 @@ export class HideoutView {
     const parts: HTMLElement[] = [];
     if (r.reward) {
       const w = r.reward;
-      const items = Math.max(0, w.value - h.cash);
-      parts.push(el('p', 'hf-sub', `Retiring ${h.name} is permanent. You lose ${money(w.value)} (${money(h.cash)} cash + ${money(items)} in items). Your account gets:`));
+      const investment = h.investmentValue ?? 0;
+      const items = Math.max(0, w.value - h.cash - investment);
+      parts.push(el('p', 'hf-sub', `Retiring ${h.name} is permanent. You lose ${money(w.value)} (${money(h.cash)} cash + ${money(items)} in items + ${money(investment)} invested). Your account gets:`));
       const list = el('ul', 'reward-lines');
       const lines = [
         w.legacyPoints ? `${w.legacyPoints} Legacy point${w.legacyPoints === 1 ? '' : 's'} to spend on perks` : 'No Legacy points (worth under $5,000)',
@@ -876,10 +888,12 @@ export class HideoutView {
       rows.append(r);
     };
     const actions = el('div', 'compare-actions');
+    actions.append(this.protectButton(h, item));
     const extras: HTMLElement[] = [];
 
     if (isEncrypted(item)) {
       row('Decrypt time', null, `${DECRYPT_SECS[item.rarity]}s at an uplink`, 0);
+      row('Rarity upgrade', null, item.originTier ? `20% chance at tier ${item.originTier}+; none below` : '20% at any uplink (legacy item)', 0);
       row('Worth opened', null, `~${money(estimatedValue(item))}`, 1);
       row('Worth sealed', null, `${money(item.value)} scrap`, 0);
       box.append(rows, el('p', 'compare-note', 'Opens into gear (60%) or a valuable of this rarity and power, sometimes a grade better. Pack it to take it on your next raid; it is lost if you die.'));
@@ -933,13 +947,13 @@ export class HideoutView {
       }
     } else {
       row('Sells for', null, money(item.value), 0);
-      box.append(rows, el('p', 'compare-note', 'Valuables have no use in a raid. Sell them to the trader.'));
+      box.append(rows, el('p', 'compare-note', 'Valuables fund Homefront upgrades or sell for cash. Protect any you want to reserve; unprotect them when ready to spend them on a tier upgrade.'));
     }
     if (!box.contains(rows)) box.append(rows);
     const cost = this.sellCost(h, item);
     const sell = confirmButton('btn btn-money btn-sm', `Sell ${money(item.value)}`,
       cost ? `Best gear score ${cost.from} → ${cost.to}. Sell?` : slot ? 'Sell equipped? Click again' : 'Click again to sell', () => this.sell(item));
-    sell.disabled = h.inRaid;
+    sell.disabled = h.inRaid || !!item.protected;
     actions.append(sell);
     delete box.dataset.note;
     box.append(actions, ...extras);
@@ -1061,7 +1075,7 @@ export class HideoutView {
       all.indeterminate = !all.checked && shown.some(i => this.checked.has(i.id));
       all.disabled = h.inRaid || shown.length === 0;
       all.onchange = () => {
-        if (all.checked) shown.forEach(i => this.checked.add(i.id)); else shown.forEach(i => this.checked.delete(i.id));
+        if (all.checked) shown.filter(i => !i.protected).forEach(i => this.checked.add(i.id)); else shown.forEach(i => this.checked.delete(i.id));
         this.render();
       };
     }
@@ -1105,7 +1119,7 @@ export class HideoutView {
     const box = el('input', 'row-check');
     box.type = 'checkbox';
     box.checked = this.checked.has(item.id);
-    box.disabled = h.inRaid;
+    box.disabled = h.inRaid || !!item.protected;
     box.setAttribute('aria-label', `Select ${item.name} to sell`);
     box.addEventListener('click', e => e.stopPropagation());
     box.addEventListener('change', () => this.toggleCheck(item.id));
@@ -1131,6 +1145,8 @@ export class HideoutView {
     if (isEncrypted(item)) value.title = `Scrap value while sealed. Roughly ${money(estimatedValue(item))} once decrypted.`;
 
     const action = el('span', 'row-action');
+    action.style.flexWrap = 'wrap';
+    action.append(this.protectButton(h, item));
     if (best) {
       const btn = el('button', 'btn btn-sm ' + (this.topPick.has(item.id) ? 'btn-upgrade-solid' : best.delta > 0 ? 'btn-upgrade' : 'btn-secondary'));
       if (best.delta > 0) btn.append('Equip · GS', ` +${best.delta}`);
@@ -1152,14 +1168,69 @@ export class HideoutView {
       action.append(btn);
     } else {
       const btn = confirmButton('btn btn-sm btn-money', 'Sell', 'Sure?', () => this.sell(item));
-      btn.disabled = h.inRaid;
+      btn.disabled = h.inRaid || !!item.protected;
       action.append(btn);
     }
     row.append(box, this.icon(item), body, power, value, action);
     return row;
   }
 
+  private protectButton(h: Hideout, item: Item): HTMLButtonElement {
+    const button = el('button', 'btn btn-secondary btn-sm', item.protected ? 'Protected ✓' : 'Protect');
+    button.type = 'button';
+    button.disabled = h.inRaid || this.busy;
+    button.title = 'Protection prevents automatic replacement, dropping, sales and Homefront consumption. It does not insure raid losses.';
+    button.addEventListener('click', e => { e.stopPropagation(); void this.act('protect', { itemId: item.id, protected: !item.protected }); });
+    return button;
+  }
+
+  private renderRewardChoices(h: Hideout) {
+    let overflow = document.getElementById('extractionOverflow');
+    if (!overflow) {
+      overflow = el('section', 'reward-review'); overflow.id = 'extractionOverflow';
+      overflow.style.gridColumn = '1 / -1'; this.q('hideoutStash').prepend(overflow);
+    }
+    const pending = h.overflow ?? [];
+    overflow.hidden = pending.length === 0;
+    overflow.replaceChildren();
+    if (pending.length) {
+      const free = Math.max(0, h.stashCapacity - h.stash.length);
+      overflow.append(el('h3', '', `Review extracted loot · ${pending.length} waiting`),
+        el('p', 'hf-sub', `Select items to keep (${free} free stash slots). Unselected items are sold only when you confirm. Resolve this before deploying. Sell stash items below to make room.`));
+      for (const item of pending) {
+        const row = el('div', 'cmp-row');
+        const label = el('label'); const check = el('input'); check.type = 'checkbox';
+        check.checked = this.overflowKeep.has(item.id); check.disabled = !!item.protected;
+        check.addEventListener('change', () => { if (check.checked) this.overflowKeep.add(item.id); else this.overflowKeep.delete(item.id); this.render(); });
+        label.append(check, ` Keep ${item.name} · ${RARITY_LABEL[item.rarity]} · ${item.power} power · ${money(item.value)}`);
+        row.append(label, this.protectButton(h, item)); overflow.append(row);
+      }
+      const sold = pending.filter(i => !this.overflowKeep.has(i.id));
+      const confirm = confirmButton('btn btn-primary btn-sm', `Keep ${this.overflowKeep.size}, sell ${sold.length} for ${money(sold.reduce((n,i) => n+i.value, 0))}`, 'Confirm selection and sales', () => void this.act('resolveOverflow', { expectedIds: pending.map(i => i.id), keepIds: [...this.overflowKeep] }));
+      confirm.disabled = this.busy || this.overflowKeep.size > free;
+      overflow.append(confirm);
+    }
+    let requests = document.getElementById('targetedRequisitions');
+    if (!requests) { requests = el('section', 'reward-review'); requests.id = 'targetedRequisitions'; this.q('hideoutHomefront').append(requests); }
+    requests.replaceChildren(el('h3', '', 'Targeted gear requisitions'), el('p', 'hf-sub', 'Bank activity credits by extracting: kills and assists +1, unique crates +8, valid revives +5 (raid caps apply). Armory level 1 unlocks a chosen Rare item for 120 credits from its map. Credits are separate from Operations XP.'));
+    const armory = h.homefront?.facilities.find(f => f.id === 'armory')?.level ?? 0;
+    for (const op of h.operations ?? []) {
+      const row = el('div', 'cmp-row'); row.style.flexWrap = 'wrap'; row.style.gap = '8px';
+      const select = el('select'); select.setAttribute('aria-label', `Requested gear from ${op.name}`);
+      for (const kind of ['pistol','uzi','shotgun','rocketLauncher','armor','pack'] as const) {
+        const option = el('option', '', KIND_LABEL[kind]); option.value = kind; select.append(option);
+      }
+      const credits = op.requisition ?? 0; const cost = op.requisitionCost ?? 120;
+      const request = el('button', 'btn btn-secondary btn-sm', `Request · ${cost} credits`); request.type = 'button';
+      request.disabled = this.busy || h.inRaid || armory < 1 || credits < cost || pending.length > 0 || h.stash.length >= h.stashCapacity;
+      request.addEventListener('click', () => void this.act('requisition', { map: op.map, kind: select.value }));
+      row.append(el('span', '', `${op.name} · ${credits}/${cost} credits · Rare power ${op.requisitionPower ?? 0}`), select, request); requests.append(row);
+    }
+    if (!armory) requests.append(el('p', 'hf-sub', 'Build Armory level 1 to redeem credits. Trader stock alone stays below the score 40 gate.'));
+  }
+
   private toggleCheck(id: string) {
+    if (this.state?.stash.find(i => i.id === id)?.protected) return;
     if (this.checked.has(id)) this.checked.delete(id); else this.checked.add(id);
     // On phones the compare sheet would cover the list you're ticking.
     if (window.matchMedia('(max-width: 720px)').matches) this.selectedId = null;
@@ -1357,7 +1428,7 @@ export class HideoutView {
       body.append(meta);
       const btn = confirmButton('btn btn-sm ' + (cost ? 'btn-sell-muted' : 'btn-sell'), `Sell ${money(item.value)}`, cost ? `GS ${cost.from}→${cost.to}?` : 'Sure?', () => this.sell(item));
       if (cost) btn.title = `This is part of your best loadout: selling it drops your best gear score from ${cost.from} to ${cost.to}.`;
-      btn.disabled = h.inRaid;
+      btn.disabled = h.inRaid || !!item.protected;
       row.append(this.icon(item, 'sm'), body, btn);
       list.append(row);
     }

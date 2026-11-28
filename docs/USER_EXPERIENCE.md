@@ -42,7 +42,7 @@ New operators receive a power 6 Service Pistol, power 4 Padded Vest, power 4 Can
 | Homefront | Raise the tier, build facilities, collect Workshop cash, inspect Operations | Invest earnings in lasting operator benefits |
 | Operators | Create, select or delete characters; inspect Legacy and retirement | Commit to one character or maintain separate progression paths |
 
-The stash and raid pack are different inventories. The equipped pack is a piece of gear; its contents are carried loot. Insurance returns the equipped pack on a loss, along with the other equipped gear, but never its contents. Valuables also fund Homefront tier upgrades, so selling every valuable can delay progression.
+The stash and raid pack are different inventories. The equipped pack is a piece of gear; its contents are carried loot. Insurance returns the equipped pack on a loss, along with the other equipped gear, but never its contents. Valuables also fund Homefront tier upgrades. Protect items to reserve them against sale, automatic pack replacement and tier consumption; unprotect them before spending them. This is distinct from raid insurance. Homefront offers targeted gear requisitions earned through extraction, and Workshop income banks automatically on return. Legacy allocations can be reset for $1,000 with confirmation.
 
 ### Choosing a raid
 
@@ -60,7 +60,7 @@ Ordinary monsters have limited sight, pursuit and home territory. Breaking sight
 
 ### Outcome and the next attempt
 
-Extraction requires six seconds inside a green ring. The result screen reports the outcome, loot, bounty and progression. Excess extracted loot is sold automatically if the stash is full. A death, timeout or abandonment loses carried loot and unprotected equipment; stash items left at home remain safe. Operations XP is still awarded for a settled loss.
+Extraction requires six seconds inside a green ring. The result screen reports the outcome, loot, bounty and progression. Excess extracted loot waits in the stash’s review panel. Keep selected items and explicitly confirm sales before deploying again; protected items require unprotecting before sale. A death, timeout or abandonment loses carried loot and uninsured equipment; stash items left at home remain safe. A settled loss keeps earned activity XP; an empty run earns none. Results show assists, crates and credited revives alongside XP.
 
 A player with no gear can use the weaker loaner pistol and two-slot pouch on free-entry Outskirts. This is the recovery path after losing everything. Server restarts void unfinished raids and return equipment, staged loot, entry fees and insurance premiums. Disconnecting after play has begun is currently abandonment, with no reconnect grace period.
 

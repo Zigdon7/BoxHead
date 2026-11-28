@@ -70,7 +70,6 @@ pub const AMMO_RESPAWN_TIME: f64 = 45.0;
 
 // Supply crates (respawning loot)
 pub const CRATE_RADIUS: f64 = 18.0;
-pub const CRATE_RESPAWN_TIME: f64 = 240.0;
 
 // Extraction
 pub const EXTRACT_RADIUS: f64 = 110.0;

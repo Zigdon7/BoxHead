@@ -102,6 +102,9 @@
         },
         "item": {
           "$ref": "#/$defs/Item"
+        },
+        "claimant": {
+          "type": "string"
         }
       },
       "required": [
@@ -249,6 +252,9 @@
         },
         "decrypt": {
           "type": "number"
+        },
+        "activity": {
+          "$ref": "#/$defs/RaidActivity"
         }
       },
       "required": [
@@ -306,6 +312,9 @@
         },
         "target": {
           "type": "string"
+        },
+        "hunter": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -447,6 +456,9 @@
           "type": "boolean"
         },
         "dropId": {
+          "type": "string"
+        },
+        "protectId": {
           "type": "string"
         }
       },
@@ -692,6 +704,9 @@
         },
         "decrypt": {
           "type": "number"
+        },
+        "activity": {
+          "$ref": "#/$defs/RaidActivity"
         }
       },
       "required": [
@@ -866,6 +881,12 @@
         },
         "value": {
           "type": "number"
+        },
+        "protected": {
+          "type": "boolean"
+        },
+        "originTier": {
+          "type": "integer"
         }
       },
       "required": [
@@ -1019,6 +1040,9 @@
           "items": {
             "$ref": "#/$defs/Item"
           }
+        },
+        "activity": {
+          "$ref": "#/$defs/RaidActivity"
         }
       },
       "required": [
@@ -1057,6 +1081,9 @@
         },
         "ops": {
           "$ref": "#/$defs/OpsProgress"
+        },
+        "itemsPending": {
+          "type": "integer"
         }
       },
       "required": [
@@ -1132,6 +1159,26 @@
         "rankedUp",
         "next"
       ]
+    },
+    "RaidActivity": {
+      "type": "object",
+      "properties": {
+        "assists": {
+          "type": "integer"
+        },
+        "crates": {
+          "type": "integer"
+        },
+        "revives": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "assists",
+        "crates",
+        "revives"
+      ],
+      "additionalProperties": false
     }
   }
 }
