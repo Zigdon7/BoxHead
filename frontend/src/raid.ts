@@ -31,6 +31,7 @@ export interface Operations {
   /** XP for the next rank (null at the top) and for the current one. */
   next: number | null; prev: number;
   entryFee: number; baseEntryFee: number; bountyBonus: number;
+  requisition?: number; requisitionCost?: number; requisitionPower?: number;
 }
 
 export interface FacilityInfo {
@@ -42,7 +43,7 @@ export interface Homefront {
   tier: number; maxTier: number; topTier: number; safeTier: number;
   next: { tier: number; cash: number; valuables: number; minRarity: Rarity; have: number; uses: string[] } | null;
   facilities: FacilityInfo[];
-  workshop: { stored: number; perHour: number; capacity: number };
+  workshop: { stored: number; perHour: number; capacity: number; collected?: number };
 }
 
 export interface PerkInfo { id: string; name: string; perRank: string; rank: number; maxRank: number }
@@ -52,6 +53,7 @@ export interface Legacy {
   relocations: number; lastRelocation: string | null; boostLevel: number;
   badges: { season: string; operator: string; value: number }[];
   perks: PerkInfo[];
+  respecCost?: number;
 }
 
 export interface SeasonInfo {
@@ -72,6 +74,9 @@ export interface Hideout {
   cash: number; raids: number; extracts: number; deaths: number; inRaid: boolean;
   gearScore: number; loadout: Partial<Record<Slot, Item | null>>; stash: Item[]; stashCapacity: number;
   offers: Offer[]; maps: MapSummary[];
+  overflow?: Item[]; investmentValue?: number;
+  /** Unread incoming base raids on the active operator. */
+  unreadBaseDefenses?: number;
   /** Raidable operators (PvP) are available on this server. */
   pvpEnabled?: boolean;
   /** What insuring the current loadout for one raid costs. */
@@ -291,11 +296,11 @@ export function backpackValue(items: Pick<Item, 'value'>[]): number {
 /** Item a full pack would swap out for `candidate` (server rule): gear only
  *  replaces weaker gear (by power); valuables and sealed loot replace each
  *  other by what they're worth. */
-export function swapCandidate<T extends Pick<Item, 'value' | 'power' | 'kind' | 'rarity'>>(pack: T[], capacity: number, candidate: Pick<Item, 'value' | 'power' | 'kind' | 'rarity'>): T | null | 'fits' {
+export function swapCandidate<T extends Pick<Item, 'value' | 'power' | 'kind' | 'rarity' | 'protected'>>(pack: T[], capacity: number, candidate: Pick<Item, 'value' | 'power' | 'kind' | 'rarity'>): T | null | 'fits' {
   if (pack.length < capacity) return 'fits';
   const gear = isGear(candidate.kind);
   const score = (i: Pick<Item, 'value' | 'power' | 'kind' | 'rarity'>) => (gear ? i.power : packWorth(i));
-  const low = pack.filter(i => isGear(i.kind) === gear)
+  const low = pack.filter(i => !i.protected && isGear(i.kind) === gear)
     .reduce<T | null>((min, i) => (!min || score(i) < score(min) ? i : min), null);
   return low && score(candidate) > score(low) ? low : null;
 }

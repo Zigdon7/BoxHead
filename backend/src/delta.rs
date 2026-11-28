@@ -47,6 +47,7 @@ fn full_player(p: &Player) -> PlayerDelta {
         combo_timer: Some(tenths(p.combo_timer)),
         max_combo: Some(p.max_combo),
         kills: Some(p.kills),
+        activity: Some(p.activity.clone()),
         tactical_items: Some(p.tactical_items),
         bounty: Some(p.bounty),
         backpack: Some(p.backpack.clone()),
@@ -94,6 +95,7 @@ fn player_diff(prev: &Player, curr: &Player) -> Option<PlayerDelta> {
     eq_field!(combo);
     eq_field!(max_combo);
     eq_field!(kills);
+    eq_field!(activity);
     eq_field!(tactical_items);
     eq_field!(bounty);
     eq_field!(backpack);
@@ -303,7 +305,7 @@ mod tests {
         let mut zombie = Zombie {
             id: "brute".into(), zombie_type: ZombieType::Brute,
             pos: Vector2 { x: 100.0, y: 100.0 }, health: 100.0,
-            max_health: 100.0, speed: 20.0, elite: false, target: None,
+            max_health: 100.0, speed: 20.0, elite: false, target: None, hunter: false,
         };
         let mut client_pos = zombie.pos.clone();
         for _ in 0..120 {

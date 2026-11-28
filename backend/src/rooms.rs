@@ -49,7 +49,7 @@ pub struct Frame {
     pub placeables: Vec<Placeable>,
     pub drops: Vec<DropPickup>,
     pub ammo_availability: HashMap<String, bool>,
-    pub crate_availability: HashMap<String, bool>,
+    pub crate_availability: HashMap<String, HashMap<String, bool>>,
     pub paused: bool,
     pub host_id: Option<String>,
 }
@@ -359,7 +359,7 @@ impl Room {
             placeables: game.placeables().to_vec(),
             drops: game.drops(),
             ammo_availability: game.ammo_availability().iter().map(|a| (a.id.clone(), a.available)).collect(),
-            crate_availability: game.crate_availability().iter().map(|a| (a.id.clone(), a.available)).collect(),
+            crate_availability: game.players().keys().map(|id| (id.clone(), game.crate_availability(id).into_iter().map(|a| (a.id, a.available)).collect())).collect(),
             paused,
             host_id: game.host_id().map(str::to_owned),
         };
@@ -471,10 +471,11 @@ impl Room {
             let zombies: Vec<Zombie> = frame.zombies.iter().filter(|z| near(z.pos.x, z.pos.y)).cloned().collect();
             let bullets: Vec<Bullet> = frame.bullets.iter().filter(|b| near(b.pos.x, b.pos.y)).cloned().collect();
             let placeables: Vec<Placeable> = frame.placeables.iter().filter(|p| near(p.pos.x, p.pos.y)).cloned().collect();
-            let drops: Vec<DropPickup> = frame.drops.iter().filter(|d| near(d.pos.x, d.pos.y)).cloned().collect();
+            let drops: Vec<DropPickup> = frame.drops.iter().filter(|d| near(d.pos.x, d.pos.y) && d.claimant.as_ref().is_none_or(|owner| owner == id)).cloned().collect();
+            let empty_crates = HashMap::new();
             let world = World {
                 players: &frame.players, zombies: &zombies, bullets: &bullets, placeables: &placeables,
-                drops: &drops, ammo: &frame.ammo_availability, crates: &frame.crate_availability,
+                drops: &drops, ammo: &frame.ammo_availability, crates: frame.crate_availability.get(id).unwrap_or(&empty_crates),
             };
             let tracker = trackers.entry(id.clone()).or_insert_with(DeltaTracker::new);
             if room_changed || needs_snapshot {

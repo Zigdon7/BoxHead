@@ -40,15 +40,16 @@ New operators receive a power 6 Service Pistol, power 4 Padded Vest, power 4 Can
 | Stash | Filter and sort items, inspect comparisons, equip, sell or bulk-sell, pack sealed loot | Keep an upgrade, bank cash, or risk a sealed item again |
 | Trader | Buy replacement equipment and inspect available power levels | Spend now to recover or save for a larger upgrade |
 | Homefront | Raise the tier, build facilities, collect Workshop cash, inspect Operations | Invest earnings in lasting operator benefits |
-| Operators | Create, select or delete characters; inspect Legacy and retirement | Commit to one character or maintain separate progression paths |
+| Base | Build a 17×17 defense map, compose 3 attack waves, run free practice raids, scout and raid rivals (when PvP is on), watch fogged replays | Turn cash into base defense, test layouts safely, and strike rival bases |
+| Operators | Create, select, opt Safe→Raidable (when PvP is on) or delete characters; inspect Legacy and retirement | Commit to one character or maintain separate progression paths |
 
-The stash and raid pack are different inventories. The equipped pack is a piece of gear; its contents are carried loot. Insurance returns the equipped pack on a loss, along with the other equipped gear, but never its contents. Valuables also fund Homefront tier upgrades, so selling every valuable can delay progression.
+The stash and raid pack are different inventories. The equipped pack is a piece of gear; its contents are carried loot. Insurance returns the equipped pack on a loss, along with the other equipped gear, but never its contents. Valuables also fund Homefront tier upgrades. Protect items to reserve them against sale, automatic pack replacement and tier consumption; unprotect them before spending them. This is distinct from raid insurance. Homefront offers targeted gear requisitions earned through extraction, and Workshop income banks automatically on return. Legacy allocations can be reset for $1,000 with confirmation.
 
 ### Choosing a raid
 
 The deploy screen connects the selected operator, map requirement, entry fee, insurance premium and raid choice. Locked maps require gear score, not account age or Operations rank. Filling an empty slot can matter more than replacing an already strong item.
 
-Players initially match with the platform used for the current sign-in. Cross-platform play moves them into the shared opt-in pool. Friends who cannot find the same raid should compare their pools first. Hosting and choosing a shared raid are available; a party invitation and ready-check system is future work.
+Players start in the shared cross-platform matchmaking pool by default and can switch off cross-platform play to match only within their current sign-in platform pool. Friends who cannot find the same raid should compare their pools first. Hosting and choosing a shared raid are available; a party invitation and ready-check system is future work.
 
 ### The raid experience
 
@@ -60,7 +61,7 @@ Ordinary monsters have limited sight, pursuit and home territory. Breaking sight
 
 ### Outcome and the next attempt
 
-Extraction requires six seconds inside a green ring. The result screen reports the outcome, loot, bounty and progression. Excess extracted loot is sold automatically if the stash is full. A death, timeout or abandonment loses carried loot and unprotected equipment; stash items left at home remain safe. Operations XP is still awarded for a settled loss.
+Extraction requires six seconds inside a green ring. The result screen reports the outcome, loot, bounty and progression. Excess extracted loot waits in the stash’s review panel. Keep selected items and explicitly confirm sales before deploying again; protected items require unprotecting before sale. A death, timeout or abandonment loses carried loot and uninsured equipment; stash items left at home remain safe. A settled loss keeps earned activity XP; an empty run earns none. Results show assists, crates and credited revives alongside XP.
 
 A player with no gear can use the weaker loaner pistol and two-slot pouch on free-entry Outskirts. This is the recovery path after losing everything. Server restarts void unfinished raids and return equipment, staged loot, entry fees and insurance premiums. Disconnecting after play has begun is currently abandonment, with no reconnect grace period.
 

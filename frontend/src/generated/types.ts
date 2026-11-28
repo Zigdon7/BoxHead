@@ -89,6 +89,7 @@ export interface DropPickup {
   type: DropType;
   pos: Vector2;
   item?: Item;
+  claimant?: string;
   [k: string]: unknown;
 }
 /**
@@ -102,6 +103,8 @@ export interface Item {
   power: number;
   name: string;
   value: number;
+  protected?: boolean;
+  originTier?: number;
   [k: string]: unknown;
 }
 /**
@@ -153,6 +156,7 @@ export interface Player {
   hunted: boolean;
   damageLog?: DamageHit[];
   decrypt: number;
+  activity?: RaidActivity;
   [k: string]: unknown;
 }
 /**
@@ -168,6 +172,15 @@ export interface RaidWeapon {
 }
 /**
  * This interface was referenced by `BoxheadTypes`'s JSON-Schema
+ * via the `definition` "RaidActivity".
+ */
+export interface RaidActivity {
+  assists: number;
+  crates: number;
+  revives: number;
+}
+/**
+ * This interface was referenced by `BoxheadTypes`'s JSON-Schema
  * via the `definition` "Zombie".
  */
 export interface Zombie {
@@ -179,6 +192,7 @@ export interface Zombie {
   speed: number;
   elite?: boolean;
   target?: string;
+  hunter?: boolean;
   [k: string]: unknown;
 }
 /**
@@ -243,6 +257,7 @@ export interface ClientInput {
   placeItem?: number;
   dropItem?: boolean;
   dropId?: string;
+  protectId?: string;
   [k: string]: unknown;
 }
 /**
@@ -350,6 +365,7 @@ export interface PlayerDelta {
   hunted?: boolean;
   damageLog?: DamageHit[];
   decrypt?: number;
+  activity?: RaidActivity;
   [k: string]: unknown;
 }
 /**
@@ -403,6 +419,7 @@ export interface RaidOutcome {
   maxCombo: number;
   survivedSecs: number;
   lost: Item[];
+  activity?: RaidActivity;
   [k: string]: unknown;
 }
 /**
@@ -420,6 +437,7 @@ export interface RaidSettlement {
    */
   bonusCash: number;
   ops?: OpsProgress;
+  itemsPending?: number;
   [k: string]: unknown;
 }
 /**

@@ -594,6 +594,13 @@
     .rp-row .row-meta { display: block; }
     .value-open { color: #4fe3f7; font-weight: 700; }
     .stash-list.with-bar { padding-bottom: 90px; }
+    .reward-review { grid-column: 1 / -1; margin: 12px 0; padding: 16px; border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--surface-raised); }
+    .reward-review[hidden] { display: none; }
+    .reward-review h3 { margin: 0 0 8px; }
+    .reward-review .cmp-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 10px 0; }
+    .reward-review label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 200px; }
+    .reward-review input[type="checkbox"] { flex: none; }
+    .reward-review select { max-width: 100%; }
     .trader-caption { font-size: 12px; color: var(--text-muted); margin-top: -4px; }
 
     .mobile-only { display: none; }
@@ -1361,6 +1368,80 @@
     .danger-btn:not(:disabled) { border-color: var(--danger-text); color: var(--danger-text); }
     #resetSection[hidden], #authSectionOut[hidden] { display: none; }
     .choice--faction.soon { opacity: 0.55; cursor: not-allowed; filter: saturate(0.3); }
+
+    /* Base: map editor, attack waves, base raids and replays */
+    .hq-body--base { grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); }
+    .base-stage { min-height: 0; }
+    .base-canvas-wrap { flex: 1; min-height: 240px; position: relative; overflow: hidden; }
+    .base-canvas { position: absolute; inset: auto; top: 50%; left: 50%; transform: translate(-50%, -50%); display: block; border: 1px solid var(--border-strong); background: #161910; touch-action: none; cursor: crosshair; }
+    .base-canvas:focus-visible { outline: 2px solid var(--you); outline-offset: 2px; }
+    .tab-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 4px; border-radius: 999px; background: var(--accent); color: #fff; font: 700 11px var(--font-mono); line-height: 1; }
+    .base-intro { border-left: 3px solid var(--you); }
+    .base-spare-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+    .base-hint { min-height: 1.3em; }
+    .base-tabs { display: flex; }
+    .base-tabs button { flex: 1; justify-content: center; }
+    .base-panel { display: flex; flex-direction: column; gap: var(--sp-3); }
+    .base-compass { display: grid; grid-template-columns: repeat(3, 48px); gap: 4px; }
+    .base-compass-btn { height: 36px; border: 1px solid var(--border-strong); border-radius: 2px; background: var(--surface-raised); color: var(--text-secondary);
+      font: 700 14px var(--font-display); letter-spacing: 0.08em; cursor: pointer; }
+    .base-compass-btn:hover { background: var(--surface-hover); color: var(--text); }
+    .base-compass-btn[aria-checked="true"] { background: var(--you-soft); border-color: var(--you); color: var(--you); }
+    .base-compass-mid { display: grid; place-items: center; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); }
+    .base-tools { display: flex; flex-direction: column; gap: 4px; }
+    .base-tool { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 4px 10px; text-align: left; border: 1px solid var(--border); border-radius: 2px;
+      background: var(--surface-raised); color: var(--text); font: inherit; cursor: pointer; }
+    .base-tool:hover:not(:disabled) { background: var(--surface-hover); }
+    .base-tool.on { border-color: var(--you); box-shadow: inset 3px 0 0 var(--you); background: var(--you-soft); }
+    .base-tool:disabled { opacity: 0.5; cursor: not-allowed; }
+    .base-tool--erase { justify-content: center; min-height: 36px; font-weight: 700; color: var(--text-secondary); }
+    .base-tool--erase.on { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); background: var(--accent-soft); color: var(--text); }
+    .base-glyph { position: static; inset: auto; z-index: auto; width: 28px; height: 28px; flex: none; cursor: inherit; touch-action: auto; }
+    .base-tool-text { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+    .base-tool-name { font-size: 15px; font-weight: 700; color: var(--text); }
+    .base-tool-sub { font-size: 13px; color: var(--text-secondary); }
+    .base-tool-count { font-family: var(--font-mono); font-size: 14px; color: var(--text-secondary); }
+    .base-info, .base-result, .base-target { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); background: rgba(0, 0, 0, 0.25);
+      font-size: 14px; line-height: 1.4; color: var(--text-secondary); }
+    .base-info b, .base-result b { font-size: 15px; color: var(--text); }
+    .base-info-stats { font-family: var(--font-mono); font-size: 13px; color: var(--text); }
+    .base-target { border-color: var(--accent); }
+    .base-target-name { display: flex; align-items: center; gap: 8px; font: 700 22px var(--font-display); letter-spacing: 0.04em; color: var(--text); }
+    .base-problem { font-size: 14px; font-weight: 700; color: var(--danger-text); }
+    .base-ok { font-size: 14px; color: var(--health); }
+    .base-cost { font-size: 14px; font-weight: 700; color: var(--money); }
+    .base-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .base-wave { display: flex; flex-direction: column; gap: 4px; padding: 10px; border: 1px solid var(--border); background: rgba(0, 0, 0, 0.25); }
+    .base-wave-head { display: flex; align-items: center; gap: 10px; }
+    .base-wave-head b { font: 700 17px var(--font-display); letter-spacing: 0.06em; text-transform: uppercase; }
+    .base-supply { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary); }
+    .base-supply.over { color: var(--danger-text); }
+    .base-entrance button { min-width: 32px; justify-content: center; padding: 0 8px; }
+    .base-soldier, .base-wave-line, .base-log { display: flex; align-items: center; gap: 8px; min-height: 40px; }
+    .base-wave-line, .base-log { padding: 6px 10px; border: 1px solid var(--border); background: rgba(0, 0, 0, 0.25); }
+    .base-log.won { border-left: 3px solid var(--money); }
+    .base-log.lost { border-left: 3px solid var(--accent); }
+    .base-step { width: 32px; height: 32px; flex: none; border: 1px solid var(--border-strong); border-radius: 2px; background: var(--surface-raised); color: var(--text);
+      font-size: 18px; font-weight: 700; line-height: 1; cursor: pointer; }
+    .base-step:hover:not(:disabled) { background: var(--surface-hover); }
+    .base-step:disabled { opacity: 0.35; cursor: not-allowed; }
+    .base-step-n { width: 24px; text-align: center; font-family: var(--font-mono); font-size: 16px; }
+    .base-log-cash { font-family: var(--font-mono); font-size: 14px; }
+    .base-log-cash.gain { color: var(--money); }
+    .base-log-cash.loss { color: var(--danger-text); }
+    .base-transport { display: flex; flex-direction: column; gap: 6px; }
+    .base-transport[hidden] { display: none; }
+    .base-transport-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .base-scrub { flex: 1; min-width: 120px; accent-color: var(--you); }
+    .base-time { font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary); }
+    .base-result-line { min-height: 1.4em; font-size: 15px; font-weight: 700; color: var(--text); }
+    @media (max-width: 1100px) {
+      .hq-body--base { grid-template-columns: 1fr; }
+      .base-canvas-wrap { flex: none; width: 100%; max-width: 560px; aspect-ratio: 1; margin: 0 auto; }
+    }
+    @media (max-width: 720px) {
+      .hq-tabs button { padding: 0 3px; font-size: 12px; letter-spacing: 0.04em; min-width: 0; }
+    }
   </style>
 </head>
 <body>
@@ -1475,6 +1556,7 @@
           <button type="button" data-hideout-tab="stash" aria-pressed="true"><svg class="icon"><use href="#i-crate"/></svg>Stash</button>
           <button type="button" data-hideout-tab="trader" aria-pressed="false"><svg class="icon"><use href="#i-star"/></svg>Trader</button>
           <button type="button" data-hideout-tab="homefront" aria-pressed="false"><svg class="icon"><use href="#i-home"/></svg>Homefront</button>
+          <button type="button" data-hideout-tab="base" aria-pressed="false"><svg class="icon"><use href="#i-flag"/></svg>Base<span id="baseUnreadBadge" class="tab-badge" hidden></span></button>
           <button type="button" data-hideout-tab="operators" aria-pressed="false"><svg class="icon"><use href="#i-users"/></svg>Operators</button>
         </div>
         <button id="operatorChip" class="op-chip" type="button" data-hideout-tab="operators" title="Switch or create operators">
@@ -1555,6 +1637,24 @@
           <div class="pane-head"><span class="label">Operations · map levels</span></div>
           <p class="meta">Raid a map to level it: cheaper entry, bigger bounty (kill cash, paid when you extract).</p>
           <div id="hfOps" class="ops-list"></div>
+        </aside>
+      </div>
+
+      <div id="hideoutBase" class="hq-body hq-body--base" hidden>
+        <section class="hq-main base-stage" aria-label="Base map">
+          <div class="pane-head"><span id="baseStageTitle" class="label">Your base</span><span id="baseStageMeta" class="meta"></span></div>
+          <div id="baseCanvasWrap" class="base-canvas-wrap"><canvas id="baseCanvas" class="base-canvas" width="544" height="544" tabindex="0" aria-label="Base map (arrow keys move cursor, Space places or removes)"></canvas></div>
+          <div id="baseTransport" class="base-transport" hidden></div>
+          <p id="baseHint" class="hq-hint base-hint"></p>
+        </section>
+        <aside class="hq-side hf-scroll base-side" aria-label="Base controls">
+          <div class="segmented base-tabs" role="group" aria-label="Base">
+            <button type="button" data-base-tab="build" aria-pressed="true">Build</button>
+            <button type="button" data-base-tab="army" aria-pressed="false">Army</button>
+            <button type="button" data-base-tab="raid" aria-pressed="false">Raid</button>
+            <button type="button" data-base-tab="log" aria-pressed="false">Log<span id="baseLogBadge" class="tab-badge" hidden></span></button>
+          </div>
+          <div id="basePanel" class="base-panel"></div>
         </aside>
       </div>
 

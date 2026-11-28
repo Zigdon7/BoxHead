@@ -15,6 +15,8 @@ mod ratelimit;
 mod mail;
 mod auth;
 mod buildinfo;
+mod siege;
+mod base_api;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +55,7 @@ struct AppState {
     mailer: mail::Mailer,
 }
 
-/// PvP (raidable operators, base raids) is off until it is built: `BOXHEAD_PVP=1` turns it on.
+/// PvP (raidable operators and base raids) is opt-in per server: `BOXHEAD_PVP=1` turns it on.
 fn pvp_enabled() -> bool {
     static PVP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PVP.get_or_init(|| std::env::var("BOXHEAD_PVP").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on")))
@@ -102,7 +104,7 @@ async fn main() {
         Ok(base) => println!("Public address: {}", base.trim_end_matches('/')),
         Err(_) => println!("WARNING: BASE_URL is not set, so email and Steam links follow each request's Host header. Set it before letting the public in."),
     }
-    if !pvp_enabled() { println!("PvP is off: new operators are Safe (set BOXHEAD_PVP=1 to allow Raidable)"); }
+    if !pvp_enabled() { println!("PvP is off: new operators are Safe and bases can't be raided (set BOXHEAD_PVP=1 to allow Raidable operators and base raids)"); }
     if !build.notice.is_empty() { println!("Home screen notice: {}", build.notice); }
     if !build.feedback_url.is_empty() { println!("Feedback link: {}", build.feedback_url); }
 
@@ -129,6 +131,8 @@ async fn main() {
         .route("/api/matchmaking/crossplay", post(crossplay_set))
         .route("/api/hideout", get(hideout))
         .route("/api/hideout/{action}", post(hideout_action))
+        .route("/api/base", get(base_api::base))
+        .route("/api/base/{action}", post(base_api::base_action))
         .route("/api/maps", get(maps_list))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/email/register", post(auth::register))
@@ -520,12 +524,13 @@ fn maps_json(gear_score: u32, operations: &[serde_json::Value]) -> serde_json::V
 }
 
 fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
+    let collected = db.collect_workshop(profile, now).unwrap_or(0);
     let Some(op) = db.operator(profile) else { return serde_json::Value::Null };
     let ctx = db.context(profile, now);
     let mut loadout = op.loadout();
     loadout.boost = ctx.raid_boost();
     let gs = loadout.gear_score();
-    let stash: Vec<&gear::Item> = op.items.iter().filter(|s| s.slot.is_none()).map(|s| &s.item).collect();
+    let stash: Vec<&gear::Item> = op.items.iter().filter(|s| s.slot.is_none() && !s.overflow).map(|s| &s.item).collect();
     let cap = progression::tier_cap(op.raidable);
     let next_tier = progression::tier_cost(op.tier + 1).filter(|c| c.tier <= cap);
     let tier_items = db.tier_valuables(profile);
@@ -535,8 +540,8 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
         let next = (level < cap).then_some(level + 1);
         serde_json::json!({
             "id": f.as_str(), "name": f.label(), "level": level, "maxLevel": op.tier,
-            "effect": f.effect(level),
-            "next": next.map(|n| serde_json::json!({ "level": n, "cost": f.cost(n), "effect": f.effect(n), "needsTier": n > op.tier })),
+            "effect": f.effect_for(level, op.raidable),
+            "next": next.map(|n| serde_json::json!({ "level": n, "cost": f.cost(n), "effect": f.effect_for(n, op.raidable), "needsTier": n > op.tier })),
         })
     }).collect();
     let operations: Vec<serde_json::Value> = db.operations(profile).into_iter().map(|(m, xp)| {
@@ -546,6 +551,9 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
             "next": progression::ops_next(xp), "prev": rank.checked_sub(1).map_or(0, |r| progression::OPS_THRESHOLDS[r as usize]),
             "entryFee": progression::ops_fee(m, rank), "baseEntryFee": m.entry_fee,
             "bountyBonus": progression::ops_bounty_bonus(rank),
+            "requisition": db.requisition_balance(profile, m.id),
+            "requisitionCost": progression::REQUISITION_COST,
+            "requisitionPower": (m.loot_power.1 + 6).min(gear::MAX_POWER),
         })
     }).collect();
     serde_json::json!({
@@ -557,6 +565,9 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
         "loadout": loadout,
         "boost": { "maxHealth": loadout.boost.max_health, "damage": loadout.boost.damage },
         "stash": stash,
+        "overflow": op.items.iter().filter(|s| s.overflow).map(|s| &s.item).collect::<Vec<_>>(),
+        "investmentValue": db.investment_value(profile),
+        "unreadBaseDefenses": db.unread_base_defenses(profile),
         "carry": op.items.iter().filter(|s| s.carry).map(|s| s.item.id.clone()).collect::<Vec<_>>(),
         "stashCapacity": ctx.stash_capacity(),
         "insuranceCost": gear::insurance_cost_at(&loadout, ctx.insurance_rate()),
@@ -572,9 +583,10 @@ fn operator_json(db: &Database, profile: &str, now: i64) -> serde_json::Value {
             })),
             "facilities": facilities,
             "workshop": {
+                "collected": collected,
                 "stored": ctx.workshop_stored(now),
-                "perHour": progression::workshop_rate(ctx.facility(progression::Facility::Workshop)),
-                "capacity": progression::workshop_rate(ctx.facility(progression::Facility::Workshop)) * progression::WORKSHOP_HOURS,
+                "perHour": ctx.workshop_rate(),
+                "capacity": ctx.workshop_rate() * progression::WORKSHOP_HOURS,
             },
         },
     })
@@ -608,6 +620,7 @@ fn hideout_json(db: &Database, user: &str) -> serde_json::Value {
             "relocations": account.relocations, "lastRelocation": account.last_relocation,
             "boostLevel": if account.boost_season.as_deref() == Some(season.id.as_str()) { account.boost_level } else { 0 },
             "badges": account.badges, "perks": perks,
+            "respecCost": progression::RESPEC_COST,
         },
         "relocation": {
             "minTier": progression::RELOCATION_MIN_TIER,
@@ -625,7 +638,7 @@ fn hideout_json(db: &Database, user: &str) -> serde_json::Value {
         // No operator yet: empty defaults, so every screen still renders.
         let defaults = serde_json::json!({
             "cash": 0, "raids": 0, "extracts": 0, "deaths": 0, "inRaid": false, "gearScore": 0,
-            "loadout": gear::Loadout::default(), "stash": [], "carry": [], "carryCapacity": 0,
+            "loadout": gear::Loadout::default(), "stash": [], "overflow": [], "carry": [], "carryCapacity": 0,
             "stashCapacity": gear::STASH_CAPACITY, "insuranceCost": 0, "offers": [], "operations": [],
             "maps": maps_json(0, &[]),
         });
@@ -684,6 +697,7 @@ async fn hideout_action(
                 Some(perk) => db.buy_perk(&user, perk).map(|_| ()),
                 None => Err("Unknown perk".into()),
             }),
+            "respec" => Some(if body["confirm"].as_bool() == Some(true) { db.respec(&user) } else { Err("Confirm the Legacy reset.".into()) }),
             _ => None,
         };
         let result = if let Some(r) = account_result { r } else {
@@ -695,6 +709,11 @@ async fn hideout_action(
         };
         match (action.as_str(), slot) {
             ("upgradeTier", _) => db.upgrade_tier(&profile).map(|_| ()),
+            ("promoteRaidable", _) => {
+                if !pvp_enabled() { Err("Raidable operators arrive with PvP.".into()) }
+                else if body["confirm"].as_bool() != Some(true) { Err("Confirm promoting this operator to Raidable.".into()) }
+                else { db.promote_raidable(&profile) }
+            }
             ("upgradeFacility", _) => match body["facility"].as_str().and_then(progression::Facility::parse) {
                 Some(f) => db.upgrade_facility(&profile, f, now).map(|_| ()),
                 None => Err("Unknown facility".into()),
@@ -709,6 +728,17 @@ async fn hideout_action(
                 db.sell_many(&profile, &ids).map(|_| ())
             }
             ("carry", _) => db.set_carry(&profile, item, body["carry"].as_bool().unwrap_or(true)),
+            ("protect", _) => db.protect_item(&profile, item, body["protected"].as_bool().unwrap_or(true)),
+            ("resolveOverflow", _) => {
+                match (serde_json::from_value::<Vec<String>>(body["expectedIds"].clone()), serde_json::from_value::<Vec<String>>(body["keepIds"].clone())) {
+                    (Ok(expected), Ok(keep)) => db.resolve_overflow(&profile, &expected, &keep),
+                    _ => Err("Review and select your overflow items first.".into()),
+                }
+            },
+            ("requisition", _) => match (body["map"].as_str().and_then(gear::map_by_id), body["kind"].as_str().and_then(gear::ItemKind::parse)) {
+                (Some(map), Some(kind)) => db.requisition(&profile, map, kind).map(|_| ()),
+                _ => Err("Choose a map and gear type.".into()),
+            },
             ("equip" | "unequip", None) => Err("Pick a slot: primary, secondary, armor or pack".into()),
             _ => Err("Unknown action".into()),
         }

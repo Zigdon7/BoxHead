@@ -11,7 +11,7 @@ Progression has three scopes: loot at risk during a raid, persistent investment 
 | Account | Up to three operators, account friendships, Legacy perks, retirement stash bonus and badges | Survives operator loss or retirement; removed by account deletion |
 | Seasonal boost | Bonus bounty and Operations XP from retirement | Applies in the following season; permanent perks and stash rewards remain |
 
-Safe operators are PvE-only and have a Homefront tier cap of 3. That does not cap their map progression: they can reach Black Site. Raidable operator support and tier 4 rules exist behind `BOXHEAD_PVP`, but switching it on does not implement PvP or base raids.
+Safe operators are PvE-only and have a Homefront tier cap of 3. That does not cap their map progression: they can reach Black Site. Raidable operators, tier 4 and base raids sit behind `BOXHEAD_PVP`: with it on, Raidable operators can take cash from each other's bases ([BASES.md](BASES.md)). There is still no player-versus-player combat inside raids.
 
 ## Gear and map progression
 
@@ -26,7 +26,7 @@ Gear score is `floor((primary + secondary + armor + pack power) / 4)`, with empt
 
 Rarity adds power to the base roll: common +0, uncommon +3, rare +6, epic +10 and legendary +15, with item power capped at 100. Higher-tier maps improve rarity odds as well as base power. Rolls favor the lower end of their band, so reaching a gate takes more than finding one theoretical maximum item.
 
-The base trader sells common gear through power 24, enough to assemble a Rust Yard kit. Armory upgrades extend that stock, but even power 38 in every slot cannot reach Quarantine's score 40 gate. Higher progression therefore needs extracted gear. New equipment goes into the raid pack and can only be equipped after returning to the hideout.
+The base trader sells common gear through power 24, enough to assemble a Rust Yard kit. Armory upgrades extend that stock, but even power 38 in every slot cannot reach Quarantine's score 40 gate. Higher progression needs extracted gear or earned requisitions. Armory level 1 unlocks a chosen Rare weapon, armor or pack for 120 credits earned by extracting with activity on its map. Requisition power is the map’s upper base loot power +6: 22, 40, 65 or 94. Credits are separate from XP, never awarded on loss, and spent atomically. Requested items start protected. New equipment goes into the raid pack and can only be equipped after returning to the hideout.
 
 ### How power changes the kit
 
@@ -42,9 +42,11 @@ The base trader sells common gear through power 24, enough to assemble a Rust Ya
 
 ## Loot and cash decisions
 
+Protect items in the stash or raid pack to prevent automatic replacement, dropping, sale and consumption in Homefront upgrades. Unprotect reserved materials when ready to spend them. Protection does not insure an item against raid loss. Sealed loot records its origin tier: any uplink preserves base power/rarity, but the 20% rarity upgrade is available only at the origin tier or higher. Existing sealed items without an origin retain their previous eligibility.
+
 Extraction banks bounty and carried loot. Gear can be equipped, retained as a replacement kit or sold. Valuables sell for more than equivalent gear and are also consumed by Homefront tier upgrades. Sealed items sell for scrap until decrypted; they can be extracted, staged in the stash and carried into a later raid. Their estimated opened value is not guaranteed cash.
 
-The base stash has 40 unequipped-item slots. Equipped items do not consume that allowance. Extraction overflow is sold automatically, so free space matters when hunting specific upgrades. Stash capacity is `40 + 10 × Storage level + 5 × Packrat rank + retirement stash bonus`. The maximum under the current Safe rules is 105 slots; tier 4 would raise it to 115.
+The base stash has 40 unequipped-item slots. Equipped items do not consume that allowance. Extraction overflow waits in a review panel. Select items to keep, make room in the stash, then explicitly confirm the sale of the remainder before deploying again. Protected items cannot be sold; stale previews are rejected. Stash capacity is `40 + 10 × Storage level + 5 × Packrat rank + retirement stash bonus`. The maximum under the current Safe rules is 105 slots; tier 4 would raise it to 115.
 
 Cash enters through extracted bounty, sales, overflow sales and Workshop collections. It leaves through trader purchases, entry fees, insurance and Homefront upgrades. A lost raid does not bank its bounty. Entry fees are paid upfront even if the attempt fails.
 
@@ -65,13 +67,13 @@ Each operator starts at tier 1. Higher tiers unlock higher facility levels, with
 | Storage | `$400 × L²` | `10 × L` additional stash slots |
 | Armory | `$600 × L²` | Adds trader power 28, 32, 35, then 38 at successive levels |
 | Insurance Office | `$500 × L²` | Reduces the premium rate by `4 × L` percentage points |
-| Workshop | `$800 × L²` | `$60 × L` per hour, collected manually, capped at 12 hours of production |
+| Workshop | `$800 × L²` | `$60 × L` per hour (+15% for Raidable operators), banked automatically on returning to the hideout, capped at 48 hours of production |
 
-Costs are per purchase, not cumulative. For example, Storage levels 1, 2 and 3 cost $400, $1,600 and $3,600, or $5,600 in total. A level 3 Workshop holds at most $2,160. Homefront tier spending does not automatically build facilities.
+Costs are per purchase, not cumulative. For example, Storage levels 1, 2 and 3 cost $400, $1,600 and $3,600, or $5,600 in total. A level 3 Workshop holds at most $8,640. Homefront tier spending does not automatically build facilities.
 
 ## Operations ranks
 
-Every settled raid awards XP on that map: `100 + min(kills, 100)` for extraction or `25 + min(kills, 100)` for loss. The next-season boost multiplies this by `1 + 0.10 × boost level`, rounded to the nearest whole XP. A voided raid earns none.
+Earned activity is `min(kills + assists, 100) + 8 × min(unique crates, 10) + 5 × min(valid revives, 3)`. An assist requires at least 10% of an enemy’s maximum health in damage within the last 12 seconds. A downed player grants revive credit only once per deployment and only after enemy damage. Losses keep earned activity as XP; extraction adds `min(earned activity, 100)` XP. Empty extractions and immediate abandonments earn zero. Successful extraction also banks earned activity as requisition credits on that map. The next-season boost multiplies this by `1 + 0.10 × boost level`, rounded to the nearest whole XP. A voided raid earns none.
 
 | Rank | Total XP | Fee reduction | Banked bounty bonus |
 | --- | ---: | ---: | ---: |
@@ -88,7 +90,7 @@ Operations rank never substitutes for gear score. Rank 5 Black Site costs $1,000
 
 Seasons are calendar quarters in UTC. In the last 28 days, an account can retire one operator with Homefront tier 3 or higher, once per season. The player-facing action is **Retire**; code and API names use `relocate`. Retirement deletes the operator, cash, items, facilities, Operations and operator friendships. It is optional: season rollover does not automatically wipe operators.
 
-The retirement preview values an operator as cash plus the sale value of all owned items. Money already spent on facilities is not added back to that valuation.
+Retirement value includes cash, item sale values, cash invested in installed Homefront tiers/facilities, owned permanent base structures (walls, turrets, sniper towers and mines), and the sale value of materials consumed by tier upgrades after this update. Investment is counted once: upgrading transfers cash/material value into installed value. Existing installations receive their known cash value; historical material values were not recorded and cannot be reconstructed. Preview and settlement use the same valuation; settlement recomputes it inside its transaction.
 
 | Operator value | Legacy points earned before the lifetime cap |
 | --- | ---: |
@@ -99,7 +101,7 @@ The retirement preview values an operator as cash plus the sale value of all own
 
 An account can earn 12 Legacy points in total. Each retirement also adds five stash slots to every operator, up to 20, and a season badge. It grants a boost for the following season: +5% bounty and +10% Operations XP per level. Consecutive seasonal retirements raise that boost to at most level 3. Missing a retirement season removes no permanent rewards; a later nonconsecutive retirement starts a new boost at level 1.
 
-Each perk rank costs one Legacy point and applies to all operators on the account. Every perk has three ranks: Vitality gives +6 maximum health per rank; Firepower +3% weapon damage; Scavenger +5% banked bounty; Packrat +5 stash slots; Broker reduces the insurance rate by three percentage points. Twelve lifetime points cannot buy all fifteen ranks, so the current system requires tradeoffs.
+Each perk rank costs one Legacy point and applies to all operators on the account. Every perk has three ranks: Vitality gives +6 maximum health per rank; Firepower +3% weapon damage; Scavenger +5% banked bounty; Packrat +5 stash slots; Broker reduces the insurance rate by three percentage points. Twelve lifetime points cannot buy all fifteen ranks. Reset all allocated perks for $1,000 from the active operator to refund the points. All operators must be out of raids and their stashes must fit without Packrat; the reset requires confirmation.
 
 ## Player milestones and tuning questions
 

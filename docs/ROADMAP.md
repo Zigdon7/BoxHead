@@ -16,6 +16,12 @@ This roadmap is sequenced as of November 15, 2026 against `3.0.0-playtest.1`. **
 
 The detailed current behavior is in [USER_EXPERIENCE.md](USER_EXPERIENCE.md), [PROGRESSION.md](PROGRESSION.md) and [GAMEPLAY.md](GAMEPLAY.md).
 
+## Approved mechanics review — batches 1–3
+
+Implemented: wall checks for melee and revives; bounded local defense during enemy returns; permanent hunter reward classification; activity-based XP and extraction bonuses; per-deployment crate claims and reserved crate drops; contribution-based bounty/assist credit; origin-aware decryption; protected items; confirmed overflow selection; targeted Armory requisitions; investment-aware retirement; automatic Workshop banking with a 48-hour cap; and paid Legacy respecs. Regression, migration and API checks cover these changes. Balance values remain playtest hypotheses, not measured retention improvements.
+
+Batch 4 remains future work: variable objectives, nest suppression, distinct enemy roles, optional reward bosses and encounter pacing. Party invitations, reconnect protection, insurance repricing and seasonal timing changes also remain separate proposals.
+
 ## Milestone 1 — Reliable and understandable playtest
 
 **Next.** Make the existing loop trustworthy before adding another progression system.
@@ -35,7 +41,7 @@ Use [PLAYTEST.md](PLAYTEST.md) for execution. Start with small invited sessions 
 
 | Track | Work | Completion criteria |
 | --- | --- | --- |
-| User experience | Show the loadout contribution to the next gear gate; add item locking or retention markers and clearer overflow warnings; improve post-raid guidance | Players identify an actionable upgrade and avoid accidental sales of reserved equipment or valuables |
+| User experience | Show the loadout contribution to the next gear gate; validate the implemented protection controls, requisitions and overflow selection; improve post-raid guidance | Players identify an actionable upgrade and avoid accidental sales of reserved equipment or valuables |
 | Progression | Tune loot bands, fees, premiums, facility prices and Workshop income as a connected economy; evaluate deterministic goals if random drops stall progress | Observed recovery remains viable, each map gate is reachable, and costs create choices without repeated empty recovery runs |
 | Gameplay | Prototype a small optional objective set using existing raids, such as retrieving a marked cache or completing an uplink task | Objectives change routes and risk decisions; rewards settle once and cannot be duplicated by disconnecting |
 
@@ -61,7 +67,7 @@ Reconnect protection is proposed here. The current disconnect rule remains aband
 | Track | Work | Completion criteria |
 | --- | --- | --- |
 | User experience | Full keyboard navigation of menus, focus visibility, readable scaling, non-color-only cues, motion/audio options and complete device controls for any advertised platforms | Representative accessibility and input-device checks cover the full preparation–raid–results loop |
-| Progression | Review rank caps, retirement valuation, irreversible perk choices and veteran advantages; add long-term goals only where observed behavior supports them | Keeping an operator and retiring one are both understandable choices; previewed rewards match settlement at season boundaries |
+| Progression | Review rank caps, the implemented investment valuation and perk respecs, and veteran advantages; add long-term goals only where observed behavior supports them | Keeping an operator and retiring one are both understandable choices; previewed rewards match settlement at season boundaries |
 | Gameplay | Add tested late-map objectives and loadout variety; assess whether new maps offer more than higher multipliers | Endgame tasks change decisions, and performance remains within the measured host budget |
 | Operations | Publish the data-handling information, establish moderation and abuse response, rehearse restore procedures and measure capacity | Public-release checklist is completed on the actual deployment and support responsibilities are assigned |
 
@@ -69,9 +75,9 @@ Complete touch controls and controller support are separate deliverables, not co
 
 ## Milestone 5 — Optional PvP and Homefront raiding
 
-**Explore; depends on reliable PvE, social consent and economy protections.** Raidable operators and tier 4 costs are foundations, not playable PvP.
+**Base raids implemented, unvalidated; in-raid PvP still to explore.** As of November 16, 2026, asynchronous base raids exist behind `BOXHEAD_PVP`: bases, three-wave attacks, fog of war, cash loot, shields, replays and practice raids ([BASES.md](BASES.md)). No player has tested them. Player-versus-player combat inside extraction raids is not built.
 
-Before implementation, resolve the following rules in a separate design proposal:
+The base-raid build implements offline asynchronous raids with cash-only stakes (liquid + uncollected Workshop, 20% capped at $15k), 15% raid fencing burn, 24h per-account-pair cooldown on top of 8h shields, hard ±1 tier scouting with escalating re-scout fees, defender salvage bounties, defended-HQ contract bonuses, wall line of sight, sight-gated targeting with Scout mine-sweeping, unread defense badges, keyboard base editing, and one-way Safe→Raidable promotion (+15% Workshop rate). For in-raid PvP, resolve these in a separate design proposal before implementation:
 
 - Matchmaking and fair combat: gear/Legacy disparities, team size, damage rules, spawn safety and anti-cheat validation.
 - Risk consent: who opts into PvP, what can be stolen, how Safe operators remain isolated, and whether account-wide rewards cross modes.
@@ -79,7 +85,7 @@ Before implementation, resolve the following rules in a separate design proposal
 - Rewards and abuse: win trading, repeated victim farming, alternate-account transfers and disconnect outcomes.
 - Player communication: an explicit preview of exposed items and consequences before entering the mode.
 
-Implement and validate a small opt-in PvP raid mode before attempting persistent base raids. Base raiding is a further gate, not automatically bundled with PvP. Neither feature should be advertised as playable solely because `BOXHEAD_PVP=1` permits Raidable creation.
+Before turning `BOXHEAD_PVP` on for players: watch real raids for balance, add a notice when a base is raided, and decide whether cash transfers between cooperating accounts need a tighter limit. Do not advertise in-raid PvP as playable because `BOXHEAD_PVP=1` permits Raidable creation.
 
 ## Measurement and delivery rules
 

@@ -527,6 +527,7 @@ function showMenuView(view: MenuView) {
   if (view !== 'signin') { bskyLinkMode = false; if (resetToken) hideResetForm(); }
   menuView = view;
   for (const [name, el] of Object.entries(menuViews)) el.classList.toggle('hidden', name !== view);
+  if (view !== 'hideout') hideoutView.base.setVisible(false);
   if (view === 'browser') { void refreshRooms(); void hideoutView.refresh(); }
   if (view === 'hideout') void hideoutView.refresh();
 }
@@ -692,6 +693,7 @@ function renderRaidResults() {
   else if (!settle) line = 'Your stash could not be updated. Check the hideout.';
   else line = `+$${fmtInt(settle.cashEarned)} banked · ${settle.itemsKept} item${settle.itemsKept === 1 ? '' : 's'} added to your stash`
     + (settle.bonusCash ? ` (incl. $${fmtInt(settle.bonusCash)} rank and perk bonus)` : '')
+    + (settle.itemsPending ? ` · ${settle.itemsPending} overflow items waiting for your choice in the stash` : '')
     + (settle.itemsAutoSold ? ` · ${settle.itemsAutoSold} sold because your stash was full` : '') + ` · you now have $${fmtInt(settle.cash)}`;
   const ops = settle?.ops;
   if (ops) {
@@ -699,6 +701,7 @@ function renderRaidResults() {
     line += ` · ${mapName} Operations +${ops.xpGained} XP`
       + (ops.rankedUp ? ` · rank ${ops.rank} reached: cheaper entry, bigger bounty` : ops.next === null ? ' (top rank)' : ` (${ops.xp}/${ops.next} to rank ${ops.rank + 1})`);
   }
+  if (o.activity) line += ` · ${o.activity.assists} assists · ${o.activity.crates} crates · ${o.activity.revives} credited revives`;
   if (kept && o.loot.length === 0) lootEl.append(Object.assign(document.createElement('p'), { className: 'meta', textContent: 'You extracted with an empty pack.' }));
   document.getElementById('resultsSettlement')!.textContent = line;
   document.getElementById('resultsLootCard')!.hidden = false;
@@ -728,6 +731,7 @@ function setAuthState(token: string, handle: string, userId: string, displayName
   updateAuthDOM();
   refreshFriends();
   refreshMe();
+  void hideoutView.refresh();
   void refreshRooms();
   if (menuView === 'signin') showMenuView('home');
 }
@@ -830,6 +834,7 @@ function clearAuthState() {
   friendsList = [];
   friendIdentity = null;
   hideoutView.state = null;
+  hideoutView.base.reset();
   updateAuthDOM();
   localStorage.removeItem('boxhead_auth_token');
   localStorage.removeItem('boxhead_auth_handle');
@@ -1408,6 +1413,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code !== 'Escape' || settingsListening || e.repeat) return;
   if (settingsOverlay.style.display === 'flex') { closeSettings(); e.stopPropagation(); return; }
   if (friendsOverlay.style.display === 'flex') { friendsOverlay.classList.add('hidden'); friendsOverlay.style.display = 'none'; e.stopPropagation(); return; }
+  if (currentScreen === 'menu' && menuView === 'hideout' && hideoutView.tab === 'base' && hideoutView.base.closeReplay()) { e.stopPropagation(); return; }
   if (currentScreen === 'menu' && menuView !== 'home') { showMenuView(menuView === 'browser' ? 'hideout' : 'home'); e.stopPropagation(); return; }
   if (currentScreen === 'playing' && mapOpen) { mapOpen = false; e.stopPropagation(); return; }
   if (currentScreen === 'playing' && raidInvOpen) { toggleRaidInventory(false); e.stopPropagation(); return; }
@@ -1417,9 +1423,9 @@ window.addEventListener('keydown', (e) => {
 // Enter presses the open screen's primary button (Play, Join, Sign in, Play again),
 // unless a focused control handles Enter itself.
 window.addEventListener('keydown', (e) => {
-  if (e.key !== 'Enter' || e.repeat || settingsListening) return;
+  if (e.key !== 'Enter' || e.repeat || e.defaultPrevented || settingsListening) return;
   const target = e.target as HTMLElement;
-  if (target.closest('button, a, select, textarea') || target === roomNameInput || target.id === 'addFriendInputEl') return;
+  if (target.closest('button, a, select, textarea, canvas') || target === roomNameInput || target.id === 'addFriendInputEl') return;
   if (settingsOverlay.style.display === 'flex' || friendsOverlay.style.display === 'flex') return;
   let primary: HTMLButtonElement | null = null;
   if (currentScreen === 'results') primary = backToMenuBtn as HTMLButtonElement;
@@ -1540,6 +1546,7 @@ function toggleMap(force?: boolean) {
 let raidInvOpen = false;
 let raidInvKey = '';
 let pendingDropId: string | null = null;
+let pendingProtectId: string | null = null;
 const raidInvEl = document.getElementById('raidInventory')!;
 document.getElementById('raidInvClose')!.addEventListener('click', () => toggleRaidInventory(false));
 
@@ -1609,7 +1616,7 @@ function renderRaidInventory() {
   const decrypting = pack.find(isEncrypted);
   const nu = nearest(staticUplinks, me.pos.x, me.pos.y);
   const uplinkText = nu ? `${nu.point.name} · ${formatDistance(nu.dist)} ${compass(nu.point.x - me.pos.x, nu.point.y - me.pos.y)}` : '';
-  const key = `${pack.map(i => i.id).join(',')}|${cap}|${Math.floor(me.decrypt || 0)}|${bindings.inventory}|${uplinkText}`;
+  const key = `${pack.map(i => `${i.id}:${!!i.protected}`).join(',')}|${cap}|${Math.floor(me.decrypt || 0)}|${bindings.inventory}|${uplinkText}`;
   if (key === raidInvKey) return;
   // Don't rebuild under a Drop being held down.
   if (raidInvEl.querySelector('.hold-btn.holding')) return;
@@ -1672,7 +1679,7 @@ function renderRaidInventory() {
         fill.style.width = `${Math.min(100, (me.decrypt / DECRYPT_SECS[item.rarity]) * 100)}%`;
         progress.append(fill);
       } else {
-        meta.append(`Decrypt ${DECRYPT_SECS[item.rarity]}s at an uplink`);
+        meta.append(`Decrypt ${DECRYPT_SECS[item.rarity]}s · 20% rarity upgrade at tier ${item.originTier || 1}+ only`);
       }
     } else {
       meta.textContent = keyStat(item) ? `${item.power} PWR · ${keyStat(item)!.text.split(' · ')[0]}` : 'Sells at the trader';
@@ -1694,7 +1701,13 @@ function renderRaidInventory() {
     }
     const side = document.createElement('span');
     side.className = 'rp-side';
-    side.append(worth, holdToDrop(() => { pendingDropId = item.id; maybeSendInput(); }));
+    const protect = document.createElement('button');
+    protect.className = 'btn btn-secondary btn-sm'; protect.type = 'button';
+    protect.textContent = item.protected ? 'Protected ✓' : 'Protect';
+    protect.title = 'Prevents automatic replacement and dropping. Does not prevent raid loss.';
+    protect.addEventListener('click', () => { pendingProtectId = item.id; maybeSendInput(); });
+    side.append(worth, protect);
+    if (!item.protected) side.append(holdToDrop(() => { pendingDropId = item.id; maybeSendInput(); }));
     row.addEventListener('pointerenter', () => { raidInvHoverRow = row; });
     row.addEventListener('pointerleave', () => { if (raidInvHoverRow === row) raidInvHoverRow = null; });
     row.append(icon, body, side);
@@ -2372,6 +2385,7 @@ function applyDelta(delta: DeltaState) {
       if (diff.comboTimer !== undefined) existing.comboTimer = diff.comboTimer;
       if (diff.maxCombo !== undefined) existing.maxCombo = diff.maxCombo;
       if (diff.kills !== undefined) existing.kills = diff.kills;
+      if (diff.activity !== undefined) existing.activity = diff.activity;
       if (diff.tacticalItems !== undefined) existing.tacticalItems = diff.tacticalItems;
     }
   }
@@ -2875,6 +2889,7 @@ function maybeSendInput() {
     input.dropItem = true;
     pendingDrop = false;
   }
+  if (pendingProtectId) { input.protectId = pendingProtectId; pendingProtectId = null; }
   if (pendingDropId) {
     input.dropId = pendingDropId;
     pendingDropId = null;
@@ -2893,6 +2908,7 @@ function maybeSendInput() {
   input.placeItem = 0;
   input.dropItem = false;
   delete input.dropId;
+  delete input.protectId;
 }
 
 function buildRenderState(): GameState | null {
